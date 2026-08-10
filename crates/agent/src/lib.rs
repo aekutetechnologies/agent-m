@@ -11,13 +11,15 @@
 mod agent;
 mod context;
 mod message;
+mod risk;
 mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, InterruptHandle, Mode};
 pub use context::{InstructionFile, discover_instructions, render_instructions};
 pub use message::{SessionMessage, SessionMessageKind};
+pub use risk::RiskPolicy;
 pub use tool::{
     AlwaysAllowGate, AskGate, BoolGate, ClosureAskGate, ClosureGate, DangerousCommandGate,
-    Permission, PermissionGate, SelectiveAskGate, Tool, ToolCallInfo, ToolContext, ToolError,
-    ToolOutcome, ToolRegistry, UnavailableAskGate, dangerous_bash, tool_spec,
+    DenyAllGate, Permission, PermissionGate, SelectiveAskGate, Tool, ToolCallInfo, ToolContext,
+    ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
 };

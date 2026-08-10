@@ -182,79 +182,32 @@ pub enum Permission {
     Denied(String),
 }
 
-/// Decides whether a tool call may run. The TUI implements the interactive
-/// confirm gate; `--yes` uses [`AlwaysAllowGate`]; `--no-tools` registers no
-/// tools at all.
+/// Decides whether a tool call may run. The TUI without `--yes` prompts for
+/// every call; with `--yes` it uses SelectiveAskGate (asks only for risky calls).
+/// Print mode and flows without `--yes` deny all; with `--yes` they use
+/// DangerousCommandGate (denies risky, allows benign). `--no-tools` is the
+/// strongest boundary: no tools registered, nothing to authorize.
 #[async_trait]
 pub trait PermissionGate: Send + Sync {
     async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission;
 }
 
-/// Returns a reason when a `bash` tool call contains a destructive command
-/// that should never be auto-approved (ECC GateGuard pattern): recursive
-/// force-deletes, hard resets/force checkouts, `find -exec`/`-delete`,
-/// device/partition writes, and blanket permission changes.
-pub fn dangerous_bash(call: &ToolCallInfo) -> Option<&'static str> {
-    if call.name != "bash" {
-        return None;
-    }
-    let command = call
-        .arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let command = command.trim_start();
-    let patterns: &[(&str, &str)] = &[
-        (
-            r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\b",
-            "recursive force delete (rm -rf)",
-        ),
-        (
-            r"rm\s+-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\b",
-            "recursive force delete (rm -rf)",
-        ),
-        (
-            r"rm\s+-r\b[^\x0a]*\b-f\b|rm\s+-f\b[^\x0a]*\b-r\b",
-            "recursive force delete (rm -r -f)",
-        ),
-        (
-            r"rm\s+--recursive\b[^\x0a]*\b--force\b",
-            "recursive force delete (rm --recursive --force)",
-        ),
-        (r"sudo\s+rm\s+", "sudo rm"),
-        (r"git\s+checkout\s+(--force|-f)\b", "git checkout --force"),
-        (r"git\s+reset\s+--hard", "git reset --hard"),
-        (r"git\s+clean\s+-(f|d|fd|df)\b", "git clean -f"),
-        (r"find\s+[^\x0a]*\s+-(exec|delete)\b", "find -exec/-delete"),
-        (
-            r"\b(mkfs|fdisk|format|dd)\b[^\x0a]*/dev/",
-            "device/partition write",
-        ),
-        (r"chmod\s+-R\s+[0-7]{3,4}", "recursive chmod"),
-        (r">\s+/dev/(sd|disk|rdisk)", "write to a device"),
-    ];
-    let lower = command.to_lowercase();
-    for (pattern, reason) in patterns {
-        if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&lower)) {
-            return Some(reason);
-        }
-    }
-    None
-}
-
 /// A permission gate that asks the user (via the wrapped closure) ONLY for
-/// destructive commands and auto-approves everything else (`--yes` in the
-/// TUI): the closure is invoked for dangerous bash calls, `Allowed` otherwise.
-pub struct SelectiveAskGate<F>(F)
+/// risky commands and auto-approves everything else (`--yes` in the TUI).
+pub struct SelectiveAskGate<F>
 where
-    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync;
+    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
+{
+    policy: Arc<crate::risk::RiskPolicy>,
+    ask: F,
+}
 
 impl<F> SelectiveAskGate<F>
 where
     F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
 {
-    pub fn new(ask: F) -> Self {
-        Self(ask)
+    pub fn new(policy: Arc<crate::risk::RiskPolicy>, ask: F) -> Self {
+        Self { policy, ask }
     }
 }
 
@@ -264,30 +217,39 @@ where
     F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
 {
     async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission {
-        if dangerous_bash(tool_call).is_some() {
-            (self.0)(tool_call.clone()).await
+        if self.policy.risk(tool_call).is_some() {
+            (self.ask)(tool_call.clone()).await
         } else {
             Permission::Allowed
         }
     }
 }
 
-/// Wraps another gate and denies destructive commands outright even when the
+/// Wraps another gate and denies risky commands outright even when the
 /// inner gate would auto-approve them (print mode: no UI to ask).
-pub struct DangerousCommandGate<G>(pub G);
+pub struct DangerousCommandGate<G> {
+    policy: Arc<crate::risk::RiskPolicy>,
+    inner: G,
+}
+
+impl<G> DangerousCommandGate<G> {
+    pub fn new(policy: Arc<crate::risk::RiskPolicy>, inner: G) -> Self {
+        Self { policy, inner }
+    }
+}
 
 #[async_trait]
 impl<G: PermissionGate + Send + Sync> PermissionGate for DangerousCommandGate<G> {
     async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission {
-        if let Some(reason) = dangerous_bash(tool_call) {
-            match self.0.authorize(tool_call).await {
+        if let Some(reason) = self.policy.risk(tool_call) {
+            match self.inner.authorize(tool_call).await {
                 Permission::Allowed => Permission::Denied(format!(
-                    "destructive command requires explicit approval: {reason}"
+                    "risky command requires explicit approval: {reason}"
                 )),
                 other => other,
             }
         } else {
-            self.0.authorize(tool_call).await
+            self.inner.authorize(tool_call).await
         }
     }
 }
@@ -299,6 +261,21 @@ pub struct AlwaysAllowGate;
 impl PermissionGate for AlwaysAllowGate {
     async fn authorize(&self, _tool_call: &ToolCallInfo) -> Permission {
         Permission::Allowed
+    }
+}
+
+/// Refuses everything, with a message the model can act on. The gate to use
+/// when there is no human available to approve (print mode without `--yes`).
+pub struct DenyAllGate;
+
+#[async_trait]
+impl PermissionGate for DenyAllGate {
+    async fn authorize(&self, _tool_call: &ToolCallInfo) -> Permission {
+        Permission::Denied(
+            "tools are disabled here (no interactive approval available); \
+             re-run with --yes to enable them"
+                .to_string(),
+        )
     }
 }
 

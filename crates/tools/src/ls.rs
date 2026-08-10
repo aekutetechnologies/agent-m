@@ -36,11 +36,11 @@ impl Tool for LsTool {
         arguments: Value,
         context: &ToolContext,
     ) -> Result<ToolOutcome, ToolError> {
-        let path = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| crate::resolve_path(&context.cwd, path))
-            .unwrap_or_else(|| context.cwd.clone());
+        let path = crate::resolve_path(
+            "ls",
+            &context.cwd,
+            arguments.get("path").and_then(Value::as_str).unwrap_or("."),
+        )?;
         let limit = arguments
             .get("limit")
             .and_then(Value::as_u64)

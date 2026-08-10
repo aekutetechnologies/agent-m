@@ -4,7 +4,10 @@
 //! `--list-models`. Startup order mirrors pi's `main.ts`: parse args →
 //! resolve provider/key/model → build tools → resolve mode → dispatch.
 
-use agent_m_agent::{Agent, AgentOptions, AlwaysAllowGate, SessionMessage, Tool};
+use agent_m_agent::{
+    Agent, AgentOptions, AlwaysAllowGate, DangerousCommandGate, DenyAllGate, PermissionGate,
+    RiskPolicy, SessionMessage, Tool,
+};
 use agent_m_ai::{OpenAiCompatibleProvider, Provider, resolve_api_key};
 use agent_m_tools::{all_tools, default_tools};
 
@@ -101,6 +104,10 @@ struct Cli {
     /// Run a YAML flow (print mode): `agent-m --flow flows/agentic-dev.yml`.
     #[arg(long = "flow")]
     flow: Option<PathBuf>,
+
+    /// Extra directory the file tools may access (repeatable). bash is NOT contained.
+    #[arg(long = "allow-path")]
+    allow_path: Vec<PathBuf>,
 
     /// Manage plugins (install/list/remove/update).
     #[command(subcommand)]
@@ -222,6 +229,16 @@ fn build_tools(cli: &Cli) -> Vec<Arc<dyn Tool>> {
         .collect()
 }
 
+/// The gate for modes with no human to ask: print and flow. `--yes` is full
+/// trust minus the risk hints; without it, nothing runs.
+fn non_interactive_gate(yes: bool, risk: Arc<RiskPolicy>) -> Arc<dyn PermissionGate> {
+    if yes {
+        Arc::new(DangerousCommandGate::new(risk, AlwaysAllowGate))
+    } else {
+        Arc::new(DenyAllGate)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -245,6 +262,13 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     }
     let settings = load_settings(&agent_dir);
+
+    // Filesystem containment for the file tools: cwd plus user-approved roots.
+    let mut allowed = cli.allow_path.clone();
+    if let Some(paths) = settings.get("allowedPaths").and_then(|v| v.as_array()) {
+        allowed.extend(paths.iter().filter_map(|v| v.as_str()).map(PathBuf::from));
+    }
+    agent_m_tools::set_allowed_paths(allowed);
 
     let provider_id = cli
         .provider
@@ -276,20 +300,32 @@ async fn main() -> Result<()> {
             default_tools().len()
         );
     }
-    let tools = if cli.no_tools || (print_mode && !cli.yes) {
-        if print_mode && !cli.yes && !cli.no_tools {
-            eprintln!("warning: print mode disables tools; pass --yes to enable them");
-        }
-        Vec::new()
-    } else {
-        build_tools(&cli)
-    };
-
-    // Load out-of-tree plugins and merge their tools into the tool set.
-    let mut tools = tools;
-    for plugin in agent_m_plugin_loader::load_plugins_dir(&agent_dir.join("plugins")) {
-        tools.extend(plugin.tools);
+    // One decision: no tools when --no-tools or print mode without --yes.
+    let tools_enabled = !cli.no_tools && (!print_mode || cli.yes);
+    if print_mode && !cli.yes && !cli.no_tools {
+        eprintln!("warning: print mode disables tools; pass --yes to enable them");
     }
+    let mut tools = Vec::new();
+    let mut opaque_tools = Vec::new();
+    if tools_enabled {
+        tools = build_tools(&cli);
+        // Load plugins and apply the same filters.
+        for plugin in agent_m_plugin_loader::load_plugins_dir(&agent_dir.join("plugins")) {
+            for tool in plugin.tools {
+                if !cli.exclude_tools.iter().any(|n| n == tool.name())
+                    && (cli.tools.is_empty() || cli.tools.iter().any(|n| n == tool.name()))
+                {
+                    // All plugin tools are opaque (trust policy is P1, not P0).
+                    opaque_tools.push(tool.name().to_string());
+                    tools.push(tool);
+                }
+            }
+        }
+    }
+    let risk = Arc::new(agent_m_agent::RiskPolicy {
+        cwd: cwd.clone(),
+        opaque_tools,
+    });
 
     if cli.list_models {
         for spec in provider.models() {
@@ -324,7 +360,6 @@ async fn main() -> Result<()> {
         model: model.clone(),
         system_prompt,
         tools,
-        permission_gate: Arc::new(AlwaysAllowGate), // replaced by the TUI when interactive
         max_turns: MAX_TURNS,
         cwd: cwd.clone(),
         mode: if cli.mode_plan {
@@ -332,7 +367,6 @@ async fn main() -> Result<()> {
         } else {
             agent_m_agent::Mode::Build
         },
-        // Print mode has no UI: the ask tool fails with a clear message.
         ask_gate: None,
         context_window: provider
             .models()
@@ -349,6 +383,7 @@ async fn main() -> Result<()> {
             flow_path,
             cwd,
             cli.yes,
+            risk.clone(),
             flow_state_dir,
         )
         .await;
@@ -356,7 +391,8 @@ async fn main() -> Result<()> {
 
     if print_mode {
         let messages = inline_file_args(&cwd, cli.messages.clone());
-        return run_print(provider, agent_options, messages).await;
+        let gate = non_interactive_gate(cli.yes, risk.clone());
+        return run_print(provider, agent_options, gate, messages).await;
     }
 
     let theme = resolve_theme(&cli, &settings)?;
@@ -421,17 +457,12 @@ async fn run_flow_mode(
     flow_path: &std::path::Path,
     cwd: PathBuf,
     yes: bool,
+    risk: Arc<RiskPolicy>,
     state_dir: PathBuf,
 ) -> anyhow::Result<()> {
     let flow = agent_m_flow::load_flow(&flow_path.to_path_buf())?;
     let tools = agent_options.tools.clone();
-    // Print mode has no UI: even with --yes, destructive commands are denied
-    // outright (ECC GateGuard) — auto-approve never covers rm -rf & friends.
-    let permission: Arc<dyn agent_m_agent::PermissionGate> = if yes {
-        Arc::new(agent_m_agent::DangerousCommandGate(AlwaysAllowGate))
-    } else {
-        Arc::new(agent_m_agent::BoolGate::new(|_| false))
-    };
+    let permission = non_interactive_gate(yes, risk);
     let deps = agent_m_flow::FlowDeps {
         provider,
         agent_options,
@@ -483,9 +514,10 @@ async fn run_flow_mode(
 async fn run_print(
     provider: Arc<dyn Provider>,
     agent_options: AgentOptions,
+    gate: Arc<dyn PermissionGate>,
     messages: Vec<String>,
 ) -> Result<()> {
-    let mut agent = Agent::new(provider, agent_options);
+    let mut agent = Agent::new(provider, agent_options, gate);
     agent.subscribe(|event| match event {
         agent_m_agent::AgentEvent::MessageUpdate {
             delta: agent_m_ai::StreamEvent::TextDelta { delta },
@@ -493,8 +525,13 @@ async fn run_print(
             print!("{delta}");
             let _ = std::io::stdout().flush();
         }
-        agent_m_agent::AgentEvent::ToolExecutionStart { name, .. } => {
-            eprintln!("[tool] {name}");
+        agent_m_agent::AgentEvent::ToolExecutionStart {
+            name, arguments, ..
+        } => {
+            eprintln!(
+                "[tool] {name} {}",
+                serde_json::to_string(&arguments).unwrap_or_default()
+            );
         }
         agent_m_agent::AgentEvent::Notice { message } => {
             eprintln!("[notice] {message}");

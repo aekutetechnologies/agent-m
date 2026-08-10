@@ -79,14 +79,29 @@ agent-m --help                         # all flags
 Note: print mode (piped stdin or `-p`) disables tools unless `--yes` is passed —
 there is no interactive approval in print mode, so tools require explicit opt-in.
 
-Security: destructive shell commands (`rm -rf`, `git reset --hard`, `git
-checkout --force`, `git clean -f`, `find -exec/-delete`, device writes,
-recursive `chmod`) are **never auto-approved** (ECC GateGuard pattern): in the
-TUI they always show a ⚠️ DESTRUCTIVE approval prompt even with `--yes`, and
-in print mode `--yes` denies them outright. Flow `tool`/`verify` steps run
-through the same permission gate. `--compact-threshold` (default 0.5) sets the
-strategic-compaction boundary, and startup warns if the active tool set
-exceeds the 80-tool budget or the injected context exceeds 50k chars.
+## Security boundaries and risk hints
+
+agent-m runs with the full privileges of the invoking user. It has no OS-level sandbox. The security model consists of three layers, in order of strength:
+
+### 1. No tool registered (strongest)
+The most secure boundary: if a tool is not registered (`--no-tools`, `--exclude-tools bash`), the model cannot invoke it. Plan mode (`/plan` or `--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`, `search`) plus `ask`, so destructive operations cannot reach the filesystem.
+
+### 2. Human approval (interactive TUI only)
+In the interactive TUI without `--yes`, every tool call waits for your approval. **Risk hints** — cheap heuristics over command strings and write targets — flag calls that look destructive (recursive deletes, git force operations, writes outside the workspace, writes to `.git/hooks`) with a **⚠️ RISKY** prompt. These hints catch accidents from a cooperative model, not adversarial prompts. A bash command can hide anything via `eval "$(base64 -d …)"`, so risk detection is advisory, never a containment boundary.
+
+In print mode with `--yes`, and in flow execution with `--yes`, risk-hinted calls are **denied outright** — there is no human to ask. Without `--yes`, print mode and flows deny all tool calls.
+
+### 3. The OS user agent-m runs as (weakest)
+The `bash` tool inherits the session's full environment and runs with your privileges. Filesystem containment applies to the seven file tools (`read`, `write`, `edit`, `ls`, `grep`, `find`, `search`) — they resolve symlinks, check `..` escapes, enforce allowed roots (default: cwd only, extend with `--allow-path`), and skip sensitive files (`.env*`, `.ssh`, `*.pem`, API keys) even inside the workspace — but `bash` can access anything you can. Untrusted plugin tools (those not marked `--trust` at install) are always flagged for approval.
+
+**Honest ceiling**: an OS sandbox (`sandbox-exec` / `bubblewrap` / container) around the `bash` tool is the real upgrade path. Until then, agent-m is safe for work on codebases you trust, not for untrusted repos or adversarial prompts. Prompt injection (hidden instructions in file contents the agent reads) reaches the tool loop.
+
+### Why risk hints, not a denylist?
+The prior regex-based "destructive command" denylist had 12+ confirmed bypasses: `rm -r --force /`, `chmod -R a+rwx /`, `git -C /repo reset --hard`, `>/dev/sda`, and many more. Shell strings are not parseable without a full interpreter, so the new design treats risk detection as **accident prevention for a cooperative model**, not as a security boundary. Risk hints are tool-agnostic (any tool with a `command` argument is treated as a shell) and match on behavior, not names.
+
+The denylist arms race cannot be won. The real boundaries are: no tool registered, you reading the call, and the OS process sandbox (roadmap).
+
+`--compact-threshold` (default 0.5) sets the strategic-compaction boundary, and startup warns if the active tool set exceeds the 80-tool budget or the injected context exceeds 50k chars.
 
 ## Modes, planning, and the ask tool
 

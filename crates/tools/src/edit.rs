@@ -73,7 +73,7 @@ impl Tool for EditTool {
             return Err(ToolError::failed("edit", "`edits` must not be empty"));
         }
 
-        let path = crate::resolve_path(&context.cwd, path);
+        let path = crate::resolve_path("edit", &context.cwd, path)?;
         let original = tokio::fs::read_to_string(&path).await.map_err(|error| {
             ToolError::failed("edit", format!("cannot read {}: {error}", path.display()))
         })?;

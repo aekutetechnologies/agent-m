@@ -1,0 +1,1 @@
+/Users/smrutiranjansahoo/AAA/1/agent-m/target/debug/libagent_m_plugin_fixture.dylib: /Users/smrutiranjansahoo/AAA/1/agent-m/crates/plugin-sdk/src/lib.rs /Users/smrutiranjansahoo/AAA/1/agent-m/plugins/fixture/src/lib.rs

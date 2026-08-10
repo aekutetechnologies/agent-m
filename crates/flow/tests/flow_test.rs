@@ -2,8 +2,8 @@
 //! verify fix loop, and the agent loop driving.
 
 use agent_m_agent::{
-    AgentOptions, AlwaysAllowGate, AskGate, ClosureAskGate, Mode, Tool, ToolContext, ToolError,
-    ToolOutcome,
+    AgentOptions, AlwaysAllowGate, AskGate, ClosureAskGate, Mode, RiskPolicy, Tool, ToolContext,
+    ToolError, ToolOutcome,
 };
 use agent_m_ai::{
     AiError, ChatRequest, ContentPart, ModelSpec, Provider, StopReason, StreamEvent, Usage,
@@ -166,7 +166,6 @@ fn options() -> AgentOptions {
         model: "fake".to_string(),
         system_prompt: "You are a test agent.".to_string(),
         tools: vec![],
-        permission_gate: Arc::new(AlwaysAllowGate),
         max_turns: 5,
         cwd: PathBuf::from("."),
         mode: Mode::Build,
@@ -286,7 +285,13 @@ async fn destructive_command_denied_in_flow() {
         agent_options: options(),
         tools: vec![bash.clone()],
         // --yes in print mode: destructive commands are still denied.
-        permission_gate: Arc::new(agent_m_agent::DangerousCommandGate(AlwaysAllowGate)),
+        permission_gate: Arc::new(agent_m_agent::DangerousCommandGate::new(
+            Arc::new(RiskPolicy {
+                cwd: PathBuf::from("."),
+                opaque_tools: vec![],
+            }),
+            AlwaysAllowGate,
+        )),
         ask_gate: None,
         state_dir: None,
         on_progress: None,

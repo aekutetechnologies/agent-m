@@ -42,11 +42,11 @@ impl Tool for FindTool {
             .get("pattern")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::failed("find", "missing string argument `pattern`"))?;
-        let root = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| crate::resolve_path(&context.cwd, path))
-            .unwrap_or_else(|| context.cwd.clone());
+        let root = crate::resolve_path(
+            "find",
+            &context.cwd,
+            arguments.get("path").and_then(Value::as_str).unwrap_or("."),
+        )?;
         let limit = arguments
             .get("limit")
             .and_then(Value::as_u64)

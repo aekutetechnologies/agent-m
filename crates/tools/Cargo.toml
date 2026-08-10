@@ -9,6 +9,7 @@ description = "Built-in agent tools: bash, read, write, edit, grep, find, ls"
 agent-m-agent = { path = "../agent" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+dirs = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

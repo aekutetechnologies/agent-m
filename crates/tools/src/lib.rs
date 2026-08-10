@@ -11,6 +11,7 @@ mod find;
 mod grep;
 mod index;
 mod ls;
+mod paths;
 mod read;
 mod search;
 mod truncate;
@@ -23,24 +24,14 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use index::{SymbolIndex, build_index, load_or_build};
 pub use ls::LsTool;
+pub use paths::{resolve_path, set_allowed_paths};
 pub use read::ReadTool;
 pub use search::SearchTool;
 pub use truncate::{MAX_BYTES, MAX_LINES};
 pub use write::WriteTool;
 
 use agent_m_agent::Tool;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Resolve a tool argument path against the session working directory.
-pub fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
-}
 
 /// All built-in tools.
 pub fn all_tools() -> Vec<Arc<dyn Tool>> {

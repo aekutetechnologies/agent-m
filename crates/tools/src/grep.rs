@@ -53,11 +53,11 @@ impl Tool for GrepTool {
             .get("pattern")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::failed("grep", "missing string argument `pattern`"))?;
-        let root = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| crate::resolve_path(&context.cwd, path))
-            .unwrap_or_else(|| context.cwd.clone());
+        let root = crate::resolve_path(
+            "grep",
+            &context.cwd,
+            arguments.get("path").and_then(Value::as_str).unwrap_or("."),
+        )?;
         let glob = arguments.get("glob").and_then(Value::as_str);
         let ignore_case = arguments
             .get("ignoreCase")
@@ -156,6 +156,10 @@ async fn grep_with_ripgrep(
     command.arg("--max-count").arg(limit.to_string());
     if let Some(glob) = glob {
         command.arg("-g").arg(glob);
+    }
+    // Exclude sensitive files (after user globs: last match wins).
+    for exclude in crate::paths::sensitive_globs() {
+        command.arg("-g").arg(exclude);
     }
     // `--` ends option parsing so a pattern that looks like a flag (e.g.
     // `--no-ignore`) cannot flip rg's options (security review MEDIUM).
@@ -280,6 +284,9 @@ fn walk_files(root: &Path, on_file: &mut impl FnMut(&PathBuf)) -> Result<(), std
                 continue;
             }
             let path = entry.path();
+            if crate::paths::is_sensitive(&path) {
+                continue;
+            }
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() {

@@ -16,12 +16,13 @@ use crate::model::{Flow, FlowContext, FlowStep};
 /// Dependencies the executor needs to run prompt/tool/ask steps.
 pub struct FlowDeps {
     pub provider: Arc<dyn Provider>,
-    /// Template agent options: model, system_prompt, cwd, context window, etc.
-    /// Each prompt step clones this and adjusts mode/model.
+    /// Template agent options: model, system_prompt, tools, cwd, context window.
+    /// No gate — permission_gate is passed separately to avoid stale clones.
     pub agent_options: AgentOptions,
     /// All registered tools (built-in + plugin). `tool` steps resolve here.
     pub tools: Vec<Arc<dyn Tool>>,
-    /// Permission gate for tool calls inside prompt steps (TUI approval).
+    /// Permission gate for every tool call in this flow: tool steps, verify
+    /// commands, and the model's own calls inside prompt/phase/verify-fix steps.
     pub permission_gate: Arc<dyn PermissionGate>,
     /// Ask gate for `ask` steps (None → ask steps fail with a clear message).
     pub ask_gate: Option<Arc<dyn AskGate>>,
@@ -241,10 +242,12 @@ async fn run_step_inner(
             };
             let mut options = deps.agent_options.clone();
             options.mode = mode;
+            options.ask_gate = deps.ask_gate.clone();
             if let Some(model) = model {
                 options.model = model.clone();
             }
-            let mut agent = Agent::new(deps.provider.clone(), options);
+            let mut agent =
+                Agent::new(deps.provider.clone(), options, deps.permission_gate.clone());
             let deltas = Arc::new(std::sync::Mutex::new(String::new()));
             let capture = deltas.clone();
             agent.subscribe(move |event| {
@@ -533,7 +536,8 @@ async fn run_verify(
         tracing::info!("verify `{name}`: fix round {rounds}");
         let mut options = deps.agent_options.clone();
         options.mode = Mode::Build;
-        let mut agent = Agent::new(deps.provider.clone(), options);
+        options.ask_gate = deps.ask_gate.clone();
+        let mut agent = Agent::new(deps.provider.clone(), options, deps.permission_gate.clone());
         let deltas = Arc::new(std::sync::Mutex::new(String::new()));
         let capture = deltas.clone();
         agent.subscribe(move |event| {

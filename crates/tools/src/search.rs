@@ -59,11 +59,11 @@ impl Tool for SearchTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::failed("search", "missing string argument `query`"))?
             .to_lowercase();
-        let root = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| crate::resolve_path(&context.cwd, path))
-            .unwrap_or_else(|| context.cwd.clone());
+        let root = crate::resolve_path(
+            "search",
+            &context.cwd,
+            arguments.get("path").and_then(Value::as_str).unwrap_or("."),
+        )?;
         if !root.is_dir() {
             return Ok(ToolOutcome::error(format!(
                 "`{}` is not a directory; search works on a project root",

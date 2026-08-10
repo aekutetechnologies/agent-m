@@ -72,7 +72,9 @@ pub fn index_path_for(root: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
     root.to_string_lossy().hash(&mut hasher);
     let hash = hasher.finish();
-    agent_dir().join("index").join(format!("{hash:016x}.json"))
+    agent_dir()
+        .join("index")
+        .join(format!("{hash:016x}-v2.json"))
 }
 
 /// Build (or refresh) the index for `root`. Returns the index.
@@ -174,6 +176,9 @@ fn walk_files(dir: &Path, files: &mut Vec<PathBuf>) {
         };
         if file_type.is_symlink() {
             continue; // no symlink loops
+        }
+        if crate::paths::is_sensitive(&path) {
+            continue; // skip secrets
         }
         if file_type.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();

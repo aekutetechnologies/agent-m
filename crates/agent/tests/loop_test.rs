@@ -144,12 +144,11 @@ impl Tool for EchoTool {
     }
 }
 
-fn options(gate: Arc<dyn agent_m_agent::PermissionGate>) -> AgentOptions {
+fn options() -> AgentOptions {
     AgentOptions {
         model: "fake".to_string(),
         system_prompt: "You are a test agent.".to_string(),
         tools: vec![Arc::new(EchoTool)],
-        permission_gate: gate,
         max_turns: 5,
         cwd: PathBuf::from("."),
         mode: agent_m_agent::Mode::Build,
@@ -185,7 +184,7 @@ async fn emits_pi_event_ordering_through_tool_calls() {
         FakeLlm::tool_response("echo", json!({ "text": "hi" })),
         FakeLlm::text_response("done", 8),
     ]));
-    let mut agent = Agent::new(fake, options(Arc::new(AlwaysAllowGate)));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
 
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
@@ -242,7 +241,7 @@ async fn denied_tool_call_becomes_error_result() {
         FakeLlm::text_response("understood", 0),
     ]));
     let deny = Arc::new(BoolGate::new(|_| false));
-    let mut agent = Agent::new(fake, options(deny));
+    let mut agent = Agent::new(fake, options(), deny);
 
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
@@ -280,7 +279,7 @@ async fn model_error_is_reported_as_notice_and_run_ends() {
             message: "connection reset".to_string(),
         },
     ]]));
-    let mut agent = Agent::new(fake, options(Arc::new(AlwaysAllowGate)));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
 
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
@@ -308,7 +307,7 @@ async fn cache_stats_accumulate_across_turns() {
         FakeLlm::text_response("first", 5),
         FakeLlm::text_response("second", 3),
     ]));
-    let mut agent = Agent::new(fake, options(Arc::new(AlwaysAllowGate)));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
 
     let stats: Arc<Mutex<Option<CacheStats>>> = Arc::new(Mutex::new(None));
     let capture = stats.clone();
@@ -383,7 +382,7 @@ async fn interrupt_aborts_the_stream() {
         }
     }
 
-    let mut agent = Agent::new(Arc::new(SlowLlm), options(Arc::new(AlwaysAllowGate)));
+    let mut agent = Agent::new(Arc::new(SlowLlm), options(), Arc::new(AlwaysAllowGate));
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
     agent.subscribe(move |event| capture.lock().unwrap().push(event.clone()));
@@ -496,13 +495,13 @@ async fn plan_mode_hides_mutating_tools() {
                 Arc::new(SearchStub),
                 Arc::new(BashStub),
             ],
-            permission_gate: Arc::new(AlwaysAllowGate),
             max_turns: 6,
             cwd: PathBuf::from("."),
             mode: agent_m_agent::Mode::Plan,
             ask_gate: None,
             context_window: None,
         },
+        Arc::new(AlwaysAllowGate),
     );
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
@@ -652,13 +651,13 @@ async fn ask_tool_returns_user_answer_and_continues() {
             model: "fake".to_string(),
             system_prompt: "You are a test agent.".to_string(),
             tools: vec![Arc::new(AskStub)],
-            permission_gate: Arc::new(AlwaysAllowGate),
             max_turns: 4,
             cwd: PathBuf::from("."),
             mode: agent_m_agent::Mode::Build,
             ask_gate: Some(Arc::new(gate)),
             context_window: None,
         },
+        Arc::new(AlwaysAllowGate),
     );
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let capture = events.clone();
@@ -697,13 +696,13 @@ async fn compaction_replaces_older_messages_with_summary() {
             model: "fake".to_string(),
             system_prompt: "You are a test agent.".to_string(),
             tools: vec![Arc::new(EchoTool)],
-            permission_gate: Arc::new(AlwaysAllowGate),
             max_turns: 5,
             cwd: PathBuf::from("."),
             mode: agent_m_agent::Mode::Build,
             ask_gate: None,
             context_window: Some(64_000),
         },
+        Arc::new(AlwaysAllowGate),
     );
     agent.prompt("hello".to_string()).await.expect("prompt 1");
     agent.prompt("again".to_string()).await.expect("prompt 2");
@@ -735,31 +734,47 @@ fn bash_call(command: &str) -> ToolCallInfo {
 }
 
 #[test]
-fn dangerous_bash_detects_destructive_commands() {
-    assert!(agent_m_agent::dangerous_bash(&bash_call("rm -rf /tmp/x")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("sudo rm -rf /")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("git checkout --force main")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("git reset --hard HEAD")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("git clean -fd")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("find . -name '*.tmp' -delete")).is_some());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("dd if=x of=/dev/sda")).is_some());
+fn risk_policy_detects_destructive_commands() {
+    let policy = agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    };
+    assert!(policy.risk(&bash_call("rm -rf /tmp/x")).is_some());
+    assert!(policy.risk(&bash_call("sudo rm -rf /")).is_some());
+    assert!(
+        policy
+            .risk(&bash_call("git checkout --force main"))
+            .is_some()
+    );
+    assert!(policy.risk(&bash_call("git reset --hard HEAD")).is_some());
+    assert!(policy.risk(&bash_call("git clean -fd")).is_some());
+    assert!(
+        policy
+            .risk(&bash_call("find . -name '*.tmp' -delete"))
+            .is_some()
+    );
+    assert!(policy.risk(&bash_call("dd if=x of=/dev/sda")).is_some());
     // Benign commands pass.
-    assert!(agent_m_agent::dangerous_bash(&bash_call("ls -la")).is_none());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("rm file.txt")).is_none());
-    assert!(agent_m_agent::dangerous_bash(&bash_call("git status")).is_none());
-    // Non-bash tools are never flagged.
+    assert!(policy.risk(&bash_call("ls -la")).is_none());
+    assert!(policy.risk(&bash_call("rm file.txt")).is_none());
+    assert!(policy.risk(&bash_call("git status")).is_none());
+    // Non-bash tools are never flagged by command risk.
     let read = ToolCallInfo {
         tool_call_id: "t2".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": "rm -rf /" }),
     };
-    assert!(agent_m_agent::dangerous_bash(&read).is_none());
+    assert!(policy.risk(&read).is_none());
 }
 
 #[tokio::test]
 async fn selective_gate_asks_only_for_destructive_commands() {
+    let policy = Arc::new(agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolCallInfo>();
-    let gate = agent_m_agent::SelectiveAskGate::new(move |call: ToolCallInfo| {
+    let gate = agent_m_agent::SelectiveAskGate::new(policy, move |call: ToolCallInfo| {
         let tx = tx.clone();
         Box::pin(async move {
             let _ = tx.send(call);
@@ -787,11 +802,15 @@ async fn selective_gate_asks_only_for_destructive_commands() {
 
 #[tokio::test]
 async fn dangerous_gate_denies_destructive_under_auto_approve() {
-    let gate = agent_m_agent::DangerousCommandGate(AlwaysAllowGate);
+    let policy = Arc::new(agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    });
+    let gate = agent_m_agent::DangerousCommandGate::new(policy, AlwaysAllowGate);
     match gate.authorize(&bash_call("rm -rf /tmp/x")).await {
         Permission::Denied(message) => {
             assert!(
-                message.contains("rm -rf"),
+                message.contains("recursive delete"),
                 "reason should name the risk: {message}"
             )
         }

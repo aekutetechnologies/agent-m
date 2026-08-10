@@ -44,7 +44,7 @@ impl Tool for ReadTool {
             .and_then(Value::as_u64)
             .map(|v| v as usize);
 
-        let path = crate::resolve_path(&context.cwd, path);
+        let path = crate::resolve_path("read", &context.cwd, path)?;
         // Bound memory and time: reject huge or non-regular files up front and
         // cap the read duration (security review MEDIUM).
         const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;

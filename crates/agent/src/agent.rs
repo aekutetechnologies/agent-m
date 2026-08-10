@@ -51,8 +51,6 @@ pub struct AgentOptions {
     pub system_prompt: String,
     /// The tools the model may call (already allow/deny filtered).
     pub tools: Vec<Arc<dyn Tool>>,
-    /// Gate consulted before each tool call.
-    pub permission_gate: Arc<dyn PermissionGate>,
     /// Safety cap on the number of model turns (including tool-call turns).
     pub max_turns: usize,
     /// Working directory for tools.
@@ -146,6 +144,7 @@ type AgentListener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
 pub struct Agent {
     provider: Arc<dyn Provider>,
     options: AgentOptions,
+    gate: Arc<dyn PermissionGate>,
     /// Byte-stable tool specs, computed once at construction.
     tool_specs: Vec<ToolSpec>,
     messages: Vec<SessionMessage>,
@@ -158,11 +157,16 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(provider: Arc<dyn Provider>, options: AgentOptions) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        options: AgentOptions,
+        gate: Arc<dyn PermissionGate>,
+    ) -> Self {
         let tool_specs = Self::tool_specs_for(&options);
         Self {
             provider,
             options,
+            gate,
             tool_specs,
             messages: Vec::new(),
             cache_stats: CacheStats::default(),
@@ -582,7 +586,7 @@ impl Agent {
     }
 
     async fn run_tool(&self, call: &ToolCallInfo) -> ToolOutcome {
-        match self.options.permission_gate.authorize(call).await {
+        match self.gate.authorize(call).await {
             Permission::Denied(reason) => ToolOutcome::error(format!(
                 "Permission denied for tool `{}`: {reason}",
                 call.name

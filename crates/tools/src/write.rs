@@ -43,7 +43,7 @@ impl Tool for WriteTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::failed("write", "missing string argument `content`"))?;
 
-        let path = crate::resolve_path(&context.cwd, path);
+        let path = crate::resolve_path("write", &context.cwd, path)?;
         if let Some(parent) = Path::new(&path).parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 ToolError::failed(

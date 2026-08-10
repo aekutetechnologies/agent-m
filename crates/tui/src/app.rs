@@ -198,6 +198,7 @@ pub struct App {
     picker_index: usize,
     info_open: bool,
 
+    risk: Arc<agent_m_agent::RiskPolicy>,
     pending_approval: Option<ApprovalRequest>,
     pending_ask: Option<AskRequest>,
     ask_rx: mpsc::UnboundedReceiver<AskRequest>,
@@ -237,10 +238,15 @@ impl App {
                 })
             }
         };
+        let risk = Arc::new(agent_m_agent::RiskPolicy {
+            cwd: inputs.cwd.clone(),
+            opaque_tools: vec![], // TUI has no plugins yet; will be needed when they load
+        });
         let gate: Arc<dyn agent_m_agent::PermissionGate> = if inputs.approve_tools {
-            // Destructive commands always ask; everything else auto-approves.
+            // Risky commands always ask; everything else auto-approves.
             let closure = make_gate_closure(approval_tx.clone());
             Arc::new(agent_m_agent::SelectiveAskGate::new(
+                risk.clone(),
                 move |call: agent_m_agent::ToolCallInfo| closure(&call),
             ))
         } else {
@@ -292,10 +298,10 @@ impl App {
         let mut agent = Agent::new(
             inputs.provider.clone(),
             AgentOptions {
-                permission_gate: gate,
                 ask_gate: Some(ask_gate),
                 ..inputs.agent_options.clone()
             },
+            gate.clone(),
         );
         agent.restore_messages(resumed);
         let event_tx_runner = event_tx.clone();
@@ -359,6 +365,7 @@ impl App {
             model_picker_open: false,
             picker_index: 0,
             info_open: false,
+            risk,
             pending_approval: None,
             pending_ask: None,
             ask_rx,
@@ -1453,10 +1460,10 @@ impl App {
             } else {
                 serde_json::to_string(&call.arguments).unwrap_or_default()
             };
-            let danger = agent_m_agent::dangerous_bash(call);
+            let risk_hint = self.risk.risk(call);
             let mut lines = vec![Line::from(Span::styled(
-                match danger {
-                    Some(reason) => format!("⚠️ Approve DESTRUCTIVE tool call: {name} ({reason})"),
+                match risk_hint {
+                    Some(reason) => format!("⚠️ Approve RISKY tool call: {name} ({reason})"),
                     None => format!("Approve tool call: {name}"),
                 },
                 Style::default()
