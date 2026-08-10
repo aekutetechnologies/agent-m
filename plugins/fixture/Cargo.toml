@@ -1,0 +1,13 @@
+[package]
+name = "agent-m-plugin-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference cdylib plugin for agent-m (separate-repo shape)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-m-plugin-sdk = { path = "../../crates/plugin-sdk" }
+serde_json = { workspace = true }

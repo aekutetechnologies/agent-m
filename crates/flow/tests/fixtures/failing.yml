@@ -1,0 +1,7 @@
+name: failing
+steps:
+  - type: tool
+    name: failing
+    tool: bash
+    arguments:
+      command: "false"

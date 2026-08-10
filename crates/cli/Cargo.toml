@@ -1,0 +1,27 @@
+[package]
+name = "agent-m-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "agent-m: a pi-style coding agent in Rust"
+
+[[bin]]
+name = "agent-m"
+path = "src/main.rs"
+
+[dependencies]
+agent-m-agent = { path = "../agent" }
+agent-m-flow = { path = "../flow" }
+agent-m-plugin-loader = { path = "../plugin-loader" }
+agent-m-ai = { path = "../ai" }
+agent-m-tools = { path = "../tools" }
+agent-m-tui = { path = "../tui" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

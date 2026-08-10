@@ -1,0 +1,23 @@
+name: basic
+steps:
+  - type: tool
+    name: jira
+    tool: jira-stub
+    arguments:
+      query: "${ticket}"
+  - type: prompt
+    name: plan
+    mode: plan
+    message: "Plan work for ${steps.jira.output.content}"
+  - type: condition
+    name: gate
+    if: "${steps.jira.output.isError} == false"
+    then:
+      - type: ask
+        name: gate
+        question: "Approve the plan?"
+  - type: tool
+    name: ship
+    tool: bash
+    arguments:
+      command: "git status"

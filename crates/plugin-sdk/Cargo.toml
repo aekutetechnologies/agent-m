@@ -1,0 +1,9 @@
+[package]
+name = "agent-m-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C-ABI plugin SDK for agent-m: out-of-tree plugins contribute tools"
+
+[lib]
+crate-type = ["lib", "cdylib"]

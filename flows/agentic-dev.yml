@@ -1,0 +1,67 @@
+# agentic-dev — Issue → PR (GSD phase loop)
+#
+# The canonical example flow: Discuss → Plan → Execute → Verify → Ship.
+# References plugin tools (jira-search, github-create-pr) that you install with
+# `agent-m plugins install <repo>`; the rest uses built-in tools.
+#
+# Run: agent-m --flow flows/agentic-dev.yml --yes
+# Context inputs: ticket, repo (via --flow-context or seeded values).
+
+name: agentic-dev
+description: "Ticket → pull request, GSD-style: discuss, plan, execute, verify, ship"
+
+steps:
+  # ── Discuss: fetch the ticket and the repo ───────────────────────────────
+  - type: tool
+    name: jira-ticket
+    tool: jira-search
+    arguments:
+      query: "${ticket}"
+  - type: tool
+    name: clone
+    tool: bash
+    arguments:
+      command: "git clone ${repo} work"
+
+  # ── Plan: research → numbered Plan → human review ────────────────────────
+  - type: prompt
+    name: discuss
+    mode: plan
+    message: |
+      Ticket: ${steps.jira-ticket.output.content}
+      Repo: ${steps.clone.output.content}
+      Summarize the key implementation decisions for this ticket (GSD Discuss:
+      libraries, error handling, edge cases). Do not plan yet.
+  - type: prompt
+    name: plan
+    mode: plan
+    message: |
+      Based on these decisions: ${steps.discuss.output}
+      Create a numbered Plan: with concrete, verifiable steps.
+  - type: ask
+    name: review-plan
+    question: "Approve the plan? ${steps.plan.output}"
+
+  # ── Execute: implement the approved plan (fresh context per prompt step) ─
+  - type: phase
+    name: execute
+    prompt: |
+      Implement the approved plan. ${steps.plan.output}
+      Use the edit/write tools. Run the tests when done.
+
+  # ── Verify: run the tests, loop fixes up to 3 rounds ─────────────────────
+  - type: verify
+    name: verify
+    command: "cd work && cargo test"
+    max_fix_rounds: 3
+  - type: ask
+    name: review-implementation
+    question: "Implementation verified: ${steps.verify.output}. Review and ship?"
+
+  # ── Ship: raise the pull request ─────────────────────────────────────────
+  - type: tool
+    name: pr
+    tool: github-create-pr
+    arguments:
+      title: "${ticket}"
+      body: "Closes ${ticket}\n\nPlan: ${steps.plan.output}\nVerify: ${steps.verify.output}"

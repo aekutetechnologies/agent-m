@@ -1,0 +1,22 @@
+[package]
+name = "agent-m-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Built-in agent tools: bash, read, write, edit, grep, find, ls"
+
+[dependencies]
+agent-m-agent = { path = "../agent" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
