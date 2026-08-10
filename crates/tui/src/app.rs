@@ -4,13 +4,16 @@
 //! agent events into the transcript with follow-end scrolling.
 
 use agent_m_agent::{
-    Agent, AgentEvent, AgentOptions, ClosureGate, Permission, SessionMessage, Tool, ToolContext,
+    Agent, AgentEvent, AgentOptions, Permission, SessionMessage, Tool, ToolContext,
 };
 use agent_m_ai::{ContentPart, ModelSpec, Provider, StopReason, Usage};
 use agent_m_tools::BashTool;
 use anyhow::{Context, Result};
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     self as crossterm_terminal, EnterAlternateScreen, LeaveAlternateScreen,
@@ -164,6 +167,10 @@ pub struct App {
     cwd: PathBuf,
 
     items: Vec<TranscriptItem>,
+    /// Items before this index are from a completed, no-longer-current
+    /// turn: their tool output/thinking render collapsed unless explicitly
+    /// expanded. Sealed by `seal_turn()` at the start of each new action.
+    collapsed_before: usize,
     editor: Editor,
     editor_view_top: usize,
     completion: Option<String>,
@@ -242,16 +249,19 @@ impl App {
             cwd: inputs.cwd.clone(),
             opaque_tools: vec![], // TUI has no plugins yet; will be needed when they load
         });
-        let gate: Arc<dyn agent_m_agent::PermissionGate> = if inputs.approve_tools {
-            // Risky commands always ask; everything else auto-approves.
-            let closure = make_gate_closure(approval_tx.clone());
-            Arc::new(agent_m_agent::SelectiveAskGate::new(
+        // A human is always present in the interactive TUI, so the gate is
+        // risk-based unconditionally, `--yes` or not: read-only tools never
+        // prompt, risky calls always do (ECC GateGuard), and everything else
+        // — including benign shell commands like `ls`/`cat` run via `bash` —
+        // auto-approves. `--yes` still matters for print mode and flows,
+        // which have no human to ask and default to denying everything.
+        let closure = make_gate_closure(approval_tx.clone());
+        let gate: Arc<dyn agent_m_agent::PermissionGate> = Arc::new(
+            agent_m_agent::ReadOnlyAutoApproveGate::new(agent_m_agent::SelectiveAskGate::new(
                 risk.clone(),
                 move |call: agent_m_agent::ToolCallInfo| closure(&call),
-            ))
-        } else {
-            Arc::new(ClosureGate::new(make_gate_closure(approval_tx.clone())))
-        };
+            )),
+        );
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<SubmitCommand>();
@@ -329,6 +339,8 @@ impl App {
                 todos: resumed_todos.clone(),
             });
         }
+        // Resumed history is all past turns: it starts collapsed.
+        let collapsed_before = items.len();
 
         let mut app = App {
             inputs,
@@ -337,6 +349,7 @@ impl App {
             show_cache_notices: false,
             cwd: PathBuf::new(),
             items,
+            collapsed_before,
             editor: Editor::new(),
             editor_view_top: 0,
             completion: None,
@@ -511,9 +524,13 @@ impl App {
             Terminal::new(CrosstermBackend::new(stdout))?
         };
         crossterm_terminal::enable_raw_mode()?;
+        // Without this, wheel scroll goes to the host terminal instead of the
+        // app — in regular mode that reveals raw scrollback underneath us.
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
 
         let result = self.event_loop(&mut terminal).await;
 
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
         crossterm_terminal::disable_raw_mode()?;
         if self.ui_mode == UiMode::Fullscreen {
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -539,6 +556,18 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => {
                         self.handle_key(key).await;
+                        changed = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.apply_app_action(AppAction::ScrollUp).await
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.apply_app_action(AppAction::ScrollDown).await
+                            }
+                            _ => {}
+                        }
                         changed = true;
                     }
                     Event::Resize(_, _) => changed = true,
@@ -614,8 +643,12 @@ impl App {
             }
         }
         // The plan is ready: e/s/r decide what happens next. Only when the
-        // editor is empty so normal typing/messages are never intercepted.
-        if self.plan_choice_pending && self.editor.text().is_empty() {
+        // editor is empty so normal typing/messages are never intercepted,
+        // and not for ctrl+r (toggle thinking) which shares the 'r' key.
+        if self.plan_choice_pending
+            && self.editor.text().is_empty()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             match key.code {
                 KeyCode::Char('e' | 'E') => {
                     self.execute_plan();
@@ -682,6 +715,13 @@ impl App {
 
     /// Execute the approved plan: flip to build mode and send the plan as a
     /// follow-up prompt that tracks completion with `[DONE:n]` markers.
+    /// Seal the transcript boundary: everything currently in `items` becomes
+    /// collapsible; new items added by the action about to run stay
+    /// expanded until the *next* sealed action.
+    fn seal_turn(&mut self) {
+        self.collapsed_before = self.items.len();
+    }
+
     fn execute_plan(&mut self) {
         let plan_text: String = self
             .todos
@@ -699,6 +739,7 @@ impl App {
         );
         self.streaming = true;
         self.last_error = None;
+        self.seal_turn();
         let _ = self.submit_tx.send(SubmitCommand::Prompt(prompt));
         self.push_notice("executing the plan — mark steps with [DONE:n]");
     }
@@ -716,6 +757,7 @@ impl App {
             .retain(|item| !matches!(item, TranscriptItem::Plan { .. }));
         self.streaming = true;
         self.last_error = None;
+        self.seal_turn();
         let _ = self.submit_tx.send(SubmitCommand::Prompt(
             "Please refine the plan above: improve the steps (keep the `Plan:` numbered format)."
                 .to_string(),
@@ -786,6 +828,24 @@ impl App {
                 }
             }
             AppAction::ToggleThinking => {
+                let last_thinking = self.items.iter_mut().rev().find_map(|item| match item {
+                    TranscriptItem::Assistant { parts, .. }
+                        if parts
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::Thinking { .. })) =>
+                    {
+                        Some(item)
+                    }
+                    _ => None,
+                });
+                if let Some(TranscriptItem::Assistant {
+                    thinking_expanded, ..
+                }) = last_thinking
+                {
+                    *thinking_expanded = !*thinking_expanded;
+                }
+            }
+            AppAction::ToggleCacheNotices => {
                 self.show_cache_notices = !self.show_cache_notices;
             }
             AppAction::ApproveTool => self.respond_to_approval(Permission::Allowed),
@@ -898,11 +958,13 @@ impl App {
         self.last_error = None;
         self.question_pending = false;
         self.plan_choice_pending = false;
+        self.seal_turn();
         let _ = self.submit_tx.send(SubmitCommand::Prompt(text));
     }
 
     /// Execute bash directly (pi's `!cmd`), showing the result as a tool block.
     async fn run_inline_bash(&mut self, command: String) {
+        self.seal_turn();
         self.editor.set_text("");
         let tool_call_id = uuid::Uuid::now_v7().simple().to_string();
         self.items.push(TranscriptItem::ToolExecution {
@@ -947,9 +1009,12 @@ impl App {
                 "agent-m help\n\nSlash commands: /help /hotkeys /clear /exit /quit /model /new /settings /cache /info /plan /build /todos /context /compact\n!command runs bash directly. Type a prompt and press Enter to chat.",
             ),
             "/hotkeys" => self.push_notice(
-                "enter submit · shift+enter/ctrl+j newline · tab autocomplete\nctrl+c clear (empty: exit) · ctrl+d exit · escape interrupt\nctrl+l model select · ctrl+o tool output · ctrl+n info · ctrl+p/ctrl+shift+p model cycle\nctrl+a/e line · ctrl+b/f word · ctrl+w/u/k kill · ctrl+y yank · ctrl+- undo\npageUp/pageDown scroll · ctrl+t toggle cache notices",
+                "enter submit · shift+enter/ctrl+j newline · tab autocomplete\nctrl+c clear (empty: exit) · ctrl+d exit · escape interrupt\nctrl+l model select · ctrl+o tool output · ctrl+r toggle thinking · ctrl+n info · ctrl+p/ctrl+shift+p model cycle\nctrl+a/e line · ctrl+b/f word · ctrl+w/u/k kill · ctrl+y yank · ctrl+- undo\npageUp/pageDown/mouse wheel scroll · ctrl+t toggle cache notices",
             ),
-            "/clear" => self.items.clear(),
+            "/clear" => {
+                self.items.clear();
+                self.collapsed_before = 0;
+            }
             "/exit" | "/quit" => self.should_exit = true,
             "/plan" => {
                 let _ = self.submit_tx.send(SubmitCommand::SetMode(agent_m_agent::Mode::Plan));
@@ -1069,6 +1134,7 @@ impl App {
             "/info" => self.info_open = !self.info_open,
             "/new" => {
                 self.items.clear();
+                self.collapsed_before = 0;
                 self.todos.clear();
                 let _ = crate::sessions::save_todos(
                     &self.inputs.agent_dir,
@@ -1193,6 +1259,7 @@ impl App {
                     self.items.push(TranscriptItem::Assistant {
                         parts: Vec::new(),
                         stop_reason: StopReason::Pending,
+                        thinking_expanded: false,
                     });
                 }
             }
@@ -1400,8 +1467,8 @@ impl App {
 
     fn transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for item in &self.items {
-            lines.extend(item.render(&self.theme, width));
+        for (index, item) in self.items.iter().enumerate() {
+            lines.extend(item.render(&self.theme, width, index < self.collapsed_before));
         }
         lines
     }
@@ -1415,7 +1482,8 @@ impl App {
         let total: usize = self
             .items
             .iter()
-            .map(|item| item.height(&self.theme, width))
+            .enumerate()
+            .map(|(index, item)| item.height(&self.theme, width, index < self.collapsed_before))
             .sum();
         let viewport = area.height as usize;
         let top = if self.follow_end {
@@ -1990,6 +2058,7 @@ fn push_message_item(items: &mut Vec<TranscriptItem>, message: &SessionMessage) 
         } => items.push(TranscriptItem::Assistant {
             parts: content.clone(),
             stop_reason: *stop_reason,
+            thinking_expanded: false,
         }),
         SessionMessage::ToolResult { .. } => {}
         SessionMessage::Summary { text } => items.push(TranscriptItem::Notice {

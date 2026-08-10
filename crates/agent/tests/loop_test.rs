@@ -819,3 +819,63 @@ async fn dangerous_gate_denies_destructive_under_auto_approve() {
     let permission = gate.authorize(&bash_call("git status")).await;
     assert_eq!(permission, Permission::Allowed);
 }
+
+#[tokio::test]
+async fn read_only_tools_bypass_the_inner_gate() {
+    // Inner denies everything; only read-only tool names should skip it.
+    let gate = agent_m_agent::ReadOnlyAutoApproveGate::new(BoolGate::new(|_| false));
+    let read_call = ToolCallInfo {
+        tool_call_id: "t1".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "src/main.rs" }),
+    };
+    assert_eq!(gate.authorize(&read_call).await, Permission::Allowed);
+    let ls_call = ToolCallInfo {
+        tool_call_id: "t2".to_string(),
+        name: "ls".to_string(),
+        arguments: json!({}),
+    };
+    assert_eq!(gate.authorize(&ls_call).await, Permission::Allowed);
+
+    let write_call = ToolCallInfo {
+        tool_call_id: "t3".to_string(),
+        name: "write".to_string(),
+        arguments: json!({ "path": "src/main.rs", "content": "" }),
+    };
+    assert!(matches!(
+        gate.authorize(&write_call).await,
+        Permission::Denied(_)
+    ));
+}
+
+#[tokio::test]
+async fn benign_shell_commands_auto_approve_without_yes() {
+    // The TUI's actual interactive gate shape: SelectiveAskGate wrapped in
+    // ReadOnlyAutoApproveGate, regardless of --yes. A model that runs `ls`
+    // or `cat` via `bash` instead of the dedicated tools must not prompt.
+    let policy = Arc::new(agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    });
+    let gate = agent_m_agent::ReadOnlyAutoApproveGate::new(agent_m_agent::SelectiveAskGate::new(
+        policy,
+        |_call: ToolCallInfo| Box::pin(async { Permission::Denied("should not ask".to_string()) }),
+    ));
+    assert_eq!(
+        gate.authorize(&bash_call("ls -la")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        gate.authorize(&bash_call("cat README.md")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        gate.authorize(&bash_call("git status")).await,
+        Permission::Allowed
+    );
+    // A risky command must still ask (here: denied, proving it reached the ask closure).
+    assert_eq!(
+        gate.authorize(&bash_call("rm -rf /tmp/x")).await,
+        Permission::Denied("should not ask".to_string())
+    );
+}

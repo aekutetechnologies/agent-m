@@ -20,6 +20,6 @@ pub use message::{SessionMessage, SessionMessageKind};
 pub use risk::RiskPolicy;
 pub use tool::{
     AlwaysAllowGate, AskGate, BoolGate, ClosureAskGate, ClosureGate, DangerousCommandGate,
-    DenyAllGate, Permission, PermissionGate, SelectiveAskGate, Tool, ToolCallInfo, ToolContext,
-    ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
+    DenyAllGate, Permission, PermissionGate, ReadOnlyAutoApproveGate, SelectiveAskGate, Tool,
+    ToolCallInfo, ToolContext, ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
 };

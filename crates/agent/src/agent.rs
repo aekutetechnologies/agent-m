@@ -37,7 +37,7 @@ impl Mode {
 const PLAN_MODE_BLOCK: &str = "\n\nYou are in PLAN MODE. You may only read, search, and ask questions — you cannot modify files or run state-changing commands. Available tools: `ls` (list a directory — use this instead of reading a directory), `read` (read one file), `grep` (search file contents), `find` (locate files), `ask` (ask the user a question). There is no `bash` tool in plan mode. Explore the codebase, then create a detailed numbered plan under a heading `Plan:`, one item per line (`1. step`). Each step must be a concrete, verifiable action. Do not execute the plan yet.";
 
 /// The tools a plan-mode agent may call (read-only + ask).
-const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "ask", "search"];
+pub(crate) const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "ask", "search"];
 
 /// Instructions for the compaction summarizer (memory across sessions).
 const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation by a coding agent. Keep it concise but complete: the goal, key decisions, files touched, important tool results, user preferences, and open questions. 300 words or fewer.";

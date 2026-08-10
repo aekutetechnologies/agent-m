@@ -79,9 +79,16 @@ impl Theme {
         Self::from_map("light", &Self::light_colors())
     }
 
-    /// Pick dark/light from the terminal environment. pi queries OSC-11; the
-    /// MVP heuristic reads `COLORFGBG` (the terminal's default fg;bg indices,
-    /// dark background = bg index < 8).
+    /// Pick dark/light from the terminal environment. Priority: `COLORFGBG`
+    /// (rxvt/urxvt/Konsole convention), then macOS system appearance (a
+    /// proxy for Terminal.app's default profile), else `dark()`.
+    // ponytail: a raw OSC-11 background query (what pi does) is the correct
+    // cross-platform answer, but hand-rolling it safely — bounded read,
+    // guaranteed raw-mode restore on every exit path including panics —
+    // is a bigger, riskier change than this heuristic warrants today. The
+    // macOS check covers the common case (default profile follows system
+    // appearance) without touching terminal state; it does not see a
+    // custom profile color. Promote to OSC-11 if that proves insufficient.
     pub fn default_for_terminal() -> Self {
         if let Ok(colorfg) = std::env::var("COLORFGBG") {
             let background = colorfg.split(';').nth(1).unwrap_or("0");
@@ -92,7 +99,43 @@ impl Theme {
                 return Self::light();
             }
         }
+        if let Some(dark) = macos_dark_mode() {
+            return if dark { Self::dark() } else { Self::light() };
+        }
         Self::dark()
+    }
+
+    /// Downgrade every `Rgb` color to the nearest 256-color `Indexed` unless
+    /// the terminal advertises truecolor support. crossterm writes `Rgb` as
+    /// the 24-bit SGR form unconditionally (no capability check), and a
+    /// terminal that doesn't understand it — Terminal.app is 256-color only —
+    /// parses the parameters as independent legacy codes, so components in
+    /// 40-47 silently paint a background the theme never asked for.
+    pub fn downgrade_for_terminal(self) -> Self {
+        if supports_truecolor() {
+            return self;
+        }
+        Self {
+            name: self.name,
+            user_message_bg: quantize(self.user_message_bg),
+            user_message_text: quantize(self.user_message_text),
+            md_heading: quantize(self.md_heading),
+            md_code: quantize(self.md_code),
+            md_code_bg: quantize(self.md_code_bg),
+            md_bold: quantize(self.md_bold),
+            md_italic: quantize(self.md_italic),
+            md_link: quantize(self.md_link),
+            thinking_text: quantize(self.thinking_text),
+            error: quantize(self.error),
+            warning: quantize(self.warning),
+            muted: quantize(self.muted),
+            dim: quantize(self.dim),
+            tool_pending_bg: quantize(self.tool_pending_bg),
+            tool_success_bg: quantize(self.tool_success_bg),
+            tool_error_bg: quantize(self.tool_error_bg),
+            accent: quantize(self.accent),
+            scrollbar: quantize(self.scrollbar),
+        }
     }
 
     fn from_map(name: &str, colors: &serde_json::Map<String, Value>) -> Self {
@@ -191,6 +234,60 @@ impl Theme {
     }
 }
 
+/// `Some(true)` = system Dark Mode active, `Some(false)` = Light Mode,
+/// `None` = not macOS or the query failed (caller falls back to `dark()`).
+#[cfg(target_os = "macos")]
+fn macos_dark_mode() -> Option<bool> {
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()
+        .map(|output| output.status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_dark_mode() -> Option<bool> {
+    None
+}
+
+/// De-facto standard set by iTerm2, Ghostty, WezTerm, kitty, Alacritty and
+/// VS Code; Terminal.app leaves it unset. Unknown → assume 256-color, which
+/// fails safe (a quantized palette on a truecolor terminal looks nearly
+/// identical; the converse is the bug this function exists to avoid).
+fn supports_truecolor() -> bool {
+    matches!(
+        std::env::var("COLORTERM").as_deref(),
+        Ok("truecolor") | Ok("24bit")
+    )
+}
+
+fn quantize(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Indexed(rgb_to_ansi256(r, g, b)),
+        other => other,
+    }
+}
+
+/// Standard rgb→ansi256 approximation: the 24-step grayscale ramp
+/// (232-255) when r≈g≈b, otherwise the 6×6×6 color cube (16-231).
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    let (rf, gf, bf) = (r as i32, g as i32, b as i32);
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    if max - min < 10 {
+        let gray = (rf + gf + bf) / 3;
+        if gray < 8 {
+            return 16;
+        }
+        if gray > 248 {
+            return 231;
+        }
+        return (((gray - 8) as f32 / 247.0 * 24.0).round() as u8) + 232;
+    }
+    let scale = |c: i32| (c as f32 / 255.0 * 5.0).round() as u8;
+    16 + 36 * scale(rf) + 6 * scale(gf) + scale(bf)
+}
+
 /// Parse "#rgb", "#rrggbb", a named color, or "" (terminal default).
 pub fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim();
@@ -239,6 +336,28 @@ mod tests {
         assert_eq!(theme.md_heading, Color::Rgb(0, 0xff, 0));
         // Unspecified keys fall back to the dark defaults.
         assert_eq!(theme.user_message_bg, Theme::dark().user_message_bg);
+    }
+
+    #[test]
+    fn quantize_maps_rgb_to_ansi256() {
+        assert_eq!(quantize(Color::Rgb(0x80, 0x80, 0x80)), Color::Indexed(244));
+        assert_eq!(quantize(Color::Rgb(0xff, 0, 0)), Color::Indexed(196));
+        assert_eq!(quantize(Color::Reset), Color::Reset);
+        assert_eq!(quantize(Color::Red), Color::Red);
+    }
+
+    #[test]
+    fn downgrade_for_terminal_removes_all_rgb_unless_truecolor() {
+        unsafe { std::env::remove_var("COLORTERM") };
+        let downgraded = Theme::dark().downgrade_for_terminal();
+        assert!(!matches!(downgraded.tool_success_bg, Color::Rgb(..)));
+        assert!(!matches!(downgraded.muted, Color::Rgb(..)));
+        assert!(!matches!(downgraded.user_message_bg, Color::Rgb(..)));
+
+        unsafe { std::env::set_var("COLORTERM", "truecolor") };
+        let kept = Theme::dark().downgrade_for_terminal();
+        assert!(matches!(kept.tool_success_bg, Color::Rgb(..)));
+        unsafe { std::env::remove_var("COLORTERM") };
     }
 
     #[test]

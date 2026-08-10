@@ -182,11 +182,15 @@ pub enum Permission {
     Denied(String),
 }
 
-/// Decides whether a tool call may run. The TUI without `--yes` prompts for
-/// every call; with `--yes` it uses SelectiveAskGate (asks only for risky calls).
-/// Print mode and flows without `--yes` deny all; with `--yes` they use
-/// DangerousCommandGate (denies risky, allows benign). `--no-tools` is the
-/// strongest boundary: no tools registered, nothing to authorize.
+/// Decides whether a tool call may run. The TUI always wraps
+/// SelectiveAskGate in ReadOnlyAutoApproveGate, `--yes` or not: read-only
+/// tools never prompt, risky calls always do (ECC GateGuard), everything
+/// else — including a benign shell command like `ls`/`cat` run via `bash`
+/// — auto-approves, because a human is present either way. Print mode and
+/// flows have no human to ask, so `--yes` still matters there: without it
+/// they deny all (including reads); with it they use DangerousCommandGate
+/// (denies risky, allows benign). `--no-tools` is the strongest boundary:
+/// no tools registered, nothing to authorize.
 #[async_trait]
 pub trait PermissionGate: Send + Sync {
     async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission;
@@ -248,6 +252,33 @@ impl<G: PermissionGate + Send + Sync> PermissionGate for DangerousCommandGate<G>
                 )),
                 other => other,
             }
+        } else {
+            self.inner.authorize(tool_call).await
+        }
+    }
+}
+
+/// Wraps another gate so read-only tools (no side effects: `read`, `grep`,
+/// `find`, `ls`, `ask`, `search` — the same set plan mode allows) never need
+/// approval; everything else defers to `inner`. Used by the interactive TUI
+/// so browsing a codebase doesn't mean a y/n prompt per file. Not applied to
+/// print mode / flows: their "disabled unless --yes" default has no UI to
+/// bypass anything through, so it stays as-is.
+pub struct ReadOnlyAutoApproveGate<G> {
+    inner: G,
+}
+
+impl<G> ReadOnlyAutoApproveGate<G> {
+    pub fn new(inner: G) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<G: PermissionGate + Send + Sync> PermissionGate for ReadOnlyAutoApproveGate<G> {
+    async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission {
+        if crate::agent::PLAN_TOOLS.contains(&tool_call.name.as_str()) {
+            Permission::Allowed
         } else {
             self.inner.authorize(tool_call).await
         }

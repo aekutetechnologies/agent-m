@@ -87,7 +87,7 @@ agent-m runs with the full privileges of the invoking user. It has no OS-level s
 The most secure boundary: if a tool is not registered (`--no-tools`, `--exclude-tools bash`), the model cannot invoke it. Plan mode (`/plan` or `--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`, `search`) plus `ask`, so destructive operations cannot reach the filesystem.
 
 ### 2. Human approval (interactive TUI only)
-In the interactive TUI without `--yes`, every tool call waits for your approval. **Risk hints** — cheap heuristics over command strings and write targets — flag calls that look destructive (recursive deletes, git force operations, writes outside the workspace, writes to `.git/hooks`) with a **⚠️ RISKY** prompt. These hints catch accidents from a cooperative model, not adversarial prompts. A bash command can hide anything via `eval "$(base64 -d …)"`, so risk detection is advisory, never a containment boundary.
+A human is present in the interactive TUI, so the gate is risk-based whether or not you pass `--yes`: read-only tools (`read`, `grep`, `find`, `ls`, `search`, `ask`) never prompt, and neither does a benign shell command — `ls`, `cat somefile`, `git status` — even when the model runs it via `bash` rather than a dedicated tool. Only calls that look destructive wait for your approval. **Risk hints** — cheap heuristics over command strings and write targets — flag calls that look destructive (recursive deletes, git force operations, writes outside the workspace, writes to `.git/hooks`) with a **⚠️ RISKY** prompt; these always ask, even under `--yes` (ECC GateGuard). These hints catch accidents from a cooperative model, not adversarial prompts. A bash command can hide anything via `eval "$(base64 -d …)"`, so risk detection is advisory, never a containment boundary.
 
 In print mode with `--yes`, and in flow execution with `--yes`, risk-hinted calls are **denied outright** — there is no human to ask. Without `--yes`, print mode and flows deny all tool calls.
 
@@ -189,13 +189,17 @@ plugin tools.
 | `ctrl+d` | exit |
 | `Escape` | interrupt the running reply |
 | `ctrl+l` | cycle model |
-| `ctrl+o` | expand/collapse tool output |
+| `ctrl+o` | expand/collapse the most recent tool output |
+| `ctrl+r` | expand/collapse the most recent thinking trace |
 | `ctrl+p` / `ctrl+shift+p` | cycle model forward/backward |
 | `ctrl+a`/`ctrl+e` | line start/end |
 | `ctrl+b`/`ctrl+f` | word left/right |
 | `ctrl+w`/`ctrl+u`/`ctrl+k` | kill word/backward/forward |
 | `ctrl+y` / `ctrl+-` | yank / undo |
-| `PageUp`/`PageDown` | scroll transcript |
+| `PageUp`/`PageDown` / mouse wheel | scroll transcript |
+
+Tool output and thinking from a finished turn collapse to a one-line receipt/summary once you
+move on to the next prompt (or `!command`) — `ctrl+o`/`ctrl+r` re-expand the most recent one.
 
 Slash commands: `/help`, `/hotkeys`, `/clear`, `/exit`, `/quit`, `/model`,
 `/new`, `/settings`, `/cache`. `!command` runs bash directly.

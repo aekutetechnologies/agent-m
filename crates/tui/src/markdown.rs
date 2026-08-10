@@ -69,6 +69,26 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     current.push(Span::styled(text.to_string(), current_style));
                 }
             }
+            Event::Code(text) => {
+                current.push(Span::styled(
+                    text.to_string(),
+                    Style::default().fg(theme.md_code),
+                ));
+            }
+            Event::Start(Tag::Strong) => {
+                current_style = current_style.fg(theme.md_bold).add_modifier(Modifier::BOLD);
+            }
+            Event::End(TagEnd::Strong) => {
+                current_style = Style::default();
+            }
+            Event::Start(Tag::Emphasis) => {
+                current_style = current_style
+                    .fg(theme.md_italic)
+                    .add_modifier(Modifier::ITALIC);
+            }
+            Event::End(TagEnd::Emphasis) => {
+                current_style = Style::default();
+            }
             Event::Start(Tag::List(_)) => {
                 flush(&mut current, &mut lines);
                 list_depth += 1;
@@ -93,8 +113,10 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             }
             Event::Rule => {
                 flush(&mut current, &mut lines);
+                // Render width isn't known here; a short rule never wraps,
+                // unlike the old hardcoded 80 columns on a narrower terminal.
                 lines.push(Line::from(Span::styled(
-                    "─".repeat(80),
+                    "─".repeat(40),
                     Style::default().fg(theme.dim),
                 )));
             }
@@ -163,6 +185,37 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("fn main()"))
         }));
+    }
+
+    #[test]
+    fn inline_code_survives_rendering() {
+        let theme = Theme::dark();
+        let lines = render_markdown("use `serde_json` here", &theme);
+        let found = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "serde_json");
+        let span = found.expect("inline code span was dropped");
+        assert_eq!(span.style.fg, Some(theme.md_code));
+    }
+
+    #[test]
+    fn bold_and_italic_get_theme_colors() {
+        let theme = Theme::dark();
+        let lines = render_markdown("Some **bold** and *italic* text.", &theme);
+        let spans: Vec<&Span> = lines.iter().flat_map(|line| line.spans.iter()).collect();
+        let bold = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "bold")
+            .expect("bold span missing");
+        assert_eq!(bold.style.fg, Some(theme.md_bold));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let italic = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "italic")
+            .expect("italic span missing");
+        assert_eq!(italic.style.fg, Some(theme.md_italic));
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]

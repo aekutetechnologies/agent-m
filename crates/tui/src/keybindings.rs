@@ -39,6 +39,7 @@ pub enum AppAction {
     ModelCycleBackward,
     ToggleToolOutput,
     ToggleThinking,
+    ToggleCacheNotices,
     /// Open/close the session info panel (ctrl+i).
     ToggleInfo,
     ApproveTool,
@@ -69,8 +70,9 @@ pub struct KeyContext {
 /// Resolve a key event to an action. Mirrors pi's defaults:
 /// enter submit, shift+enter/ctrl+j newline, tab autocomplete, ctrl+c clear
 /// (double ctrl+c exits), ctrl+d exit when empty, escape interrupt,
-/// ctrl+l model select, ctrl+o toggle tool output, ctrl+p/ctrl+shift+p model
-/// cycle, ctrl+t toggle thinking, y/n approve/deny while a call is pending.
+/// ctrl+l model select, ctrl+o toggle tool output, ctrl+r toggle thinking,
+/// ctrl+p/ctrl+shift+p model cycle, ctrl+t toggle cache notices, y/n
+/// approve/deny while a call is pending.
 pub fn resolve_key(key: KeyEvent, context: KeyContext) -> Option<Action> {
     let modifiers = key.modifiers;
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
@@ -110,7 +112,8 @@ pub fn resolve_key(key: KeyEvent, context: KeyContext) -> Option<Action> {
         KeyCode::Char('n') if ctrl => Some(Action::App(AppAction::ToggleInfo)),
         KeyCode::Char('p') if ctrl && shift => Some(Action::App(AppAction::ModelCycleBackward)),
         KeyCode::Char('p') if ctrl => Some(Action::App(AppAction::ModelCycleForward)),
-        KeyCode::Char('t') if ctrl => Some(Action::App(AppAction::ToggleThinking)),
+        KeyCode::Char('t') if ctrl => Some(Action::App(AppAction::ToggleCacheNotices)),
+        KeyCode::Char('r') if ctrl => Some(Action::App(AppAction::ToggleThinking)),
         KeyCode::Char('b') if ctrl => Some(Action::Editor(EditorAction::MoveLeft)),
         KeyCode::Char('f') if ctrl => Some(Action::Editor(EditorAction::MoveRight)),
         KeyCode::Char('a') if ctrl => Some(Action::Editor(EditorAction::LineStart)),
@@ -220,6 +223,18 @@ mod tests {
         assert_eq!(
             resolve_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), idle()),
             Some(Action::App(AppAction::Exit))
+        );
+        assert_eq!(
+            resolve_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL), idle()),
+            Some(Action::App(AppAction::ToggleCacheNotices))
+        );
+    }
+
+    #[test]
+    fn ctrl_r_toggles_thinking() {
+        assert_eq!(
+            resolve_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), idle()),
+            Some(Action::App(AppAction::ToggleThinking))
         );
     }
 

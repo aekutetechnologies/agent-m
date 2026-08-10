@@ -21,6 +21,9 @@ pub enum TranscriptItem {
     Assistant {
         parts: Vec<ContentPart>,
         stop_reason: StopReason,
+        /// Force-show the `Thinking` part in full even if this item is
+        /// stale (`ctrl+r`), mirroring `ToolExecution.expanded`.
+        thinking_expanded: bool,
     },
     ToolExecution {
         tool_call_id: String,
@@ -40,8 +43,11 @@ pub enum TranscriptItem {
 
 impl TranscriptItem {
     /// Render the item to styled lines. Paragraphs are wrapped by ratatui at
-    /// draw time; use [`TranscriptItem::height`] for layout.
-    pub fn render(&self, theme: &Theme, _width: usize) -> Vec<Line<'static>> {
+    /// draw time; use [`TranscriptItem::height`] for layout. `stale` marks an
+    /// item from a completed, no-longer-current turn: tool output and
+    /// thinking collapse to a compact receipt/summary unless explicitly
+    /// expanded (`ctrl+o`/`ctrl+r`), which always wins over `stale`.
+    pub fn render(&self, theme: &Theme, _width: usize, stale: bool) -> Vec<Line<'static>> {
         match self {
             TranscriptItem::User { content } => {
                 // pi/Claude style: a solid background block with a leading
@@ -69,7 +75,11 @@ impl TranscriptItem {
                 lines.push(Line::default());
                 lines
             }
-            TranscriptItem::Assistant { parts, stop_reason } => {
+            TranscriptItem::Assistant {
+                parts,
+                stop_reason,
+                thinking_expanded,
+            } => {
                 let mut lines = Vec::new();
                 for part in parts {
                     match part {
@@ -77,12 +87,24 @@ impl TranscriptItem {
                             lines.extend(render_markdown(text, theme));
                         }
                         ContentPart::Thinking { thinking } => {
-                            let style = Style::default()
-                                .fg(theme.thinking_text)
-                                .add_modifier(Modifier::ITALIC);
-                            for raw_line in thinking.lines() {
-                                lines
-                                    .push(Line::from(Span::styled(format!("… {raw_line}"), style)));
+                            if stale && !*thinking_expanded {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "🧠 reasoned ({} lines) — ctrl+r to expand",
+                                        thinking.lines().count()
+                                    ),
+                                    Style::default().fg(theme.warning),
+                                )));
+                            } else {
+                                let style = Style::default()
+                                    .fg(theme.thinking_text)
+                                    .add_modifier(Modifier::ITALIC);
+                                for raw_line in thinking.lines() {
+                                    lines.push(Line::from(Span::styled(
+                                        format!("… {raw_line}"),
+                                        style,
+                                    )));
+                                }
                             }
                         }
                         ContentPart::ToolCall { .. } => {
@@ -133,37 +155,41 @@ impl TranscriptItem {
                 )));
 
                 if let Some(outcome) = result {
-                    let content_lines: Vec<&str> = outcome.content.lines().collect();
-                    let show = if *expanded {
-                        content_lines.as_slice()
-                    } else if content_lines.len() > COLLAPSED_TOOL_LINES {
-                        &content_lines[..COLLAPSED_TOOL_LINES]
+                    if stale && !*expanded {
+                        // Stale receipt: the title line above is enough.
                     } else {
-                        content_lines.as_slice()
-                    };
-                    let color = if outcome.is_error {
-                        theme.error
-                    } else {
-                        theme.muted
-                    };
-                    let style = Style::default().bg(bg).fg(color);
-                    for line in show {
-                        lines.push(Line::from(Span::styled(line.to_string(), style)));
-                    }
-                    if content_lines.len() > COLLAPSED_TOOL_LINES && !*expanded {
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "… {} more lines (ctrl+o to expand)",
-                                content_lines.len() - COLLAPSED_TOOL_LINES
-                            ),
-                            Style::default().bg(bg).fg(theme.warning),
-                        )));
-                    }
-                    if outcome.is_error {
-                        lines.push(Line::from(Span::styled(
-                            "(tool failed)",
-                            Style::default().bg(bg).fg(theme.error),
-                        )));
+                        let content_lines: Vec<&str> = outcome.content.lines().collect();
+                        let show = if *expanded {
+                            content_lines.as_slice()
+                        } else if content_lines.len() > COLLAPSED_TOOL_LINES {
+                            &content_lines[..COLLAPSED_TOOL_LINES]
+                        } else {
+                            content_lines.as_slice()
+                        };
+                        let color = if outcome.is_error {
+                            theme.error
+                        } else {
+                            theme.muted
+                        };
+                        let style = Style::default().bg(bg).fg(color);
+                        for line in show {
+                            lines.push(Line::from(Span::styled(line.to_string(), style)));
+                        }
+                        if content_lines.len() > COLLAPSED_TOOL_LINES && !*expanded {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "… {} more lines (ctrl+o to expand)",
+                                    content_lines.len() - COLLAPSED_TOOL_LINES
+                                ),
+                                Style::default().bg(bg).fg(theme.warning),
+                            )));
+                        }
+                        if outcome.is_error {
+                            lines.push(Line::from(Span::styled(
+                                "(tool failed)",
+                                Style::default().bg(bg).fg(theme.error),
+                            )));
+                        }
                     }
                 } else {
                     lines.push(Line::from(Span::styled(
@@ -212,13 +238,19 @@ impl TranscriptItem {
         }
     }
 
-    /// Total rendered height at the given width (wrap-aware).
-    pub fn height(&self, theme: &Theme, width: usize) -> usize {
+    /// Total rendered height at the given width (wrap-aware). `stale` must
+    /// match whatever was passed to [`TranscriptItem::render`] for the same
+    /// item, or the two will disagree on line count.
+    pub fn height(&self, theme: &Theme, width: usize, stale: bool) -> usize {
         match self {
             TranscriptItem::User { content } => {
                 crate::markdown::markdown_height(content, theme, width) + 1
             }
-            TranscriptItem::Assistant { parts, stop_reason } => {
+            TranscriptItem::Assistant {
+                parts,
+                stop_reason,
+                thinking_expanded,
+            } => {
                 let mut height = 0usize;
                 for part in parts {
                     match part {
@@ -226,10 +258,14 @@ impl TranscriptItem {
                             height += crate::markdown::markdown_height(text, theme, width);
                         }
                         ContentPart::Thinking { thinking } => {
-                            height += thinking
-                                .lines()
-                                .map(|line| line_height(&Line::from(line.to_string()), width))
-                                .sum::<usize>();
+                            if stale && !*thinking_expanded {
+                                height += 1;
+                            } else {
+                                height += thinking
+                                    .lines()
+                                    .map(|line| line_height(&Line::from(line.to_string()), width))
+                                    .sum::<usize>();
+                            }
                         }
                         ContentPart::ToolCall { .. } => {}
                     }
@@ -248,20 +284,22 @@ impl TranscriptItem {
             } => {
                 let mut height = 1; // title
                 if let Some(outcome) = result {
-                    let content_lines: Vec<&str> = outcome.content.lines().collect();
-                    let shown = if *expanded {
-                        content_lines.len()
-                    } else {
-                        content_lines.len().min(COLLAPSED_TOOL_LINES)
-                    };
-                    for line in content_lines.iter().take(shown) {
-                        height += line_height(&Line::from(line.to_string()), width);
-                    }
-                    if content_lines.len() > COLLAPSED_TOOL_LINES && !*expanded {
-                        height += 1;
-                    }
-                    if outcome.is_error {
-                        height += 1;
+                    if !stale || *expanded {
+                        let content_lines: Vec<&str> = outcome.content.lines().collect();
+                        let shown = if *expanded {
+                            content_lines.len()
+                        } else {
+                            content_lines.len().min(COLLAPSED_TOOL_LINES)
+                        };
+                        for line in content_lines.iter().take(shown) {
+                            height += line_height(&Line::from(line.to_string()), width);
+                        }
+                        if content_lines.len() > COLLAPSED_TOOL_LINES && !*expanded {
+                            height += 1;
+                        }
+                        if outcome.is_error {
+                            height += 1;
+                        }
                     }
                 } else {
                     height += 1; // "Running…"
@@ -338,7 +376,7 @@ mod tests {
         let item = TranscriptItem::User {
             content: "hello".to_string(),
         };
-        let lines = item.render(&theme, 40);
+        let lines = item.render(&theme, 40, false);
         assert!(lines.len() >= 2);
         let first = &lines[0].spans;
         assert!(first.iter().any(|span| span.content.starts_with('❯')));
@@ -370,7 +408,7 @@ mod tests {
             result: Some(ToolOutcome::success(long)),
             expanded: false,
         };
-        let lines = item.render(&theme, 60);
+        let lines = item.render(&theme, 60, false);
         let text: String = lines
             .iter()
             .map(|line| {
@@ -398,7 +436,7 @@ mod tests {
             result: Some(ToolOutcome::success(long)),
             expanded: true,
         };
-        let lines = item.render(&theme, 60);
+        let lines = item.render(&theme, 60, false);
         let text: String = lines
             .iter()
             .map(|line| {
@@ -419,7 +457,88 @@ mod tests {
         let item = TranscriptItem::User {
             content: "hello world".to_string(),
         };
-        let rendered = item.render(&theme, 200).len();
-        assert_eq!(item.height(&theme, 200), rendered);
+        let rendered = item.render(&theme, 200, false).len();
+        assert_eq!(item.height(&theme, 200, false), rendered);
+    }
+
+    fn render_text(item: &TranscriptItem, theme: &Theme, width: usize, stale: bool) -> String {
+        item.render(theme, width, stale)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn stale_tool_output_is_receipt_only() {
+        let theme = Theme::dark();
+        let long = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = TranscriptItem::ToolExecution {
+            tool_call_id: "c1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "ls" }),
+            result: Some(ToolOutcome::success(long)),
+            expanded: false,
+        };
+        let text = render_text(&item, &theme, 60, true);
+        assert!(!text.contains("line 0"), "got: {text}");
+        assert!(!text.contains("more lines"), "got: {text}");
+        assert!(text.contains("ls"), "title should remain: {text}");
+    }
+
+    #[test]
+    fn expanded_overrides_stale() {
+        let theme = Theme::dark();
+        let long = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = TranscriptItem::ToolExecution {
+            tool_call_id: "c1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({}),
+            result: Some(ToolOutcome::success(long)),
+            expanded: true,
+        };
+        let text = render_text(&item, &theme, 60, true);
+        assert!(text.contains("line 49"), "got: {text}");
+    }
+
+    #[test]
+    fn stale_thinking_is_summarized() {
+        let theme = Theme::dark();
+        let item = TranscriptItem::Assistant {
+            parts: vec![ContentPart::Thinking {
+                thinking: "step one\nstep two\nstep three".to_string(),
+            }],
+            stop_reason: StopReason::Stop,
+            thinking_expanded: false,
+        };
+        let text = render_text(&item, &theme, 60, true);
+        assert!(!text.contains("step one"), "got: {text}");
+        assert!(text.contains("ctrl+r to expand"), "got: {text}");
+    }
+
+    #[test]
+    fn thinking_expanded_overrides_stale() {
+        let theme = Theme::dark();
+        let item = TranscriptItem::Assistant {
+            parts: vec![ContentPart::Thinking {
+                thinking: "step one\nstep two".to_string(),
+            }],
+            stop_reason: StopReason::Stop,
+            thinking_expanded: true,
+        };
+        let text = render_text(&item, &theme, 60, true);
+        assert!(text.contains("… step one"), "got: {text}");
+        assert!(text.contains("… step two"), "got: {text}");
     }
 }

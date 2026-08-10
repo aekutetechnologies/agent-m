@@ -182,17 +182,18 @@ fn resolve_theme(cli: &Cli, settings: &serde_json::Value) -> Result<Theme> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     });
-    match choice.as_deref() {
-        None => Ok(Theme::default_for_terminal()),
-        Some("dark") => Ok(Theme::dark()),
-        Some("light") => Ok(Theme::light()),
+    let theme = match choice.as_deref() {
+        None => Theme::default_for_terminal(),
+        Some("dark") => Theme::dark(),
+        Some("light") => Theme::light(),
         Some(path) => {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("cannot read theme file {path}"))?;
             agent_m_tui::theme::parse_theme(&contents)
-                .map_err(|error| anyhow::anyhow!("invalid theme {path}: {error}"))
+                .map_err(|error| anyhow::anyhow!("invalid theme {path}: {error}"))?
         }
-    }
+    };
+    Ok(theme.downgrade_for_terminal())
 }
 
 fn resolve_ui_mode(cli: &Cli, settings: &serde_json::Value) -> UiMode {
