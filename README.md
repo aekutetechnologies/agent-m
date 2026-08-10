@@ -8,6 +8,10 @@ The UI is modeled on [pi](https://pi.dev)'s interactive mode (transcript +
 fixed editor/footer dock, same default keybindings), implemented with the same
 stack warp's terminal agent CLI uses (ratatui + crossterm).
 
+📚 **Docs**: a Mintlify documentation site lives in [`docs/`](docs/overview.mdx)
+— quickstart, CLI reference, trust principles, flows, plugins, and
+architecture (`mint.json` + `.mdx` pages, validated by `scripts/docs-check.sh`).
+
 ## Features
 
 - Interactive TUI: streaming markdown replies, tool-execution blocks with
@@ -203,6 +207,39 @@ move on to the next prompt (or `!command`) — `ctrl+o`/`ctrl+r` re-expand the m
 
 Slash commands: `/help`, `/hotkeys`, `/clear`, `/exit`, `/quit`, `/model`,
 `/new`, `/settings`, `/cache`. `!command` runs bash directly.
+
+## Trust (check.md principles)
+
+The harness — never the LLM — decides what is safe. All twelve principles from
+`check.md` are addressed; the model only *reports* (reason, confidence, evidence)
+and the harness *enforces* (risk tiers, autonomy levels).
+
+| # | Principle | Status |
+|---|-----------|--------|
+| 1 | Transparency | ✅ Tool narration in the status line (`Reading …`, `Running \`…\``) |
+| 2 | Explain decisions | ✅ `<trust>` block parsed into a "── decision ──" block under every reply |
+| 3 | Plan before execution | ✅ Plan mode + `<plan>` items + time estimate in the decision block |
+| 4 | Confidence | ✅ 0-100 gauge, color-coded by tier, in the decision block and `/info` |
+| 5 | Risk-based permissions | ✅ 4 tiers (Low/Medium/High/Critical) by `RiskPolicy`; `TierGate`/`LevelGate` |
+| 6 | Meaningful interruptions | ✅ Consequence framing + tier badge (⚠️ HIGH / 🔴 CRITICAL); High/Critical always ask, even `--yes` |
+| 7 | Audit trail | ✅ Timestamped JSONL entries + `/journal` narrated timeline |
+| 8 | Reversible actions | ✅ `/undo` restores write/edit snapshots; ledger persists per session |
+| 9 | Evidence | ✅ `file:line — note` citations rendered from `<evidence>` |
+| 10 | Uncertainty | ✅ `<uncertainty>` note shown in the decision block |
+| 11 | Preference learning | ✅ Learns `!command` families + `/undo` → `preferences.json` → static prompt block |
+| 12 | Autonomy levels | ✅ `--level 0-4` / `/level`: observe · suggest · assisted · trusted · autonomous |
+
+**Risk tiers** (harness-assigned): reads/searches → Low; workspace writes and
+ordinary commands → Medium; outside-cwd / `.git` / force-git / `find -exec` →
+High; recursive deletes / sudo / device writes / opaque plugin tools → Critical.
+
+**Autonomy levels**: 0 observe (no tools), 1 suggest, 2 everything asks,
+3 trusted (default: auto Low/Medium, ask High/Critical), 4 autonomous (auto
+everything except Critical). Persisted in `settings.json`.
+
+**Slash commands added**: `/journal` (audit timeline), `/undo` (restore the last
+file snapshot), `/level <0-4>` (autonomy). `!command` still runs bash directly
+and is what the preference learner watches.
 
 ## Architecture
 

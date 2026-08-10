@@ -39,8 +39,27 @@ const PLAN_MODE_BLOCK: &str = "\n\nYou are in PLAN MODE. You may only read, sear
 /// The tools a plan-mode agent may call (read-only + ask).
 pub(crate) const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "ask", "search"];
 
+/// Static trust-metadata instruction appended to every system prompt
+/// (check.md principles 2/3/4/9/10). Static text keeps the prefix byte-stable.
+const TRUST_BLOCK: &str = "\n\nEnd each reply with a <trust> block the harness machine-reads (it is never shown to the user): <confidence>0-100</confidence>, <reason>, <expected_outcome>, <evidence> with <item file=\"…\" line=\"…\">note</item> entries, <uncertainty>, <plan> with <item> steps, and <estimated_time>. Omit any field you cannot answer honestly; do not invent evidence or confidence.";
+
 /// Instructions for the compaction summarizer (memory across sessions).
 const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation by a coding agent. Keep it concise but complete: the goal, key decisions, files touched, important tool results, user preferences, and open questions. 300 words or fewer.";
+
+/// Pull the `<trust>` block out of the last text part (the model is
+/// instructed to end the reply with it) and return (trust, parts-without).
+fn extract_trust(parts: &[ContentPart]) -> (agent_m_ai::TrustData, Vec<ContentPart>) {
+    let mut result = parts.to_vec();
+    let Some(last_text) = result.iter_mut().rev().find_map(|part| match part {
+        ContentPart::Text { text } => Some(text),
+        _ => None,
+    }) else {
+        return (agent_m_ai::TrustData::default(), result);
+    };
+    let (trust, cleaned) = agent_m_ai::extract_trust_block(last_text);
+    *last_text = cleaned;
+    (trust, result)
+}
 
 /// Configuration for one agent run.
 #[derive(Clone)]
@@ -202,6 +221,14 @@ impl Agent {
 
     /// The system prompt for the current mode (byte-stable within a mode).
     fn current_system_prompt(&self) -> String {
+        let mut prompt = self.raw_system_prompt();
+        prompt.push_str(TRUST_BLOCK);
+        prompt
+    }
+
+    /// The base system prompt (without the mode block), so the trust
+    /// instruction stays a stable suffix.
+    fn raw_system_prompt(&self) -> String {
         match self.options.mode {
             Mode::Build => self.options.system_prompt.clone(),
             Mode::Plan => format!("{}{}", self.options.system_prompt, PLAN_MODE_BLOCK),
@@ -504,11 +531,15 @@ impl Agent {
                 });
             }
 
+            // Best-effort trust metadata: the model ends the reply with a
+            // <trust> block (last text part); strip it and parse it.
+            let (trust, final_parts) = extract_trust(&final_parts);
             let assistant_message = SessionMessage::Assistant {
                 content: final_parts,
                 usage: usage.clone(),
                 stop_reason,
                 model: self.options.model.clone(),
+                trust,
             };
             if let Some(usage) = &usage {
                 self.cache_stats.record(usage);

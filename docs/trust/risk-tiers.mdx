@@ -1,0 +1,39 @@
+---
+title: Risk tiers
+---
+
+# Risk tiers
+
+`RiskPolicy` classifies every tool call into one of four tiers. The
+classification is **harness-side** — cheap, deterministic heuristics over the
+tool name, the command string, and the write target — never the model's
+opinion.
+
+| Tier | Approves | Examples |
+|------|----------|----------|
+| Low | auto | `read`, `grep`, `find`, `ls`, `search`; read-only bash (`ls -la`, `cat x`, `git status`) |
+| Medium | auto | `write`/`edit` inside the workspace; ordinary bash (`cargo test`, `npm install`) |
+| High | asks | writes outside the cwd or into `.git`; `git reset --hard`, `git clean -f`, `git checkout --force`, `git push --force`; `chmod -R`; `find -exec`/`-delete`; `eval`; `curl | sh` |
+| Critical | always asks | `rm -rf` variants; `sudo`/`doas`; device writes (`mkfs`, `fdisk`, `dd`); opaque plugin tools the host cannot inspect |
+
+"Always asks" means High and Critical go to the human **even under `--yes`** —
+the harness has no auto-approve path for them. In print mode and flow execution
+there is no human to ask, so High/Critical calls are **denied outright**.
+
+## What the approval prompt shows
+
+Instead of a bare "Approve tool call?", the TUI shows:
+
+- a tier badge — ⚠️ HIGH or 🔴 CRITICAL — with the reason;
+- consequence framing: "This can destroy data or change the host." / "This
+  could discard or rewrite work."
+
+## Why heuristics, not a denylist
+
+Shell strings are not parseable without a full interpreter. The prior regex
+denylist had 12+ confirmed bypasses (`rm -r --force /`, `chmod -R a+rwx /`,
+`git -C /repo reset --hard`, `>/dev/sda`). Risk detection is therefore
+**accident prevention for a cooperative model**, not a security boundary — a
+bash command can always hide anything behind `eval "$(base64 -d …)"`. The real
+boundaries are: no tool registered, you reading the call, and (roadmap) an OS
+process sandbox around the `bash` tool.

@@ -1,0 +1,58 @@
+---
+title: Security boundaries
+---
+
+# Security boundaries
+
+agent-m runs with the full privileges of the invoking user — it has no OS-level
+sandbox. The security model is three layers, in order of strength.
+
+## 1. No tool registered (strongest)
+
+If a tool is not registered, the model cannot invoke it. `--no-tools` disables
+everything; `--exclude-tools bash` drops the shell. Plan mode (`/plan` or
+`--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`,
+`search`) plus `ask`, so destructive operations cannot reach the filesystem.
+
+## 2. Human approval (interactive TUI)
+
+A human is present, so the gate is risk-based whether or not you pass `--yes`:
+read-only tools and benign shell commands never prompt; calls that look
+destructive wait for your approval with a risk-tier badge and consequence
+framing, and always ask — even under `--yes`. In print mode with `--yes`,
+High/Critical calls are denied outright; without `--yes`, print mode and flows
+deny all tool calls.
+
+Risk detection is advisory (see [Risk tiers](/trust/risk-tiers)) — it catches
+accidents from a cooperative model, not adversarial prompts.
+
+## 3. The OS user agent-m runs as (weakest)
+
+The `bash` tool inherits the session's full environment and runs with your
+privileges. Filesystem containment applies to the seven file tools (`read`,
+`write`, `edit`, `ls`, `grep`, `find`, `search`): they resolve symlinks, check
+`..` escapes, enforce allowed roots (default: cwd only; extend with
+`--allow-path`), and skip sensitive files (`.env*`, `.ssh`, `*.pem`, API keys)
+even inside the workspace. But `bash` can access anything you can, and untrusted
+plugin tools are always flagged for approval.
+
+**Honest ceiling:** an OS sandbox (`sandbox-exec` / `bubblewrap` / container)
+around the `bash` tool is the real upgrade path. Until then, agent-m is safe
+for work on codebases you trust, not for untrusted repos or adversarial
+prompts — prompt injection (hidden instructions in file contents the agent
+reads) reaches the tool loop.
+
+## Guardrails
+
+- **Tool budget** — startup warns if the active tool set exceeds 80 tools.
+- **Context cap** — startup warns if injected context (AGENTS.md + preferences)
+  exceeds 50k characters; `/context` reports tokens vs. the window.
+- **Strategic compaction** — `--compact-threshold` (default 0.5) compacts at
+  turn boundaries once usage passes the fraction, never mid-implementation.
+
+## Audit and rollback
+
+- Every session entry is timestamped; `/journal` renders the narrated timeline.
+- `write`/`edit` targets are snapshotted before execution; `/undo` restores
+  them, and the ledger persists per session across restarts. The status line
+  shows an `undo: /undo (n)` hint after a mutation.

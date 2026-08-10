@@ -5,6 +5,7 @@ pub mod editor;
 pub mod keybindings;
 pub mod markdown;
 pub mod plan;
+pub mod prefs;
 pub mod sessions;
 pub mod theme;
 pub mod transcript;

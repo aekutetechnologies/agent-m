@@ -105,6 +105,12 @@ struct Cli {
     #[arg(long = "flow")]
     flow: Option<PathBuf>,
 
+    /// Autonomy level 0-4 (check.md principle 12): 0 observe · 1 suggest ·
+    /// 2 assisted (everything asks) · 3 trusted (default; auto low/medium,
+    /// ask high/critical) · 4 autonomous (auto everything except critical).
+    #[arg(long = "level")]
+    level: Option<u8>,
+
     /// Extra directory the file tools may access (repeatable). bash is NOT contained.
     #[arg(long = "allow-path")]
     allow_path: Vec<PathBuf>,
@@ -160,6 +166,19 @@ fn load_settings(agent_dir: &Path) -> serde_json::Value {
         .ok()
         .and_then(|contents| serde_json::from_str(&contents).ok())
         .unwrap_or(serde_json::json!({}))
+}
+
+fn resolve_level(cli: &Cli, settings: &serde_json::Value) -> agent_m_agent::AutonomyLevel {
+    let number = cli
+        .level
+        .or_else(|| {
+            settings
+                .get("level")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as u8)
+        })
+        .unwrap_or(3);
+    agent_m_agent::AutonomyLevel::from_number(number).unwrap_or_default()
 }
 
 fn resolve_model(cli: &Cli, settings: &serde_json::Value) -> String {
@@ -347,8 +366,11 @@ async fn main() -> Result<()> {
     // Context creation: AGENTS.md instructions (ancestors + global) are
     // appended once per session, keeping the request prefix byte-stable.
     let context_files = agent_m_agent::discover_instructions(&cwd);
+    // check.md principle 11: reflect learned preferences back to the model as
+    // a static block (rebuilt only when preferences change — byte-stable).
+    let preference_block = agent_m_tui::prefs::prompt_block(&agent_m_tui::prefs::load(&agent_dir));
     let system_prompt = format!(
-        "{base_prompt}{}",
+        "{base_prompt}{}{preference_block}",
         agent_m_agent::render_instructions(&context_files)
     );
     if system_prompt.chars().count() > STARTUP_CONTEXT_MAX_CHARS {
@@ -417,6 +439,7 @@ async fn main() -> Result<()> {
         context_files,
         approve_tools: cli.yes,
         compact_threshold: cli.compact_threshold,
+        level: resolve_level(&cli, &settings),
         agent_dir,
         cwd,
     })

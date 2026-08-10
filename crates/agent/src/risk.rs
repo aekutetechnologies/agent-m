@@ -21,46 +21,143 @@ pub struct RiskPolicy {
     pub opaque_tools: Vec<String>,
 }
 
+/// The four trust tiers of check.md principle 5 (risk-based permissions).
+/// The harness — never the model — decides the tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RiskLevel {
+    /// Read files, search logs: no approval.
+    Low,
+    /// Workspace writes, benign commands: optional approval.
+    Medium,
+    /// Destructive-ish changes: approval required.
+    High,
+    /// Delete data, device writes, opaque tools: always required.
+    Critical,
+}
+
+impl RiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RiskLevel::Low => "low",
+            RiskLevel::Medium => "medium",
+            RiskLevel::High => "high",
+            RiskLevel::Critical => "critical",
+        }
+    }
+}
+
+/// A risk assessment: the tier plus the human-readable consequence reason.
+#[derive(Debug, Clone)]
+pub struct RiskAssessment {
+    pub level: RiskLevel,
+    pub reason: Option<String>,
+}
+
+/// A consequence-framing sentence for the approval box ("This will …").
+fn consequence(level: RiskLevel, reason: Option<&str>) -> Option<String> {
+    let base = match level {
+        RiskLevel::Low | RiskLevel::Medium => None,
+        RiskLevel::High => Some("This could discard or rewrite work.".to_string()),
+        RiskLevel::Critical => Some("This can destroy data or change the host.".to_string()),
+    };
+    match (base, reason) {
+        (Some(mut text), Some(reason)) => {
+            text.push_str(&format!(" ({reason})"));
+            Some(text)
+        }
+        (Some(text), None) => Some(text),
+        (None, _) => None,
+    }
+}
+
 impl RiskPolicy {
-    pub fn risk(&self, call: &ToolCallInfo) -> Option<String> {
+    /// 4-tier assessment (check.md principle 5). Opaque plugin tools and
+    /// destructive shell commands are Critical; workspace-hostile changes are
+    /// High; workspace writes and ordinary commands are Medium; reads are Low.
+    pub fn assess(&self, call: &ToolCallInfo) -> RiskAssessment {
         if self.opaque_tools.iter().any(|n| n == &call.name) {
-            return Some(format!(
-                "plugin tool `{}` — the host cannot inspect what it does",
-                call.name
-            ));
+            return RiskAssessment {
+                level: RiskLevel::Critical,
+                reason: Some(format!(
+                    "plugin tool `{}` — the host cannot inspect what it does",
+                    call.name
+                )),
+            };
+        }
+        // Read-only tools are always Low.
+        if crate::agent::PLAN_TOOLS.contains(&call.name.as_str()) && call.name != "ask" {
+            return RiskAssessment {
+                level: RiskLevel::Low,
+                reason: None,
+            };
         }
         // Any tool with a `command` string is a shell, whatever it is named:
         // bash, the test-runner plugin's `run-tests`, future tools.
-        if let Some(command) = call.arguments.get("command").and_then(Value::as_str)
-            && let Some(reason) = command_risk(command)
-        {
-            return Some(reason.to_string());
+        if let Some(command) = call.arguments.get("command").and_then(Value::as_str) {
+            if command_is_read_only(command) {
+                return RiskAssessment {
+                    level: RiskLevel::Low,
+                    reason: None,
+                };
+            }
+            let (level, reason) = command_risk(command);
+            return RiskAssessment {
+                level,
+                reason: reason.map(str::to_string),
+            };
         }
         // write/edit: the target path, not the tool name.
         if matches!(call.name.as_str(), "write" | "edit")
             && let Some(path) = call.arguments.get("path").and_then(Value::as_str)
         {
-            return self.path_risk(path);
+            return self.path_assessment(path);
         }
-        None
+        RiskAssessment {
+            level: RiskLevel::Medium,
+            reason: None,
+        }
     }
 
-    fn path_risk(&self, path: &str) -> Option<String> {
+    /// Backwards-compatible binary flag: Some(reason) for High/Critical.
+    pub fn risk(&self, call: &ToolCallInfo) -> Option<String> {
+        let assessment = self.assess(call);
+        match assessment.level {
+            RiskLevel::High | RiskLevel::Critical => assessment.reason,
+            _ => None,
+        }
+    }
+
+    /// Consequence framing for the approval box (principle 6).
+    pub fn consequence(&self, call: &ToolCallInfo) -> Option<String> {
+        let assessment = self.assess(call);
+        consequence(assessment.level, assessment.reason.as_deref())
+    }
+
+    fn path_assessment(&self, path: &str) -> RiskAssessment {
         let target = normalize(&if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             self.cwd.join(path)
         });
         if !target.starts_with(&self.cwd) {
-            return Some(format!(
-                "writes outside the workspace: {}",
-                target.display()
-            ));
+            return RiskAssessment {
+                level: RiskLevel::High,
+                reason: Some(format!(
+                    "writes outside the workspace: {}",
+                    target.display()
+                )),
+            };
         }
         if target.components().any(|c| c.as_os_str() == ".git") {
-            return Some("writes inside .git (hooks/config run on your next command)".into());
+            return RiskAssessment {
+                level: RiskLevel::High,
+                reason: Some("writes inside .git (hooks/config run on your next command)".into()),
+            };
         }
-        None
+        RiskAssessment {
+            level: RiskLevel::Medium,
+            reason: None,
+        }
     }
 }
 
@@ -86,7 +183,35 @@ fn segments(command: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
 }
 
-fn command_risk(command: &str) -> Option<&'static str> {
+/// Read-only shell commands: auto-approve (Low tier).
+fn command_is_read_only(command: &str) -> bool {
+    segments(command).all(|segment| {
+        let Some(head) = head(segment) else {
+            return true;
+        };
+        match head {
+            "ls" | "cat" | "pwd" | "echo" | "true" | "false" | "head" | "tail" | "wc" | "grep"
+            | "rg" | "env" | "which" | "printf" | "jq" | "sed" | "awk"
+                if !segment.contains(">") =>
+            {
+                true
+            }
+            // git reads only (status/log/diff/show) are fine.
+            "git" => {
+                let rest: Vec<&str> = segment.split_whitespace().skip(1).collect();
+                rest.first().is_some_and(|sub| {
+                    matches!(
+                        *sub,
+                        "status" | "log" | "diff" | "show" | "branch" | "remote"
+                    )
+                })
+            }
+            _ => false,
+        }
+    })
+}
+
+fn command_risk(command: &str) -> (RiskLevel, Option<&'static str>) {
     // Pipe-to-shell: fetch + a shell interpreter anywhere in the pipeline.
     let heads: Vec<&str> = segments(command).filter_map(head).collect();
     let fetches = heads
@@ -96,7 +221,10 @@ fn command_risk(command: &str) -> Option<&'static str> {
         .iter()
         .any(|h| matches!(*h, "sh" | "bash" | "zsh" | "dash"));
     if fetches && shells {
-        return Some("pipes downloaded content into a shell");
+        return (
+            RiskLevel::High,
+            Some("pipes downloaded content into a shell"),
+        );
     }
 
     for segment in segments(command) {
@@ -108,7 +236,10 @@ fn command_risk(command: &str) -> Option<&'static str> {
         };
         // /bin/rm -> rm ; flag obfuscation via expansion is unreadable
         if raw_head.contains('$') {
-            return Some("the command name is built from a shell expansion");
+            return (
+                RiskLevel::High,
+                Some("the command name is built from a shell expansion"),
+            );
         }
         let head = raw_head.rsplit('/').next().unwrap_or(raw_head);
         let rest: Vec<&str> = words.collect();
@@ -118,43 +249,65 @@ fn command_risk(command: &str) -> Option<&'static str> {
             })
         };
         match head {
-            "sudo" | "doas" => return Some("runs as another user (sudo)"),
-            "eval" => return Some("eval: the command cannot be inspected"),
+            "sudo" | "doas" => {
+                return (RiskLevel::Critical, Some("runs as another user (sudo)"));
+            }
+            "eval" => {
+                return (
+                    RiskLevel::High,
+                    Some("eval: the command cannot be inspected"),
+                );
+            }
             "rm" if flag("--recursive", 'r') || flag("--recursive", 'R') => {
-                return Some("recursive delete");
+                return (RiskLevel::Critical, Some("recursive delete"));
             }
             "git" => {
                 // Subcommand token, not adjacency: catches `git -C /repo reset --hard`.
                 if rest.contains(&"reset") && rest.contains(&"--hard") {
-                    return Some("git reset --hard (discards uncommitted work)");
+                    return (
+                        RiskLevel::High,
+                        Some("git reset --hard (discards uncommitted work)"),
+                    );
                 }
                 if rest.contains(&"clean") && (flag("--force", 'f') || flag("--force", 'd')) {
-                    return Some("git clean -f (deletes untracked files)");
+                    return (
+                        RiskLevel::High,
+                        Some("git clean -f (deletes untracked files)"),
+                    );
                 }
                 if rest.contains(&"checkout") && flag("--force", 'f') {
-                    return Some("git checkout --force (discards local changes)");
+                    return (
+                        RiskLevel::High,
+                        Some("git checkout --force (discards local changes)"),
+                    );
                 }
                 if rest.contains(&"push")
                     && (flag("--force", 'f') || rest.iter().any(|w| w.starts_with("--force")))
                 {
-                    return Some("git push --force (rewrites remote history)");
+                    return (
+                        RiskLevel::High,
+                        Some("git push --force (rewrites remote history)"),
+                    );
                 }
             }
             "chmod" | "chown" if flag("--recursive", 'R') => {
-                return Some("recursive permission change");
+                return (RiskLevel::High, Some("recursive permission change"));
             }
             "find"
                 if rest
                     .iter()
                     .any(|w| w.starts_with("-exec") || *w == "-delete") =>
             {
-                return Some("find -exec/-delete");
+                return (RiskLevel::High, Some("find -exec/-delete"));
             }
             "mkfs" | "fdisk" | "dd" | "shred" | "diskutil" => {
-                return Some("disk/device level command");
+                return (RiskLevel::Critical, Some("disk/device level command"));
             }
             "crontab" | "launchctl" | "systemctl" => {
-                return Some("installs or changes a background job");
+                return (
+                    RiskLevel::High,
+                    Some("installs or changes a background job"),
+                );
             }
             _ => {}
         }
@@ -175,10 +328,10 @@ fn command_risk(command: &str) -> Option<&'static str> {
                     )
             })
         {
-            return Some("writes to a device file");
+            return (RiskLevel::Critical, Some("writes to a device file"));
         }
     }
-    None
+    (RiskLevel::Medium, None)
 }
 
 fn head(segment: &str) -> Option<&str> {
@@ -186,4 +339,107 @@ fn head(segment: &str) -> Option<&str> {
         .split_whitespace()
         .next()
         .map(|w| w.rsplit('/').next().unwrap_or(w))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, arguments: Value) -> ToolCallInfo {
+        ToolCallInfo {
+            tool_call_id: "t".to_string(),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    fn policy() -> RiskPolicy {
+        RiskPolicy {
+            cwd: PathBuf::from("/work"),
+            opaque_tools: vec!["jira-search".to_string()],
+        }
+    }
+
+    #[test]
+    fn four_tier_classification() {
+        let policy = policy();
+        // Low: read-only tools and read-only shell commands.
+        assert_eq!(
+            policy
+                .assess(&call("read", json!({ "path": "/work/a.rs" })))
+                .level,
+            RiskLevel::Low
+        );
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "ls -la" })))
+                .level,
+            RiskLevel::Low
+        );
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "git status" })))
+                .level,
+            RiskLevel::Low
+        );
+        // Medium: workspace writes and ordinary commands.
+        assert_eq!(
+            policy
+                .assess(&call("edit", json!({ "path": "/work/a.rs" })))
+                .level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "cargo test" })))
+                .level,
+            RiskLevel::Medium
+        );
+        // High: workspace-hostile changes.
+        assert_eq!(
+            policy
+                .assess(&call("edit", json!({ "path": "/elsewhere/b.rs" })))
+                .level,
+            RiskLevel::High
+        );
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "git reset --hard HEAD" })))
+                .level,
+            RiskLevel::High
+        );
+        // Critical: destructive commands + opaque plugin tools.
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "rm -rf /work/tmp" })))
+                .level,
+            RiskLevel::Critical
+        );
+        assert_eq!(
+            policy
+                .assess(&call("bash", json!({ "command": "sudo rm -f x" })))
+                .level,
+            RiskLevel::Critical
+        );
+        assert_eq!(
+            policy.assess(&call("jira-search", json!({}))).level,
+            RiskLevel::Critical
+        );
+    }
+
+    #[test]
+    fn consequence_framing_exists_for_high_and_critical() {
+        let policy = policy();
+        let high = policy
+            .consequence(&call("bash", json!({ "command": "git reset --hard" })))
+            .expect("high consequence");
+        assert!(high.contains("discard or rewrite"), "got: {high}");
+        let critical = policy
+            .consequence(&call("bash", json!({ "command": "rm -rf /work" })))
+            .expect("critical consequence");
+        assert!(critical.contains("destroy"), "got: {critical}");
+        let low = policy.consequence(&call("read", json!({ "path": "/work/a.rs" })));
+        assert!(low.is_none(), "low has no consequence framing");
+    }
 }

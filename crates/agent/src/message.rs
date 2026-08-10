@@ -13,6 +13,8 @@ pub enum SessionMessage {
         usage: Option<Usage>,
         stop_reason: StopReason,
         model: String,
+        /// Trust metadata parsed from the reply's `<trust>` block.
+        trust: agent_m_ai::TrustData,
     },
     ToolResult {
         tool_call_id: String,

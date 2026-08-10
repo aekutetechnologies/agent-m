@@ -1,0 +1,45 @@
+---
+title: agent-m
+---
+
+# agent-m
+
+A pi-style coding agent in Rust: an interactive terminal UI (ratatui) with a
+DeepSeek-backed streaming agent, tool calling, byte-stable prefix caching, and
+JSONL session persistence.
+
+The UI is modeled on [pi](https://pi.dev)'s interactive mode (transcript +
+fixed editor/footer dock, same default keybindings), implemented with the same
+stack warp's terminal agent CLI uses (ratatui + crossterm).
+
+## Features
+
+- **Interactive TUI** — streaming markdown replies, tool-execution blocks with
+  expand/collapse, a status line with a working spinner, and footer keybinding
+  hints. `ui-mode regular|fullscreen` switches between terminal scrollback and
+  the alternate screen.
+- **Tool calling with approval** — per-call `y`/`n` prompts or `--yes`
+  auto-approve. Tools: `bash`, `read`, `write`, `edit` (exact-text multi-edit
+  + unified diff), `grep`, `find`, `ls`. The default active set is `read`,
+  `bash`, `ls`, `grep`, `find`, `edit`, `write`; plan mode keeps the read-only
+  subset (`ls`, `read`, `grep`, `find`, `ask`).
+- **Model-agnostic provider layer** — OpenAI-compatible chat completions, with
+  DeepSeek configured out of the box (`deepseek-chat`, `deepseek-reasoner`).
+- **Byte-stable prefix caching** — request bodies are serialized
+  deterministically (sorted keys, no volatile fields); the system prompt and
+  tool schemas are assembled once per session and only the new message is
+  appended per turn, so the provider's context cache is served instead of
+  recomputed. Cache hit/miss tokens are parsed into usage and shown in the
+  status line (`/cache` or `ctrl+t` to toggle).
+- **JSONL sessions** — stored under
+  `~/.agent-m/agent/sessions/--<cwd>--/` and auto-resumed.
+- **Trust harness** — the twelve check.md trust principles are implemented:
+  confidence scores, evidence citations, risk tiers, consequence-framed
+  approvals, an audit journal, `/undo` rollback, preference learning, and
+  progressive autonomy levels. See [Trust](/trust/principles).
+
+## Next steps
+
+- [Quickstart](/getting-started/quickstart) — install and run
+- [CLI reference](/cli/reference) — every flag
+- [Trust principles](/trust/principles) — how agent-m earns trust

@@ -49,6 +49,7 @@ impl FakeLlm {
                     stop_reason: StopReason::Stop,
                     error_message: None,
                     model: "fake".to_string(),
+                    trust: Default::default(),
                 },
             },
         ]

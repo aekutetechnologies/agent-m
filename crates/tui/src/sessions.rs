@@ -55,11 +55,19 @@ impl SessionStore {
 
     /// Append one message entry.
     pub fn append(&mut self, message: &SessionMessage) -> Result<()> {
-        let entry = message_to_entry(message)?;
+        let mut entry = message_to_entry(message)?;
+        if entry.get("ts").is_none() {
+            entry["ts"] = json!(now_iso());
+        }
         writeln!(self.file, "{entry}")?;
         self.file.flush()?;
         Ok(())
     }
+}
+
+/// Current local time as an RFC3339-style ISO string for the audit trail.
+pub fn now_iso() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Load the most recent session for `cwd`, if any, as messages.
@@ -103,11 +111,13 @@ fn message_to_entry(message: &SessionMessage) -> Result<Value> {
             usage,
             stop_reason,
             model,
+            trust,
         } => json!({
             "type": "message",
             "kind": "assistant",
             "content": content,
             "usage": usage,
+            "trust": trust,
             "stopReason": stop_reason,
             "model": model
         }),
@@ -161,6 +171,13 @@ fn entry_to_message(value: &Value) -> Result<SessionMessage> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            trust: serde_json::from_value(
+                value
+                    .get("trust")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default())),
+            )
+            .unwrap_or_default(),
         },
         "toolResult" => SessionMessage::ToolResult {
             tool_call_id: value
@@ -217,6 +234,121 @@ fn load_entries(path: &Path) -> Result<Vec<SessionMessage>> {
         })?);
     }
     Ok(messages)
+}
+
+/// A single audit-journal row (principle 7): timestamp + a one-line summary.
+#[derive(Debug, Clone)]
+pub struct JournalEntry {
+    pub time: String,
+    pub kind: String,
+    pub text: String,
+}
+
+/// Read the session file into narrated journal rows (time + kind + summary).
+pub fn journal(agent_dir: &Path, cwd: &Path) -> Vec<JournalEntry> {
+    let dir = session_dir(agent_dir, cwd);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let Some(latest) = files.pop() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&latest) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // Skip the session header (no `kind`) — it is not an event.
+        let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let kind = kind.to_string();
+        let time = value
+            .get("ts")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let text = match kind.as_str() {
+            "user" => value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            "assistant" => value
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default(),
+            "toolResult" => {
+                let name = value.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let content = value.get("content").and_then(Value::as_str).unwrap_or("");
+                let mut line = format!("{name}: {content}");
+                line.truncate(120);
+                line
+            }
+            _ => String::new(),
+        };
+        rows.push(JournalEntry { time, kind, text });
+    }
+    rows
+}
+
+/// One undoable file snapshot (check.md principle 8: reversible actions).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UndoEntry {
+    pub path: String,
+    /// The file's content before the mutation; None = the file did not exist.
+    pub before: Option<String>,
+}
+
+/// Persist the undo ledger for a session (`<agent_dir>/undo/<stem>.json`).
+pub fn save_undo(agent_dir: &Path, session_stem: &str, entries: &[UndoEntry]) -> Result<()> {
+    let dir = agent_dir.join("undo");
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string(entries)?;
+    std::fs::write(dir.join(format!("{session_stem}.json")), text)?;
+    Ok(())
+}
+
+/// Apply one undo entry: restore the before-content or delete the file when
+/// it did not exist before. Returns the action performed for messaging.
+pub fn apply_undo(entry: &UndoEntry) -> std::io::Result<&'static str> {
+    let target = std::path::Path::new(&entry.path);
+    match &entry.before {
+        Some(content) => {
+            std::fs::write(target, content)?;
+            Ok("restored")
+        }
+        None => {
+            std::fs::remove_file(target)?;
+            Ok("deleted")
+        }
+    }
+}
+
+/// Load the undo ledger for a session (empty when absent or corrupt).
+pub fn load_undo(agent_dir: &Path, session_stem: &str) -> Vec<UndoEntry> {
+    let path = agent_dir.join("undo").join(format!("{session_stem}.json"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<UndoEntry>>(&text).ok())
+        .unwrap_or_default()
 }
 
 /// Persist the current task plan for a session as JSON under
@@ -279,6 +411,68 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn undo_ledger_roundtrip() {
+        let dir = tempdir().unwrap();
+        let entries = vec![
+            UndoEntry {
+                path: "src/a.rs".to_string(),
+                before: Some("old content".to_string()),
+            },
+            UndoEntry {
+                path: "new.txt".to_string(),
+                before: None,
+            },
+        ];
+        save_undo(dir.path(), "sess", &entries).unwrap();
+        let loaded = load_undo(dir.path(), "sess");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].before.as_deref(), Some("old content"));
+        assert!(loaded[1].before.is_none(), "None before survives");
+        // Missing/corrupt ledger loads empty.
+        assert!(load_undo(dir.path(), "missing").is_empty());
+    }
+
+    #[test]
+    fn apply_undo_restores_content_and_deletes_new_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "current").unwrap();
+        let entry = UndoEntry {
+            path: path.to_string_lossy().to_string(),
+            before: Some("old content".to_string()),
+        };
+        assert_eq!(apply_undo(&entry).unwrap(), "restored");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
+        // File that did not exist before → deleted.
+        let new_path = dir.path().join("new.txt");
+        std::fs::write(&new_path, "x").unwrap();
+        let entry = UndoEntry {
+            path: new_path.to_string_lossy().to_string(),
+            before: None,
+        };
+        assert_eq!(apply_undo(&entry).unwrap(), "deleted");
+        assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn appended_messages_carry_timestamps_and_journal_reads_them() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        store
+            .append(&SessionMessage::User {
+                content: "hello".to_string(),
+            })
+            .unwrap();
+        let rows = journal(dir.path(), dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "user");
+        assert_eq!(rows[0].text, "hello");
+        assert!(!rows[0].time.is_empty(), "ts recorded: {}", rows[0].time);
+        // ISO-ish: contains a T separator.
+        assert!(rows[0].time.contains('T'), "got: {}", rows[0].time);
+    }
+
+    #[test]
     fn todos_roundtrip() {
         let dir = tempdir().unwrap();
         let todos = vec![
@@ -317,6 +511,7 @@ mod tests {
                 }),
                 stop_reason: StopReason::Stop,
                 model: "deepseek-chat".to_string(),
+                trust: Default::default(),
             },
             SessionMessage::ToolResult {
                 tool_call_id: "call_1".to_string(),

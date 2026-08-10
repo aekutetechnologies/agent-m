@@ -1,8 +1,8 @@
 //! Transcript items: the blocks rendered in the scrollable chat area.
 
 use agent_m_agent::ToolOutcome;
-use agent_m_ai::{ContentPart, StopReason};
-use ratatui::style::{Modifier, Style};
+use agent_m_ai::{ContentPart, StopReason, TrustData};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
@@ -24,6 +24,8 @@ pub enum TranscriptItem {
         /// Force-show the `Thinking` part in full even if this item is
         /// stale (`ctrl+r`), mirroring `ToolExecution.expanded`.
         thinking_expanded: bool,
+        /// Trust metadata from the reply's <trust> block (decision block).
+        trust: agent_m_ai::TrustData,
     },
     ToolExecution {
         tool_call_id: String,
@@ -79,6 +81,7 @@ impl TranscriptItem {
                 parts,
                 stop_reason,
                 thinking_expanded,
+                trust,
             } => {
                 let mut lines = Vec::new();
                 for part in parts {
@@ -127,6 +130,7 @@ impl TranscriptItem {
                     ))),
                     _ => {}
                 }
+                lines.extend(render_decision_block(trust, theme));
                 lines.push(Line::default());
                 lines
             }
@@ -250,6 +254,7 @@ impl TranscriptItem {
                 parts,
                 stop_reason,
                 thinking_expanded,
+                trust,
             } => {
                 let mut height = 0usize;
                 for part in parts {
@@ -276,6 +281,7 @@ impl TranscriptItem {
                 ) {
                     height += 1;
                 }
+                height += decision_height(trust, width);
                 height += 1; // trailing spacer
                 height
             }
@@ -315,6 +321,135 @@ impl TranscriptItem {
 
 /// The bold title line for a tool-execution block, pi-style:
 /// `$ <command>` for bash, `read <path>:12-30`, `edit <path>`, …
+/// Lines for the trust "decision" block under an assistant reply. Every
+/// line is one rendered row (markdown-free) so height is `lines.len()`.
+fn render_decision_block(trust: &TrustData, theme: &Theme) -> Vec<Line<'static>> {
+    if trust.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let accent = Style::default().fg(theme.accent);
+    lines.push(Line::from(Span::styled("── decision ──", accent)));
+    if let Some(reason) = &trust.reason {
+        lines.push(Line::from(Span::styled(
+            format!("why: {reason}"),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    if let Some(confidence) = trust.confidence {
+        let (tier, _) = trust.confidence_tier().expect("tier for value");
+        let (color, label) = match tier {
+            "low" => (theme.error, "low"),
+            "medium" => (theme.warning, "medium"),
+            _ => (Color::Green, "high"),
+        };
+        let cells = (confidence as usize * 10) / 100;
+        let gauge: String = "█".repeat(cells) + &"░".repeat(10 - cells);
+        lines.push(Line::from(vec![Span::styled(
+            format!("confidence: {gauge} {confidence}% ({label})"),
+            color,
+        )]));
+    }
+    for evidence in &trust.evidence {
+        let location = match evidence.line {
+            Some(line) => format!("{}:{line}", evidence.file),
+            None => evidence.file.clone(),
+        };
+        let note = evidence.note.as_deref().unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled("evidence: ", Style::default().fg(theme.dim)),
+            Span::styled(format!("{location}{note}"), Color::Green),
+        ]));
+    }
+    if let Some(outcome) = &trust.expected_outcome {
+        lines.push(Line::from(Span::styled(
+            format!("expect: {outcome}"),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    if let Some(uncertainty) = &trust.uncertainty {
+        lines.push(Line::from(Span::styled(
+            format!("uncertain: {uncertainty}"),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    if !trust.plan.is_empty() {
+        let steps: Vec<String> = trust
+            .plan
+            .iter()
+            .enumerate()
+            .map(|(index, step)| format!("{}. {step}", index + 1))
+            .collect();
+        let mut plan_line = format!("plan: {}", steps.join(" → "));
+        if let Some(time) = &trust.estimated_time {
+            plan_line.push_str(&format!("  (~{time})"));
+        }
+        lines.push(Line::from(Span::styled(
+            plan_line,
+            Style::default().fg(theme.accent),
+        )));
+    }
+    lines
+}
+
+/// Height contribution of the decision block (one row per rendered line).
+fn decision_height(trust: &TrustData, width: usize) -> usize {
+    if trust.is_empty() {
+        return 0;
+    }
+    // Wrap long single-row fields (reason, outcome, uncertainty, plan).
+    let mut height = 1; // header
+    height += trust
+        .reason
+        .as_ref()
+        .map(|r| line_height(&Line::from(r.clone()), width))
+        .unwrap_or(0);
+    height += usize::from(trust.confidence.is_some());
+    height += trust.evidence.len();
+    height += trust
+        .expected_outcome
+        .as_ref()
+        .map(|o| line_height(&Line::from(o.clone()), width))
+        .unwrap_or(0);
+    height += trust
+        .uncertainty
+        .as_ref()
+        .map(|u| line_height(&Line::from(u.clone()), width))
+        .unwrap_or(0);
+    if !trust.plan.is_empty() {
+        let joined: String = trust.plan.join(" → ");
+        height += line_height(&Line::from(joined), width);
+    }
+    height
+}
+
+/// Principle 1 (transparency): a deterministic "what is happening" line for
+/// the status bar while a tool executes — no model cost.
+pub fn narration(name: &str, arguments: &Value) -> String {
+    let path = || arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let value = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
+    let truncate = |s: &str| {
+        let head: String = s.chars().take(120).collect();
+        if head.chars().count() < s.chars().count() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    };
+    match name {
+        "bash" => format!("Running `{}`…", truncate(value("command"))),
+        "read" => format!("Reading {}…", path()),
+        "write" => format!("Writing {}…", path()),
+        "edit" => format!("Editing {}…", path()),
+        "grep" => format!("Searching `{}`…", truncate(value("pattern"))),
+        "find" => format!("Finding files under {}…", path()),
+        "ls" => format!("Listing {}…", path()),
+        "search" => format!("Searching `{}`…", truncate(value("query"))),
+        "ask" => "Asking you…".to_string(),
+        other => format!("Running {other}…"),
+    }
+}
+
 fn tool_title(name: &str, arguments: &Value) -> String {
     let path = || arguments.get("path").and_then(Value::as_str).unwrap_or("");
     let truncate = |s: &str| {
@@ -369,6 +504,83 @@ fn tool_title(name: &str, arguments: &Value) -> String {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+
+    #[test]
+    fn narration_describes_the_active_tool() {
+        let args = |key: &str, value: &str| {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            serde_json::Value::Object(map)
+        };
+        assert_eq!(
+            narration("bash", &args("command", "cargo test")),
+            "Running `cargo test`…"
+        );
+        assert_eq!(
+            narration("read", &args("path", "src/main.rs")),
+            "Reading src/main.rs…"
+        );
+        assert_eq!(
+            narration("edit", &args("path", "src/app.rs")),
+            "Editing src/app.rs…"
+        );
+        assert_eq!(
+            narration("grep", &args("pattern", "TODO")),
+            "Searching `TODO`…"
+        );
+        assert_eq!(narration("ask", &serde_json::json!({})), "Asking you…");
+        assert_eq!(
+            narration("custom-tool", &serde_json::json!({})),
+            "Running custom-tool…"
+        );
+    }
+
+    #[test]
+    fn decision_block_renders_confidence_and_evidence() {
+        let trust = TrustData {
+            confidence: Some(85),
+            reason: Some("Expiry is now validated.".to_string()),
+            evidence: vec![agent_m_ai::Evidence {
+                file: "auth.ts".to_string(),
+                line: Some(83),
+                note: Some("no expiry check".to_string()),
+            }],
+            uncertainty: Some("Not load-tested.".to_string()),
+            plan: vec!["Inspect logs".to_string(), "Run tests".to_string()],
+            estimated_time: Some("30 seconds".to_string()),
+            ..Default::default()
+        };
+        let theme = Theme::default();
+        let lines = render_decision_block(&trust, &theme);
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.contains("── decision ──"), "header: {text}");
+        assert!(text.contains("confidence: ████████"), "gauge: {text}");
+        assert!(text.contains("85% (high)"), "tier: {text}");
+        assert!(
+            text.contains("auth.ts:83no expiry check"),
+            "evidence: {text}"
+        );
+        assert!(
+            text.contains("uncertain: Not load-tested."),
+            "uncertainty: {text}"
+        );
+        assert!(
+            text.contains("plan: 1. Inspect logs → 2. Run tests  (~30 seconds)"),
+            "plan: {text}"
+        );
+        // Empty trust renders nothing.
+        assert!(render_decision_block(&TrustData::default(), &theme).is_empty());
+    }
 
     #[test]
     fn user_block_has_chevron_and_background() {
@@ -520,6 +732,7 @@ mod tests {
                 thinking: "step one\nstep two\nstep three".to_string(),
             }],
             stop_reason: StopReason::Stop,
+            trust: TrustData::default(),
             thinking_expanded: false,
         };
         let text = render_text(&item, &theme, 60, true);
@@ -535,6 +748,7 @@ mod tests {
                 thinking: "step one\nstep two".to_string(),
             }],
             stop_reason: StopReason::Stop,
+            trust: TrustData::default(),
             thinking_expanded: true,
         };
         let text = render_text(&item, &theme, 60, true);

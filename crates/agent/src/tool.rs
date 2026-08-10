@@ -285,6 +285,39 @@ impl<G: PermissionGate + Send + Sync> PermissionGate for ReadOnlyAutoApproveGate
     }
 }
 
+/// check.md principle 5: 4-tier risk-based permissions. Low and Medium
+/// auto-approve; High and Critical always go to the human closure (even under
+/// `--yes`) — "the harness, not the LLM, decides the risk level."
+pub struct TierGate<F> {
+    policy: crate::risk::RiskPolicy,
+    ask: F,
+}
+
+impl<F> TierGate<F>
+where
+    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
+{
+    pub fn new(policy: crate::risk::RiskPolicy, ask: F) -> Self {
+        Self { policy, ask }
+    }
+}
+
+#[async_trait]
+impl<F> PermissionGate for TierGate<F>
+where
+    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
+{
+    async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission {
+        let level = self.policy.assess(tool_call).level;
+        match level {
+            crate::risk::RiskLevel::Low | crate::risk::RiskLevel::Medium => Permission::Allowed,
+            crate::risk::RiskLevel::High | crate::risk::RiskLevel::Critical => {
+                (self.ask)(tool_call.clone()).await
+            }
+        }
+    }
+}
+
 /// Auto-approve every tool call (`--yes`).
 pub struct AlwaysAllowGate;
 
@@ -409,5 +442,120 @@ impl fmt::Debug for ToolRegistry {
             .debug_struct("ToolRegistry")
             .field("tools", &self.names())
             .finish()
+    }
+}
+
+/// check.md principle 12: progressive autonomy levels. Trust is earned
+/// gradually — higher levels auto-approve more, never Critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutonomyLevel {
+    /// 0 — Observe: only watches, no tool execution.
+    Observe,
+    /// 1 — Suggest: suggests actions but does not run them.
+    Suggest,
+    /// 2 — Assisted: runs only after approval (everything asks).
+    Assisted,
+    /// 3 — Trusted: auto Low/Medium, ask High/Critical (the default).
+    #[default]
+    Trusted,
+    /// 4 — Autonomous: auto everything except Critical.
+    Autonomous,
+}
+
+impl AutonomyLevel {
+    pub fn from_number(number: u8) -> Option<Self> {
+        match number {
+            0 => Some(AutonomyLevel::Observe),
+            1 => Some(AutonomyLevel::Suggest),
+            2 => Some(AutonomyLevel::Assisted),
+            3 => Some(AutonomyLevel::Trusted),
+            4 => Some(AutonomyLevel::Autonomous),
+            _ => None,
+        }
+    }
+
+    pub fn number(&self) -> u8 {
+        match self {
+            AutonomyLevel::Observe => 0,
+            AutonomyLevel::Suggest => 1,
+            AutonomyLevel::Assisted => 2,
+            AutonomyLevel::Trusted => 3,
+            AutonomyLevel::Autonomous => 4,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AutonomyLevel::Observe => "observe",
+            AutonomyLevel::Suggest => "suggest",
+            AutonomyLevel::Assisted => "assisted",
+            AutonomyLevel::Trusted => "trusted",
+            AutonomyLevel::Autonomous => "autonomous",
+        }
+    }
+}
+
+/// A permission gate that maps the current autonomy level onto the 4-tier
+/// risk assessment (check.md principles 5 + 12). The level is an atomic so
+/// `/level` can change it live without rebuilding the agent.
+pub struct LevelGate<F> {
+    level: Arc<std::sync::atomic::AtomicU8>,
+    policy: crate::risk::RiskPolicy,
+    ask: F,
+}
+
+impl<F> LevelGate<F>
+where
+    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
+{
+    pub fn new(level: AutonomyLevel, policy: crate::risk::RiskPolicy, ask: F) -> Self {
+        Self {
+            level: Arc::new(std::sync::atomic::AtomicU8::new(level.number())),
+            policy,
+            ask,
+        }
+    }
+
+    pub fn level_handle(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        self.level.clone()
+    }
+
+    pub fn level(&self) -> AutonomyLevel {
+        AutonomyLevel::from_number(self.level.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl<F> PermissionGate for LevelGate<F>
+where
+    F: Fn(ToolCallInfo) -> Pin<Box<dyn Future<Output = Permission> + Send>> + Send + Sync,
+{
+    async fn authorize(&self, tool_call: &ToolCallInfo) -> Permission {
+        let level = self.level();
+        let risk = self.policy.assess(tool_call).level;
+        match (level, risk) {
+            // Levels 0-1 never execute tools.
+            (AutonomyLevel::Observe, _) | (AutonomyLevel::Suggest, _) => {
+                Permission::Denied(format!(
+                    "autonomy level {} ({}) does not execute tools",
+                    level.number(),
+                    level.label()
+                ))
+            }
+            // Level 2: everything goes to the human.
+            (AutonomyLevel::Assisted, _) => (self.ask)(tool_call.clone()).await,
+            // Level 3 (default): auto Low/Medium, ask High/Critical.
+            (
+                AutonomyLevel::Trusted,
+                crate::risk::RiskLevel::Low | crate::risk::RiskLevel::Medium,
+            ) => Permission::Allowed,
+            (AutonomyLevel::Trusted, _) => (self.ask)(tool_call.clone()).await,
+            // Level 4: auto everything except Critical.
+            (AutonomyLevel::Autonomous, crate::risk::RiskLevel::Critical) => {
+                (self.ask)(tool_call.clone()).await
+            }
+            (AutonomyLevel::Autonomous, _) => Permission::Allowed,
+        }
     }
 }

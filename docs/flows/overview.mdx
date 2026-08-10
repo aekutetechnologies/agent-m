@@ -1,0 +1,91 @@
+---
+title: Flows
+---
+
+# Flows (Devin-style pipelines)
+
+`agent-m --flow flows/agentic-dev.yml --yes` runs a YAML pipeline of steps with
+a shared `FlowContext` and `${ref}` references. In the TUI, `/flow <path>` runs
+one interactively and `/flows` lists the flows in `~/.agent-m/flows/`.
+
+## Step types
+
+| Type | What it does |
+|------|--------------|
+| `tool` | Runs a built-in or plugin tool (`tool: bash`, `tool: jira-search`, …) |
+| `prompt` | Runs the agent with a message; `mode: plan` restricts it to read-only tools |
+| `ask` | Pauses for a human answer (flows need a human for `ask`; see `--yes`) |
+| `condition` | Branches on a context value (e.g. `${steps.check.output.isError}`) |
+| `phase` | A fresh-context execution phase (the GSD loop's Execute phase) |
+| `verify` | Runs a command and loops fixes up to `max_fix_rounds` |
+
+Steps run sequentially; a failed step aborts the flow with a clear message.
+Steps share outputs through `${steps.<name>.output}` (and dotted paths like
+`${steps.check.output.isError}`), plus seeded context values such as
+`${ticket}` and `${repo}`.
+
+## The canonical example
+
+The shipped `flows/agentic-dev.yml` is the GSD phase loop — Discuss → Plan →
+Execute → Verify → Ship:
+
+```yaml
+steps:
+  # Discuss: fetch the ticket and the repo
+  - type: tool
+    name: jira-ticket
+    tool: jira-search
+    arguments:
+      query: "${ticket}"
+  - type: tool
+    name: clone
+    tool: bash
+    arguments:
+      command: "git clone ${repo} work"
+
+  # Plan: research → numbered Plan → human review
+  - type: prompt
+    name: discuss
+    mode: plan
+    message: |
+      Ticket: ${steps.jira-ticket.output.content}
+      Summarize the key implementation decisions for this ticket.
+  - type: ask
+    name: review-plan
+    question: "Approve the plan? ${steps.plan.output}"
+
+  # Execute: implement the approved plan (fresh context per prompt step)
+  - type: phase
+    name: execute
+    prompt: |
+      Implement the approved plan. ${steps.plan.output}
+      Use the edit/write tools. Run the tests when done.
+
+  # Verify: run the tests, loop fixes up to 3 rounds
+  - type: verify
+    name: verify
+    command: "cd work && cargo test"
+    max_fix_rounds: 3
+
+  # Ship: raise the pull request
+  - type: tool
+    name: pr
+    tool: github-create-pr
+    arguments:
+      title: "${ticket}"
+      body: "Closes ${ticket}\n\nPlan: ${steps.plan.output}"
+```
+
+The `jira-search` and `github-create-pr` steps are plugin tools — install them
+with `agent-m plugins install <repo>` (see [Plugins](/plugins/overview)).
+
+## Safety and state
+
+- Flow `tool` and `verify` steps go through the permission gate and the
+  destructive-command rules: High/Critical calls are denied (flows have no
+  human to ask unless the `ask` step provides one).
+- Each run writes `STATE.md` + `CONTEXT.json` state artifacts under
+  `~/.agent-m/flows/<name>/`, so progress survives restarts.
+- Prompt steps get a **fresh context** (a new agent instance), so each phase
+  starts clean with exactly what its prompt references — no context rot across
+  a long pipeline.

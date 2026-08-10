@@ -1,0 +1,35 @@
+---
+title: Autonomy levels
+---
+
+# Autonomy levels
+
+Trust is earned gradually. `--level <0-4>` (or `/level <0-4>` in the TUI)
+selects how much the agent may do on its own. Each level maps the four risk
+tiers onto approvals:
+
+| Level | Name | Behavior |
+|-------|------|----------|
+| 0 | observe | Only watches — no tool executes |
+| 1 | suggest | Suggests actions but does not run them |
+| 2 | assisted | Everything asks for approval |
+| 3 | trusted (default) | Auto Low + Medium, asks High + Critical |
+| 4 | autonomous | Auto everything except Critical (Critical still asks) |
+
+The default is level 3 (trusted). The setting persists in
+`~/.agent-m/agent/settings.json` under the `"level"` key, so `/level 4` in one
+session carries into the next.
+
+```bash
+agent-m --level 4            # autonomous for this session
+agent-m --level 1 "what would you change?"   # suggest-only, no execution
+```
+
+In the TUI, `/level 3` prints the behavior of the chosen level; `/level` with no
+argument prints usage.
+
+## Relationship to --yes
+
+`--yes` auto-approves whatever the current level would auto-approve. It is not
+an escape hatch: High and Critical calls still ask (levels 2-4) or are denied
+(print mode and flows, where no human is present).

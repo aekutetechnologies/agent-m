@@ -405,6 +405,9 @@ impl<S> SseParser<S> {
     }
 
     fn push_done(&mut self) {
+        // Best-effort trust metadata from the reply's <trust> block (the
+        // agent strips the block from the stored text before display).
+        let (trust, _) = crate::trust::extract_trust_block(&self.state.text);
         let has_tool_calls = !self.state.tool_calls.is_empty();
 
         let mut content: Vec<ContentPart> = Vec::new();
@@ -436,12 +439,15 @@ impl<S> SseParser<S> {
         } else {
             StopReason::Stop
         });
+        // Best-effort trust metadata from the reply's <trust> block (the
+        // agent strips the block from the stored text before display).
         let message = AssistantMessage {
             content,
             usage: self.state.usage.take(),
             stop_reason,
             error_message: None,
             model: self.model.clone(),
+            trust,
         };
         self.queue.push_back(StreamEvent::Done { message });
         self.state.done_emitted = true;

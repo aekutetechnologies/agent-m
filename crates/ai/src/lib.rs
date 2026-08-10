@@ -15,6 +15,7 @@ mod keys;
 mod models;
 mod openai;
 mod provider;
+mod trust;
 mod types;
 mod wire;
 
@@ -23,6 +24,7 @@ pub use keys::resolve_api_key;
 pub use models::ModelSpec;
 pub use openai::OpenAiCompatibleProvider;
 pub use provider::{AiError, Provider, ProviderRegistry};
+pub use trust::{Evidence, TrustData, extract_trust_block};
 pub use types::{
     AssistantMessage, ChatRequest, ContentPart, LlmMessage, StopReason, StreamEvent, ToolSpec,
     Usage,

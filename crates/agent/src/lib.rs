@@ -17,9 +17,10 @@ mod tool;
 pub use agent::{Agent, AgentEvent, AgentOptions, InterruptHandle, Mode};
 pub use context::{InstructionFile, discover_instructions, render_instructions};
 pub use message::{SessionMessage, SessionMessageKind};
-pub use risk::RiskPolicy;
+pub use risk::{RiskAssessment, RiskLevel, RiskPolicy};
 pub use tool::{
-    AlwaysAllowGate, AskGate, BoolGate, ClosureAskGate, ClosureGate, DangerousCommandGate,
-    DenyAllGate, Permission, PermissionGate, ReadOnlyAutoApproveGate, SelectiveAskGate, Tool,
-    ToolCallInfo, ToolContext, ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
+    AlwaysAllowGate, AskGate, AutonomyLevel, BoolGate, ClosureAskGate, ClosureGate,
+    DangerousCommandGate, DenyAllGate, LevelGate, Permission, PermissionGate,
+    ReadOnlyAutoApproveGate, SelectiveAskGate, TierGate, Tool, ToolCallInfo, ToolContext,
+    ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
 };

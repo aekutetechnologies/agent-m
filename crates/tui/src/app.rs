@@ -6,7 +6,7 @@
 use agent_m_agent::{
     Agent, AgentEvent, AgentOptions, Permission, SessionMessage, Tool, ToolContext,
 };
-use agent_m_ai::{ContentPart, ModelSpec, Provider, StopReason, Usage};
+use agent_m_ai::{ContentPart, ModelSpec, Provider, StopReason, TrustData, Usage};
 use agent_m_tools::BashTool;
 use anyhow::{Context, Result};
 use ratatui::backend::CrosstermBackend;
@@ -71,6 +71,8 @@ pub struct AppInputs {
     /// Auto-compact threshold (fraction of the window) applied at turn
     /// boundaries (ECC strategic compaction; default 0.5).
     pub compact_threshold: f64,
+    /// check.md principle 12: progressive autonomy level (default Trusted).
+    pub level: agent_m_agent::AutonomyLevel,
     pub agent_dir: PathBuf,
     pub cwd: PathBuf,
 }
@@ -199,6 +201,16 @@ pub struct App {
     flow_run: Option<FlowRunView>,
     /// Whether the right-side sidebar is visible (/sidebar toggles it).
     show_sidebar: bool,
+    /// Principle 1 narration: what the model's current tool call is doing.
+    active_tool: Option<String>,
+    /// Trust data of the most recent assistant reply (the /info panel).
+    last_trust: agent_m_ai::TrustData,
+    /// Undoable file snapshots (principle 8); the top is the most recent.
+    undo_stack: Vec<crate::sessions::UndoEntry>,
+    /// Live handle to the autonomy level (shared with the gate for /level).
+    level_handle: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// The /journal audit-timeline overlay is open.
+    journal_open: bool,
     plan_choice_pending: bool,
     session_stem: String,
     model_picker_open: bool,
@@ -256,12 +268,17 @@ impl App {
         // auto-approves. `--yes` still matters for print mode and flows,
         // which have no human to ask and default to denying everything.
         let closure = make_gate_closure(approval_tx.clone());
-        let gate: Arc<dyn agent_m_agent::PermissionGate> = Arc::new(
-            agent_m_agent::ReadOnlyAutoApproveGate::new(agent_m_agent::SelectiveAskGate::new(
-                risk.clone(),
-                move |call: agent_m_agent::ToolCallInfo| closure(&call),
-            )),
+        // check.md principle 12: the autonomy level maps onto the risk tiers
+        // (LevelGate). 0-1 observe/suggest (no execution), 2 asks for
+        // everything, 3 (default) auto Low/Medium + asks High/Critical, 4
+        // auto everything except Critical.
+        let level_gate = agent_m_agent::LevelGate::new(
+            inputs.level,
+            (*risk).clone(),
+            move |call: agent_m_agent::ToolCallInfo| closure(&call),
         );
+        let level_handle = level_gate.level_handle();
+        let gate: Arc<dyn agent_m_agent::PermissionGate> = Arc::new(level_gate);
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<SubmitCommand>();
@@ -274,6 +291,7 @@ impl App {
             .unwrap_or("session")
             .to_string();
         let resumed_todos = crate::sessions::load_todos(&inputs.agent_dir, &session_stem);
+        let undo_stack = crate::sessions::load_undo(&inputs.agent_dir, &session_stem);
         let provider_id = inputs.provider.id().to_string();
         let models = inputs.models.clone();
         let context_files = inputs.context_files.clone();
@@ -374,7 +392,12 @@ impl App {
             plan_choice_pending: false,
             flow_run: None,
             show_sidebar: true,
+            active_tool: None,
+            last_trust: agent_m_ai::TrustData::default(),
+            journal_open: false,
+            level_handle,
             session_stem,
+            undo_stack,
             model_picker_open: false,
             picker_index: 0,
             info_open: false,
@@ -948,6 +971,7 @@ impl App {
         if let Some(command) = text.strip_prefix('!') {
             let command = command.trim().to_string();
             if !command.is_empty() {
+                crate::prefs::record_command(&self.inputs.agent_dir, &command);
                 self.run_inline_bash(command).await;
             }
             return;
@@ -1006,7 +1030,7 @@ impl App {
         let argument = parts.next().unwrap_or_default();
         match command {
             "/help" => self.push_notice(
-                "agent-m help\n\nSlash commands: /help /hotkeys /clear /exit /quit /model /new /settings /cache /info /plan /build /todos /context /compact\n!command runs bash directly. Type a prompt and press Enter to chat.",
+                "agent-m help\n\nSlash commands: /help /hotkeys /clear /exit /quit /model /new /settings /cache /info /plan /build /todos /context /compact /journal /undo /level <0-4>\n!command runs bash directly. Type a prompt and press Enter to chat.",
             ),
             "/hotkeys" => self.push_notice(
                 "enter submit · shift+enter/ctrl+j newline · tab autocomplete\nctrl+c clear (empty: exit) · ctrl+d exit · escape interrupt\nctrl+l model select · ctrl+o tool output · ctrl+r toggle thinking · ctrl+n info · ctrl+p/ctrl+shift+p model cycle\nctrl+a/e line · ctrl+b/f word · ctrl+w/u/k kill · ctrl+y yank · ctrl+- undo\npageUp/pageDown/mouse wheel scroll · ctrl+t toggle cache notices",
@@ -1036,6 +1060,57 @@ impl App {
                     let _ = self
                         .submit_tx
                         .send(SubmitCommand::RunFlow(std::path::PathBuf::from(path)));
+                }
+            }
+            "/level" => {
+                // "/level <0-4>" (the second whitespace token is the argument)
+                let arg = if argument.is_empty() {
+                    command.trim_start_matches("/level").trim()
+                } else {
+                    argument
+                };
+                if let Ok(number) = arg.parse::<u8>()
+                    && let Some(level) = agent_m_agent::AutonomyLevel::from_number(number)
+                {
+                    self.level_handle
+                        .store(number, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut settings) = std::fs::read_to_string(
+                        self.inputs.agent_dir.join("settings.json"),
+                    )
+                    .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+                    .unwrap_or(Ok(serde_json::Value::Object(Default::default())))
+                    {
+                        settings["level"] = serde_json::json!(number);
+                        let _ = std::fs::write(
+                            self.inputs.agent_dir.join("settings.json"),
+                            serde_json::to_string(&settings).unwrap_or_default(),
+                        );
+                    }
+                    self.push_notice(format!(
+                        "autonomy level {number} ({}) — {}",
+                        level.label(),
+                        match number {
+                            0 => "observe only",
+                            1 => "suggest, don't execute",
+                            2 => "everything asks",
+                            3 => "auto low/medium, ask high/critical",
+                            _ => "auto everything except critical",
+                        }
+                    ));
+                } else {
+                    self.push_notice("usage: /level <0-4>  (0 observe · 1 suggest · 2 assisted · 3 trusted · 4 autonomous)");
+                }
+            }
+            "/undo" => {
+                self.undo_last();
+            }
+            "/journal" => {
+                self.journal_open = !self.journal_open;
+                if self.journal_open {
+                    self.push_notice(format!(
+                        "journal: {} entries",
+                        crate::sessions::journal(&self.inputs.agent_dir, &self.cwd).len()
+                    ));
                 }
             }
             "/sidebar" => {
@@ -1241,6 +1316,63 @@ impl App {
         apply_flow_step_state(&mut self.flow_run, index, name, status);
     }
 
+    /// Principle 8: before a write/edit executes, snapshot the target file so
+    /// `/undo` can restore it (skips files > 10 MB).
+    fn snapshot_for_undo(&mut self, name: &str, arguments: &serde_json::Value) {
+        if !matches!(name, "write" | "edit") {
+            return;
+        }
+        let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let target = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            self.cwd.join(path)
+        };
+        let before = std::fs::read(&target)
+            .ok()
+            .filter(|bytes| bytes.len() <= 10 * 1024 * 1024)
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+        self.undo_stack.push(crate::sessions::UndoEntry {
+            path: target.to_string_lossy().to_string(),
+            before,
+        });
+        let _ = crate::sessions::save_undo(
+            &self.inputs.agent_dir,
+            &self.session_stem,
+            &self.undo_stack,
+        );
+    }
+
+    /// Pop the most recent snapshot and restore the file (or delete it when it
+    /// did not exist before).
+    fn undo_last(&mut self) {
+        crate::prefs::record_undo(&self.inputs.agent_dir);
+        let Some(entry) = self.undo_stack.pop() else {
+            self.push_notice("nothing to undo");
+            return;
+        };
+        match crate::sessions::apply_undo(&entry) {
+            Ok("restored") => self.push_notice(format!(
+                "restored {} (undo stack has {} left)",
+                entry.path,
+                self.undo_stack.len()
+            )),
+            Ok(_) => self.push_notice(format!(
+                "deleted {} (it did not exist before; {} undo entries left)",
+                entry.path,
+                self.undo_stack.len()
+            )),
+            Err(error) => self.push_notice(format!("undo failed: {error}")),
+        }
+        let _ = crate::sessions::save_undo(
+            &self.inputs.agent_dir,
+            &self.session_stem,
+            &self.undo_stack,
+        );
+    }
+
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::MessageEnd {
@@ -1260,12 +1392,16 @@ impl App {
                         parts: Vec::new(),
                         stop_reason: StopReason::Pending,
                         thinking_expanded: false,
+                        trust: TrustData::default(),
                     });
                 }
             }
             AgentEvent::MessageEnd {
                 message: message @ SessionMessage::Assistant { .. },
             } => {
+                if let SessionMessage::Assistant { trust, .. } = &message {
+                    self.last_trust = trust.clone();
+                }
                 self.streaming = false;
                 // Replace the streaming placeholder (tools start only after the
                 // assistant message ends, so it is still the last item).
@@ -1299,6 +1435,8 @@ impl App {
                 name,
                 arguments,
             } => {
+                self.active_tool = Some(crate::transcript::narration(&name, &arguments));
+                self.snapshot_for_undo(&name, &arguments);
                 self.items.push(TranscriptItem::ToolExecution {
                     tool_call_id,
                     name,
@@ -1312,6 +1450,7 @@ impl App {
                 tool_call_id,
                 outcome,
             } => {
+                self.active_tool = None;
                 for item in self.items.iter_mut().rev() {
                     if let TranscriptItem::ToolExecution {
                         tool_call_id: id,
@@ -1528,16 +1667,27 @@ impl App {
             } else {
                 serde_json::to_string(&call.arguments).unwrap_or_default()
             };
-            let risk_hint = self.risk.risk(call);
+            let assessment = self.risk.assess(call);
+            let (badge, color) = match assessment.level {
+                agent_m_agent::RiskLevel::High => ("⚠️ HIGH", self.theme.warning),
+                agent_m_agent::RiskLevel::Critical => ("🔴 CRITICAL", self.theme.error),
+                _ => ("⚠️", self.theme.warning),
+            };
+            let title = match assessment.reason {
+                Some(reason) => format!("{badge} Approve tool call: {name} ({reason})"),
+                None => format!("{badge} Approve tool call: {name}"),
+            };
             let mut lines = vec![Line::from(Span::styled(
-                match risk_hint {
-                    Some(reason) => format!("⚠️ Approve RISKY tool call: {name} ({reason})"),
-                    None => format!("Approve tool call: {name}"),
-                },
-                Style::default()
-                    .fg(self.theme.error)
-                    .add_modifier(Modifier::BOLD),
+                title,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))];
+            // Consequence framing (principle 6): "This will …".
+            if let Some(consequence) = self.risk.consequence(call) {
+                lines.push(Line::from(Span::styled(
+                    consequence,
+                    Style::default().fg(self.theme.warning),
+                )));
+            }
             let width = area.width.max(20) as usize;
             for wrapped in wrap_lines(&detail, width.saturating_sub(2)) {
                 if lines.len() >= 4 {
@@ -1587,10 +1737,11 @@ impl App {
             return;
         }
         let (content, style) = if self.streaming {
-            (
-                format!("Working… {spinner}{cache}"),
-                Style::default().fg(self.theme.accent),
-            )
+            let text = match &self.active_tool {
+                Some(narration) => format!("{narration} {spinner}{cache}"),
+                None => format!("Working… {spinner}{cache}"),
+            };
+            (text, Style::default().fg(self.theme.accent))
         } else if let Some(error) = &self.last_error {
             (error.clone(), Style::default().fg(self.theme.error))
         } else if self.question_pending {
@@ -1622,6 +1773,12 @@ impl App {
                 ),
                 muted,
             )];
+            if !self.undo_stack.is_empty() {
+                spans.push(Span::styled(
+                    format!(" · undo: /undo ({})", self.undo_stack.len()),
+                    Style::default().fg(self.theme.warning),
+                ));
+            }
             if self.usage.input > 0 {
                 spans.push(Span::styled(
                     format!(
@@ -1908,6 +2065,37 @@ impl App {
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
 
+        if self.journal_open {
+            let rows = crate::sessions::journal(&self.inputs.agent_dir, &self.cwd);
+            let mut lines: Vec<Line> = Vec::new();
+            for row in rows {
+                let time = if row.time.len() >= 19 {
+                    &row.time[11..19]
+                } else {
+                    ""
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{time} "), Style::default().fg(self.theme.muted)),
+                    Span::styled(
+                        format!("[{}] ", row.kind),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::styled(row.text, Style::default().fg(self.theme.dim)),
+                ]));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "no journal entries yet",
+                    Style::default().fg(self.theme.muted),
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" journal — narrated audit trail (/journal to close) ");
+            let area = overlay_area(frame.area(), 78, lines.len() as u16 + 2);
+            frame.render_widget(Paragraph::new(lines).block(block), area);
+            return;
+        }
         if self.info_open {
             let session_name = self
                 .session_path
@@ -1955,6 +2143,43 @@ impl App {
                     )
                 }),
                 ("cost".to_string(), format!("${:.4}", self.usage.cost)),
+                (
+                    "confidence".to_string(),
+                    self.last_trust
+                        .confidence
+                        .map(|c| format!("{c}%"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "last decision".to_string(),
+                    self.last_trust
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("preferences".to_string(), {
+                    let prefs = crate::prefs::load(&self.inputs.agent_dir);
+                    let families: Vec<String> = prefs
+                        .command_usage
+                        .iter()
+                        .map(|(f, c)| format!("{f}×{c}"))
+                        .collect();
+                    if families.is_empty() && prefs.undos == 0 {
+                        "none learned yet".to_string()
+                    } else {
+                        format!(
+                            "{} {}",
+                            families.join(" "),
+                            if prefs.undos > 0 {
+                                format!("undo×{}", prefs.undos)
+                            } else {
+                                String::new()
+                            }
+                        )
+                        .trim()
+                        .to_string()
+                    }
+                }),
             ];
             let lines: Vec<Line> = pairs
                 .into_iter()
@@ -2054,11 +2279,13 @@ fn push_message_item(items: &mut Vec<TranscriptItem>, message: &SessionMessage) 
         SessionMessage::Assistant {
             content,
             stop_reason,
+            trust,
             ..
         } => items.push(TranscriptItem::Assistant {
             parts: content.clone(),
             stop_reason: *stop_reason,
             thinking_expanded: false,
+            trust: trust.clone(),
         }),
         SessionMessage::ToolResult { .. } => {}
         SessionMessage::Summary { text } => items.push(TranscriptItem::Notice {

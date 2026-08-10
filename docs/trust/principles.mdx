@@ -1,0 +1,47 @@
+---
+title: Trust principles
+---
+
+# The twelve trust principles
+
+agent-m implements the twelve trust principles from `check.md` ("Building Trust
+in an AI Harness"). The split is deliberate: **the harness — never the LLM —
+decides what is safe.** The model only *reports* (reason, confidence, evidence);
+the harness *enforces* (risk tiers, autonomy levels, approvals, audit).
+
+| # | Principle | In agent-m |
+|---|-----------|------------|
+| 1 | Transparency | Tool narration in the status line — `Reading src/app.rs…`, `Running \`cargo test\`…` — instead of a bare spinner |
+| 2 | Explain every decision | The model ends each reply with a `<trust>` block; the TUI renders it as a "── decision ──" block (reason, outcome) |
+| 3 | Show the plan before execution | `/plan` mode produces a numbered plan (`Plan:` list), rendered as a `📋` checklist with `n/m`; the plan's `<plan>` items + `<estimated_time>` also appear in the decision block |
+| 4 | Confidence scoring | 0-100 `<confidence>`, color-coded by tier (low/medium/high) in the decision block and `/info` |
+| 5 | Risk-based permissions | Four harness-assigned tiers — Low / Medium / High / Critical — enforced by `RiskPolicy` + `TierGate`/`LevelGate` |
+| 6 | Meaningful interruptions | Consequence framing ("This can destroy data…") + tier badges (⚠️ HIGH / 🔴 CRITICAL). High and Critical always ask — even under `--yes` |
+| 7 | Complete audit trail | Every session entry is timestamped; `/journal` renders the narrated timeline (time, action, outcome) |
+| 8 | Reversible actions | `/undo` restores `write`/`edit` before-snapshots; the undo ledger persists per session |
+| 9 | Evidence-driven conclusions | `<evidence>` items render as `file:line — note` citations |
+| 10 | Honest uncertainty | `<uncertainty>` notes are shown in the decision block |
+| 11 | Learn user preferences | Learns `!command` families + `/undo` signals → `preferences.json` → a static "Known preferences" system-prompt block |
+| 12 | Progressive autonomy | `--level 0-4` / `/level`: observe · suggest · assisted · trusted · autonomous |
+
+## How the trust block works
+
+The system prompt instructs the model to end each reply with a machine-readable
+`<trust>` block. The harness parses it (last block wins; malformed blocks are
+dropped, never fatal), strips it from the transcript text, persists the
+structured data in the session, and renders the decision block.
+
+```xml
+<trust>
+<confidence>85</confidence>
+<reason>Expired JWT tokens are not validated.</reason>
+<expected_outcome>Expired sessions will now be rejected.</expected_outcome>
+<evidence><item file="auth.ts" line="83">no expiry check</item><item file="login.test.ts">failing test</item></evidence>
+<uncertainty>Verified against the local tests only; not load-tested.</uncertainty>
+<plan><item>Inspect logs</item><item>Update middleware</item><item>Run tests</item></plan>
+<estimated_time>45 seconds</estimated_time>
+</trust>
+```
+
+See [Risk tiers](/trust/risk-tiers) for how the harness classifies tool calls and
+[Autonomy](/trust/autonomy) for how much it lets the agent do on its own.

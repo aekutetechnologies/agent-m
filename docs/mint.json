@@ -1,0 +1,66 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "agent-m",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#8abeb7",
+    "light": "#1a6ee0",
+    "dark": "#8abeb7",
+    "anchors": {
+      "from": "#8abeb7",
+      "to": "#1a6ee0"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "overview",
+        "getting-started/quickstart"
+      ]
+    },
+    {
+      "group": "Usage",
+      "pages": [
+        "cli/reference",
+        "ui/keybindings",
+        "ui/sidebar"
+      ]
+    },
+    {
+      "group": "Trust",
+      "pages": [
+        "trust/principles",
+        "trust/risk-tiers",
+        "trust/autonomy",
+        "security/boundaries"
+      ]
+    },
+    {
+      "group": "Extending",
+      "pages": [
+        "flows/overview",
+        "plugins/overview"
+      ]
+    },
+    {
+      "group": "Reference",
+      "pages": [
+        "architecture/overview"
+      ]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/"
+  }
+}

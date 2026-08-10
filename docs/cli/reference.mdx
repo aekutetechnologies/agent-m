@@ -1,0 +1,68 @@
+---
+title: CLI reference
+---
+
+# CLI reference
+
+`agent-m [OPTIONS] [MESSAGES]... [COMMAND]`
+
+With no arguments on a TTY, the interactive TUI starts. Non-TTY stdin (piped
+input) and `-p` select **print mode**, which streams the reply to stdout and
+tool activity to stderr. Print mode disables tools unless `--yes` is passed —
+there is no interactive approval in print mode.
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `-p`, `--print` | Print mode: stream the reply to stdout |
+| `--model <MODEL>` | Model id (e.g. `deepseek-chat`, `deepseek-reasoner`) |
+| `--provider <PROVIDER>` | Provider id (default `deepseek`) |
+| `--api-key <API_KEY>` | API key override (otherwise env → `auth.json` → `settings.json`) |
+| `--yes` | Auto-approve tool calls (also enables tools in print mode) |
+| `--no-tools` | Disable all tools |
+| `--tools <TOOLS>` | Active tool set (comma-separated) |
+| `--exclude-tools <TOOLS>` | Remove tools from the default set |
+| `--theme <THEME>` | `dark`, `light`, or a JSON theme file |
+| `--ui-mode <UI_MODE>` | `regular` (terminal scrollback) or `fullscreen` (alternate screen) |
+| `--session-dir <SESSION_DIR>` | Override the sessions directory |
+| `--list-models` | List available models and exit |
+| `--system-prompt <SYSTEM_PROMPT>` | Override the base system prompt |
+| `--mode-plan` | Start in plan mode (read-only; the model produces a numbered plan) |
+| `--compact-threshold <F>` | Auto-compact fraction of the context window (default `0.5`) |
+| `--flow <PATH>` | Run a YAML flow in print mode |
+| `--level <0-4>` | Autonomy level: 0 observe · 1 suggest · 2 assisted · 3 trusted (default) · 4 autonomous |
+| `--allow-path <PATH>` | Extra directory the file tools may access (repeatable) |
+| `-v`, `--version` | Print the version |
+| `-h`, `--help` | Print help |
+
+Positional `MESSAGES...` are treated as a one-shot prompt in print mode.
+File arguments (`@path` or a bare existing path) inline the file as `<file>`
+context, capped at 50 KB per file.
+
+## Subcommands
+
+### plugins
+
+Manage out-of-tree plugins:
+
+| Command | Description |
+|---------|-------------|
+| `plugins install <git-url\|local-path>` | Clone/build a cdylib plugin and install it into `~/.agent-m/plugins/<name>/` |
+| `plugins list` | List installed plugins and their readiness |
+| `plugins remove <name>` | Uninstall a plugin |
+| `plugins update [name]` | Rebuild/update plugins (all, or one by name) |
+
+Every agent-m startup loads installed plugins and merges their tools into the
+tool set (permission gating and plan-mode filtering still apply). See
+[Plugins](/plugins/overview).
+
+## Examples
+
+```bash
+agent-m -p "explain this repo"
+echo "summarize README" | agent-m
+agent-m --model deepseek-reasoner --mode-plan "design an auth flow"
+agent-m --yes --flow flows/agentic-dev.yml
+agent-m plugins install https://github.com/you/your-agent-plugin
+```

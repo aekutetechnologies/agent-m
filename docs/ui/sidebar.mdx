@@ -1,0 +1,31 @@
+---
+title: Status sidebar
+---
+
+# Right-side status sidebar
+
+While a flow runs, the right side of the TUI shows a live stage diagram: the
+flow name with a `done/total` counter, a progress bar, and one row per step —
+`✓` done (green), `▶` running (highlighted), `○` pending, `✗` failed — updated
+as each step executes.
+
+When no flow is active, the sidebar shows, in priority order:
+
+1. **Flow stages** — the live `✓/▶/○/✗` diagram described above.
+2. **Plan task list** — `[x]`/`[ ]` with an `n/m` counter, when a plan exists
+   (from `/plan` or a flow's plan step).
+3. **Session stats** — model, tokens, cache read, context %, cost.
+
+## Controls
+
+- `/sidebar` toggles the panel.
+- The sidebar auto-hides below 110 terminal columns.
+
+## Status line
+
+The bottom status line shows the model, message count, usage (↑ tokens, ↓
+tokens, cost), context % (yellow above 70%, red above 90%), and while the
+agent works it narrates the current tool call — `Reading src/app.rs…`,
+`Running \`cargo test\`…`, `Searching \`TODO\`…` — instead of a bare spinner
+(trust principle 1, transparency). After a `write`/`edit`, an `undo: /undo
+(n)` hint appears so you can roll the change back.

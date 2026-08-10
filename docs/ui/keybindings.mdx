@@ -1,0 +1,55 @@
+---
+title: Keybindings
+---
+
+# Keybindings
+
+pi defaults. The transcript stays on top; a fixed editor/footer dock sits at
+the bottom.
+
+## Editing and submitting
+
+| Key | Action |
+|-----|--------|
+| `Enter` | submit |
+| `Shift+Enter` / `ctrl+j` | newline |
+| `Tab` | autocomplete (slash commands, file paths) |
+| `ctrl+a` / `ctrl+e` | line start / end |
+| `ctrl+b` / `ctrl+f` | word left / right |
+| `ctrl+w` / `ctrl+u` / `ctrl+k` | kill word / backward / forward |
+| `ctrl+y` / `ctrl+-` | yank / undo (text input box) |
+
+## Session control
+
+| Key | Action |
+|-----|--------|
+| `ctrl+c` | clear editor (exit when empty) |
+| `ctrl+d` | exit |
+| `Escape` | interrupt the running reply |
+
+## Model and tool output
+
+| Key | Action |
+|-----|--------|
+| `ctrl+l` | cycle model |
+| `ctrl+p` / `ctrl+shift+p` | cycle model forward / backward |
+| `ctrl+o` | expand/collapse the most recent tool output |
+| `ctrl+r` | expand/collapse the most recent thinking trace |
+| `PageUp` / `PageDown` / mouse wheel | scroll the transcript |
+
+Tool output and thinking from a finished turn collapse to a one-line
+receipt/summary once you move on to the next prompt (or `!command`) —
+`ctrl+o` / `ctrl+r` re-expand the most recent one.
+
+## Slash commands
+
+`/help`, `/hotkeys`, `/clear`, `/exit`, `/quit`, `/model`, `/new`,
+`/settings`, `/cache`, `/info`, `/plan`, `/build`, `/todos`, `/context`,
+`/compact`, `/flow <path>`, `/flows`, `/journal`, `/undo`, `/level <0-4>`,
+`/sidebar`.
+
+- `/journal` — the narrated audit timeline (timestamped JSONL entries).
+- `/undo` — restore the most recent `write`/`edit` snapshot.
+- `/level <0-4>` — set the autonomy level live (persisted to `settings.json`).
+- `/sidebar` — toggle the right-side status sidebar.
+- `!command` — runs bash directly, without the model (e.g. `!git status`).

@@ -109,13 +109,20 @@ pub struct AssistantMessage {
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
     pub model: String,
+    /// Trust metadata parsed from the reply's `<trust>` block (best-effort;
+    /// empty when the model omitted it).
+    #[serde(default, skip_serializing_if = "crate::trust::TrustData::is_empty")]
+    pub trust: crate::trust::TrustData,
 }
 
 /// Events streamed while an assistant reply is generated.
 ///
 /// Ordering mirrors pi's `AssistantMessageEventStream`: `Start`, then interleaved
 /// text/thinking/tool-call deltas, then exactly one terminal `Done` or `Error`.
+/// The `Done` variant is large (it carries the full `AssistantMessage` with
+/// trust metadata); it is streamed, not stored per-delta, so this is fine.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamEvent {
     Start,
     /// A delta of visible text.

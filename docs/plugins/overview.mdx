@@ -1,0 +1,56 @@
+---
+title: Plugins
+---
+
+# Plugins (out-of-tree extensions)
+
+agent-m can load **out-of-tree plugin tools** — separate repositories that
+export a small C-ABI entry point. This keeps the core small while letting you
+(and third parties) add tools without forking agent-m.
+
+## Managing plugins
+
+```bash
+agent-m plugins install <git-url|local-path>   # clone/build a cdylib plugin
+agent-m plugins list                            # installed plugins + readiness
+agent-m plugins remove <name>                   # uninstall
+agent-m plugins update [name]                   # rebuild/update (all or one)
+```
+
+Every agent-m startup loads installed plugins from
+`~/.agent-m/plugins/<name>/` and merges their tools into the tool set —
+permission gating and plan-mode filtering apply exactly as for built-in tools.
+Opaque plugin tools (those not explicitly trusted at install) are classified
+**Critical** by `RiskPolicy`: the harness cannot inspect what they do, so they
+always require approval.
+
+## The SDK contract
+
+A plugin is a `cdylib` crate that depends on `agent-m-plugin-sdk` and exports
+one symbol:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn agent_m_plugin_entry() -> *const PluginEntry {
+    // name, version, and a table of PluginTool { name, description, input_schema }
+}
+```
+
+The loader (`libloading`) resolves the entry, reads the tool table, and wraps
+each tool so the agent can call it like any built-in tool. Plugins are
+dependency-light: the SDK is built to avoid pulling the agent's runtime into
+the plugin binary.
+
+## Reference plugins
+
+The repo ships four example plugins under `plugins/`:
+
+| Plugin | Tools | Config |
+|--------|-------|--------|
+| `fixture` | `greet`, `sum` | none — a minimal end-to-end example |
+| `jira` | `jira-search`, `jira-comment`, `jira-transition` | `JIRA_URL`, `JIRA_TOKEN` |
+| `github` | `github-repo-info`, `github-create-pr` | `GITHUB_TOKEN` |
+| `test-runner` | `run-tests` | project-local test command |
+
+The `agentic-dev.yml` flow (see [Flows](/flows/overview)) calls the jira and
+github plugin tools.

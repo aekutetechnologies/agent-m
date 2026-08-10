@@ -1,0 +1,80 @@
+---
+title: Quickstart
+---
+
+# Quickstart
+
+Requires Rust (stable) and a DeepSeek API key.
+
+## Install
+
+```bash
+./check.sh                          # fmt + clippy -D warnings + tests
+cargo build --release               # target/release/agent-m
+# or run from source:
+./agent-m.sh
+```
+
+## Use it from any folder (like pi)
+
+Install the release binary once, then `agent-m` works everywhere — it starts the
+chat in the folder you're in, and tools/sessions are scoped to that folder:
+
+```bash
+cargo build --release
+cp target/release/agent-m ~/.cargo/bin/agent-m   # ~/.cargo/bin is on your PATH
+
+cd ~/some/project
+agent-m        # chat mode starts, scoped to ~/some/project
+```
+
+## Setup
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+Key resolution order: `DEEPSEEK_API_KEY` env var → `~/.agent-m/agent/auth.json`
+(`{"providers": {"deepseek": {"apiKey": "..."}}}` or `{"deepseek": "..."}`) →
+`~/.agent-m/agent/settings.json` (same shapes).
+
+## Usage
+
+```bash
+agent-m                                # interactive TUI (default on a TTY)
+agent-m --model deepseek-reasoner      # reasoning model
+agent-m -p "explain this repo"         # print mode: stream reply to stdout
+echo "summarize README" | agent-m      # non-TTY stdin → print mode
+agent-m --yes                          # auto-approve tool calls (also enables tools in print mode)
+agent-m --no-tools                     # no tools
+agent-m --mode-plan                    # start in plan mode (read-only planning)
+agent-m --list-models                  # list available models
+agent-m --help                         # all flags
+```
+
+Note: print mode (piped stdin or `-p`) disables tools unless `--yes` is passed —
+there is no interactive approval in print mode, so tools require explicit opt-in.
+
+## First chat
+
+Start `agent-m` in any folder. Type a prompt and press `Enter`. The agent
+streams its reply, and when it wants to run a tool you'll see an approval
+prompt (`y`/`n`) unless the call is read-only or you passed `--yes`.
+
+- `!command` runs bash directly without the model — e.g. `!git status`.
+- `/plan` switches to read-only plan mode; `/build` returns.
+- `ctrl+d` exits. `Escape` interrupts a running reply.
+
+## Where data lives
+
+All state is under `~/.agent-m/agent/` (override with the `AGENT_M_DIR`
+environment variable):
+
+| Path | Contents |
+|------|----------|
+| `sessions/--<cwd>--/` | JSONL conversation sessions, auto-resumed |
+| `tasks/<session>.json` | the persisted plan/task list |
+| `plugins/` | installed out-of-tree plugins |
+| `preferences.json` | learned `!command` families and `/undo` signals |
+| `settings.json` | model, autonomy level, API keys |
+| `index/` | the local symbol/keyword search index |

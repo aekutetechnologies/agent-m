@@ -53,6 +53,7 @@ impl FakeLlm {
                     stop_reason: StopReason::Stop,
                     error_message: None,
                     model: "fake".to_string(),
+                    trust: Default::default(),
                 },
             },
         ]
@@ -78,6 +79,7 @@ impl FakeLlm {
                     stop_reason: StopReason::ToolUse,
                     error_message: None,
                     model: "fake".to_string(),
+                    trust: Default::default(),
                 },
             },
         ]
@@ -372,6 +374,7 @@ async fn interrupt_aborts_the_stream() {
                                 stop_reason: StopReason::Stop,
                                 error_message: None,
                                 model: "slow".to_string(),
+                                trust: Default::default(),
                             },
                         },
                         2,
@@ -877,5 +880,176 @@ async fn benign_shell_commands_auto_approve_without_yes() {
     assert_eq!(
         gate.authorize(&bash_call("rm -rf /tmp/x")).await,
         Permission::Denied("should not ask".to_string())
+    );
+}
+
+#[tokio::test]
+async fn parses_trust_block_from_reply() {
+    let reply = "I fixed the JWT check.\n\n<trust><confidence>90</confidence><reason>Expiry is now validated.</reason><evidence><item file=\"auth.ts\" line=\"83\">no expiry check</item></evidence><plan><item>Inspect logs</item><item>Run tests</item></plan><estimated_time>30 seconds</estimated_time></trust>";
+    let llm = FakeLlm::new(vec![vec![
+        StreamEvent::TextDelta {
+            delta: reply.to_string(),
+        },
+        StreamEvent::Done {
+            message: AssistantMessage {
+                content: vec![ContentPart::Text {
+                    text: reply.to_string(),
+                }],
+                usage: Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 4,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: 9,
+                    cost: 0.0,
+                }),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                model: "fake".to_string(),
+                trust: Default::default(),
+            },
+        },
+    ]]);
+    let mut agent = Agent::new(Arc::new(llm), options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("fix it".to_string()).await.expect("prompt");
+    let assistant = agent
+        .messages()
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            SessionMessage::Assistant { content, trust, .. } => {
+                Some((content.clone(), trust.clone()))
+            }
+            _ => None,
+        })
+        .expect("assistant message");
+    let (content, trust) = assistant;
+    assert_eq!(trust.confidence, Some(90));
+    assert_eq!(trust.evidence.len(), 1);
+    assert_eq!(trust.evidence[0].file, "auth.ts");
+    assert!(trust.plan.contains(&"Run tests".to_string()));
+    // The raw block must not pollute the stored transcript text.
+    let text: String = content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains("<trust>"), "block stripped from stored text");
+    assert!(text.contains("I fixed the JWT check."));
+}
+
+#[tokio::test]
+async fn tier_gate_auto_approves_low_medium_asks_high_critical() {
+    use agent_m_agent::TierGate;
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = asked.clone();
+    let policy = agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    };
+    let gate = TierGate::new(policy, move |call: ToolCallInfo| {
+        let recorder = recorder.clone();
+        Box::pin(async move {
+            recorder.lock().unwrap().push(call.name.clone());
+            Permission::Allowed
+        })
+    });
+    // Low and Medium auto-approve without asking.
+    assert_eq!(
+        gate.authorize(&bash_call("ls -la")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        gate.authorize(&bash_call("cargo test")).await,
+        Permission::Allowed
+    );
+    assert!(asked.lock().unwrap().is_empty(), "Low/Medium must not ask");
+    // High and Critical ask (even under --yes — the gate has no --yes path).
+    let permission = gate.authorize(&bash_call("git reset --hard HEAD")).await;
+    assert_eq!(permission, Permission::Allowed); // the closure allowed it
+    let permission = gate.authorize(&bash_call("rm -rf /work/tmp")).await;
+    assert_eq!(permission, Permission::Allowed);
+    let names = asked.lock().unwrap().clone();
+    assert_eq!(names.len(), 2, "High + Critical asked: {names:?}");
+    assert_eq!(names[0], "bash");
+}
+
+#[tokio::test]
+async fn level_gate_maps_tiers_per_autonomy_level() {
+    use agent_m_agent::{AutonomyLevel, LevelGate};
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = asked.clone();
+    let policy = agent_m_agent::RiskPolicy {
+        cwd: PathBuf::from("/work"),
+        opaque_tools: vec![],
+    };
+    let build = |level: AutonomyLevel| {
+        let recorder = recorder.clone();
+        LevelGate::new(level, policy.clone(), move |call: ToolCallInfo| {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                recorder.lock().unwrap().push(call.name.clone());
+                Permission::Allowed
+            })
+        })
+    };
+    // Level 0/1: observe & suggest never execute anything.
+    for level in [AutonomyLevel::Observe, AutonomyLevel::Suggest] {
+        let gate = build(level);
+        assert!(
+            matches!(
+                gate.authorize(&bash_call("ls")).await,
+                Permission::Denied(message) if message.starts_with("autonomy level")
+            ),
+            "{level:?} must deny"
+        );
+        assert!(asked.lock().unwrap().is_empty(), "{level:?} must not ask");
+    }
+    // Level 2 (assisted): everything asks.
+    let gate = build(AutonomyLevel::Assisted);
+    assert_eq!(
+        gate.authorize(&bash_call("ls -la")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        asked.lock().unwrap().len(),
+        1,
+        "assisted asks for reads too"
+    );
+    // Level 3 (trusted, default): auto Low/Medium, ask High/Critical.
+    asked.lock().unwrap().clear();
+    let gate = build(AutonomyLevel::Trusted);
+    assert_eq!(gate.authorize(&bash_call("ls")).await, Permission::Allowed);
+    assert_eq!(
+        gate.authorize(&bash_call("rm -rf x")).await,
+        Permission::Allowed
+    );
+    let names = asked.lock().unwrap().clone();
+    assert_eq!(names.len(), 1, "trusted asked only for critical: {names:?}");
+    // Level 4 (autonomous): auto everything except Critical.
+    asked.lock().unwrap().clear();
+    let gate = build(AutonomyLevel::Autonomous);
+    assert_eq!(
+        gate.authorize(&bash_call("cargo test")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        gate.authorize(&bash_call("git reset --hard")).await,
+        Permission::Allowed
+    );
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "autonomous asks for nothing here"
+    );
+    assert_eq!(
+        gate.authorize(&bash_call("rm -rf x")).await,
+        Permission::Allowed
+    );
+    assert_eq!(
+        asked.lock().unwrap().len(),
+        1,
+        "autonomous still asks for critical"
     );
 }
