@@ -42,6 +42,8 @@ pub enum AppAction {
     ToggleCacheNotices,
     /// Open/close the session info panel (ctrl+i).
     ToggleInfo,
+    /// Open/close the reasoning-effort variant picker (ctrl+v).
+    ToggleVariant,
     ApproveTool,
     DenyTool,
     ScrollUp,
@@ -110,6 +112,7 @@ pub fn resolve_key(key: KeyEvent, context: KeyContext) -> Option<Action> {
         KeyCode::Char('o') if ctrl => Some(Action::App(AppAction::ToggleToolOutput)),
         // ctrl+i is Tab in terminals, so the info panel uses ctrl+n (and /info).
         KeyCode::Char('n') if ctrl => Some(Action::App(AppAction::ToggleInfo)),
+        KeyCode::Char('v') if ctrl => Some(Action::App(AppAction::ToggleVariant)),
         KeyCode::Char('p') if ctrl && shift => Some(Action::App(AppAction::ModelCycleBackward)),
         KeyCode::Char('p') if ctrl => Some(Action::App(AppAction::ModelCycleForward)),
         KeyCode::Char('t') if ctrl => Some(Action::App(AppAction::ToggleCacheNotices)),

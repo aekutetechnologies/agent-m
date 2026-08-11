@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ai", "crates/agent", "crates/tools", "crates/flow", "crates/plugin-sdk", "crates/plugin-loader", "crates/tui", "crates/cli", "plugins/fixture", "plugins/jira", "plugins/github", "plugins/test-runner"]
+members = ["crates/ai", "crates/agent", "crates/tools", "crates/flow", "crates/mcp", "crates/plugin-sdk", "crates/plugin-loader", "crates/tui", "crates/cli", "plugins/fixture", "plugins/jira", "plugins/github", "plugins/test-runner"]
 
 [workspace.package]
 version = "0.1.0"

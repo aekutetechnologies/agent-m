@@ -9,12 +9,14 @@
 //! what makes provider prefix caching effective.
 
 mod agent;
+mod checkpoint;
 mod context;
 mod message;
 mod risk;
 mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, InterruptHandle, Mode};
+pub use checkpoint::{create_checkpoint, is_git_repo, restore_checkpoint};
 pub use context::{InstructionFile, discover_instructions, render_instructions};
 pub use message::{SessionMessage, SessionMessageKind};
 pub use risk::{RiskAssessment, RiskLevel, RiskPolicy};

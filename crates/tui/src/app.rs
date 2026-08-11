@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -55,6 +55,122 @@ impl UiMode {
 }
 
 /// Everything the App needs except the terminal itself.
+/// The `/provider` setup wizard state machine (OpenAI-compatible providers).
+pub enum ProviderWizard {
+    /// Main menu: pick an action (1 add · 2 edit · 3 remove · 4 switch).
+    Menu,
+    /// Choose which provider to act on (by list number).
+    Select(SelectAction),
+    /// Adding a provider, accumulating fields.
+    Add(ProviderDraft, ProviderField),
+    /// Editing a provider (id), fields pre-filled.
+    Edit(String, ProviderDraft, ProviderField),
+    /// Removing a provider (id, confirm).
+    Remove(String, bool),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SelectAction {
+    Edit,
+    Remove,
+    Switch,
+}
+
+#[derive(Default, Clone)]
+pub struct ProviderDraft {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub key_env: String,
+    pub context: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ProviderField {
+    Id,
+    Name,
+    BaseUrl,
+    Model,
+    KeyEnv,
+    Context,
+}
+
+/// The built-in fallback provider as a config (for switch-to-deepseek).
+fn provider_config(id: &str) -> agent_m_ai::ProviderConfig {
+    if id == "deepseek" {
+        agent_m_ai::ProviderConfig {
+            models: None,
+            id: "deepseek".into(),
+            name: Some("DeepSeek".into()),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-chat".into(),
+            reasoning: false,
+            supports_images: false,
+            context_window: 1_000_000,
+            pricing: agent_m_ai::Pricing::default(),
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+        }
+    } else {
+        agent_m_ai::ProviderConfig {
+            models: None,
+            id: id.into(),
+            name: None,
+            base_url: String::new(),
+            model: String::new(),
+            reasoning: false,
+            supports_images: false,
+            context_window: 128_000,
+            pricing: agent_m_ai::Pricing::default(),
+            api_key_env: None,
+        }
+    }
+}
+
+/// The editor pre-fill for a field step (edit mode keeps the current value).
+fn prefill(draft: &ProviderDraft, field: ProviderField) -> String {
+    match field {
+        ProviderField::Id => draft.id.clone(),
+        ProviderField::Name => draft.name.clone(),
+        ProviderField::BaseUrl => draft.base_url.clone(),
+        ProviderField::Model => draft.model.clone(),
+        ProviderField::KeyEnv => draft.key_env.clone(),
+        ProviderField::Context => draft.context.clone(),
+    }
+}
+
+/// The prompt text for a single field step.
+fn field_prompt(draft: &ProviderDraft, field: ProviderField) -> String {
+    match field {
+        ProviderField::Id => "provider id [a-z0-9-_] (e.g. openai):".to_string(),
+        ProviderField::Name => {
+            format!("display name (enter = `{}`):", draft.id)
+        }
+        ProviderField::BaseUrl => {
+            "base URL, OpenAI-compatible (e.g. https://api.openai.com/v1):".to_string()
+        }
+        ProviderField::Model => "model id (e.g. gpt-4o-mini):".to_string(),
+        ProviderField::KeyEnv => format!(
+            "key env var (enter = `{}_API_KEY`):",
+            draft.id.to_uppercase()
+        ),
+        ProviderField::Context => "context window in tokens (enter = 128000):".to_string(),
+    }
+}
+
+impl ProviderField {
+    fn next(self) -> Option<ProviderField> {
+        match self {
+            ProviderField::Id => Some(ProviderField::Name),
+            ProviderField::Name => Some(ProviderField::BaseUrl),
+            ProviderField::BaseUrl => Some(ProviderField::Model),
+            ProviderField::Model => Some(ProviderField::KeyEnv),
+            ProviderField::KeyEnv => Some(ProviderField::Context),
+            ProviderField::Context => None,
+        }
+    }
+}
+
 pub struct AppInputs {
     pub provider: Arc<dyn Provider>,
     /// Agent options without the permission gate (the App installs it).
@@ -78,12 +194,15 @@ pub struct AppInputs {
 }
 
 enum SubmitCommand {
-    Prompt(String),
+    Prompt(String, Vec<String>),
     Interrupt,
     SetModel(String),
+    SetVariant(Option<String>),
     SetMode(agent_m_agent::Mode),
     Compact,
     RunFlow(std::path::PathBuf),
+    /// Rebuild the agent against a configured provider (by id).
+    SwitchProvider(String),
 }
 
 type ApprovalRequest = (agent_m_agent::ToolCallInfo, oneshot::Sender<Permission>);
@@ -160,6 +279,67 @@ const SLASH_COMMANDS: &[&str] = &[
     "/cache",
 ];
 
+/// One row of the command palette: the slash command and its one-line
+/// description (OpenCode-style). Custom commands are appended at runtime.
+fn builtin_palette() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("/help", "show this command palette"),
+        ("/hotkeys", "show key bindings"),
+        ("/clear", "clear the transcript"),
+        ("/exit", "quit agent-m"),
+        ("/quit", "quit agent-m"),
+        ("/plan", "plan mode — read-only, ask for a numbered plan"),
+        ("/build", "build mode — full tool access"),
+        ("/model <name>", "switch the model"),
+        (
+            "/provider",
+            "manage providers (add / edit / remove / switch)",
+        ),
+        ("/new", "start a fresh session"),
+        ("/settings", "show session settings"),
+        ("/cache", "show prompt-cache stats"),
+        ("/info", "toggle the session info panel"),
+        ("/context", "show context usage"),
+        ("/todos", "show the current plan todos"),
+        ("/compact", "compact the conversation into a summary"),
+        ("/journal", "show the session timeline"),
+        ("/undo", "undo the last edit"),
+        ("/checkpoint", "snapshot the current git state"),
+        ("/restore <n|sha>", "restore a checkpoint"),
+        ("/level <0-4>", "set the autonomy level"),
+        ("/sidebar", "toggle the status sidebar"),
+        ("/flow <file>", "run a flow from a YAML file"),
+        ("/flows", "list available flows"),
+    ]
+}
+
+/// Case-insensitive match of the filter against the command name (without
+/// the leading "/") or its description. An empty filter matches everything.
+fn palette_matches(filter: &str, name: &str, description: &str) -> bool {
+    let needle = filter.trim_start_matches('/').to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    name.trim_start_matches('/')
+        .to_lowercase()
+        .contains(&needle)
+        || description.to_lowercase().contains(&needle)
+}
+
+/// Build the dispatch string when Enter is pressed with `selection` (a full
+/// "/name") while the editor holds `editor_text`: replace the first word
+/// with the selection and keep the remainder as the argument.
+fn palette_completion(selection: &str, editor_text: &str) -> String {
+    let mut words = editor_text.splitn(2, char::is_whitespace);
+    let _first = words.next();
+    let rest = words.next().unwrap_or("").trim();
+    if rest.is_empty() {
+        selection.to_string()
+    } else {
+        format!("{selection} {rest}")
+    }
+}
+
 /// The interactive application.
 pub struct App {
     inputs: AppInputs,
@@ -209,12 +389,34 @@ pub struct App {
     undo_stack: Vec<crate::sessions::UndoEntry>,
     /// Live handle to the autonomy level (shared with the gate for /level).
     level_handle: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// The /provider setup wizard, when open.
+    provider_wizard: Option<ProviderWizard>,
+    /// Git checkpoints (principle 8, repo-level rollback); newest last.
+    checkpoints: Vec<crate::sessions::CheckpointEntry>,
     /// The /journal audit-timeline overlay is open.
     journal_open: bool,
     plan_choice_pending: bool,
     session_stem: String,
     model_picker_open: bool,
     picker_index: usize,
+    /// The slash-command palette is open (the editor starts with "/").
+    palette_open: bool,
+    /// Selected row in the filtered palette list.
+    palette_index: usize,
+    /// Active reasoning-effort variant (`default`/`low`/`high`/`max`).
+    variant: Option<String>,
+    /// The variant picker is open.
+    variant_picker_open: bool,
+    /// Selected row in the variant picker.
+    variant_picker_index: usize,
+    /// Collapsed sidebar sections (by name: context/timing/flow/todos).
+    collapsed_sections: Vec<String>,
+    /// When the current agent turn started (for the Timing section).
+    turn_started: Option<Instant>,
+    /// Per-turn elapsed times in ms (last 10, for the Timing section).
+    turn_times: Vec<u64>,
+    /// The sidebar rect from the last draw, for click-to-toggle mapping.
+    last_sidebar_area: Option<Rect>,
     info_open: bool,
 
     risk: Arc<agent_m_agent::RiskPolicy>,
@@ -234,6 +436,8 @@ impl App {
     /// Build the app: wires the agent event channel, the permission gate, the
     /// session store, and spawns the agent runner task.
     fn new(inputs: AppInputs) -> Result<Self> {
+        let initial_variant = inputs.agent_options.variant.clone();
+        let collapsed_sections = crate::sessions::load_collapsed_sections(&inputs.agent_dir);
         let current_model = inputs.agent_options.model.clone();
         let initial_mode = inputs.agent_options.mode;
 
@@ -292,6 +496,7 @@ impl App {
             .to_string();
         let resumed_todos = crate::sessions::load_todos(&inputs.agent_dir, &session_stem);
         let undo_stack = crate::sessions::load_undo(&inputs.agent_dir, &session_stem);
+        let checkpoints = crate::sessions::load_checkpoints(&inputs.agent_dir, &session_stem);
         let provider_id = inputs.provider.id().to_string();
         let models = inputs.models.clone();
         let context_files = inputs.context_files.clone();
@@ -314,6 +519,12 @@ impl App {
 
         // Clones the runner needs for `RunFlow` (a flow gets its own fresh
         // agents, so we hand it the provider + options + gates).
+        let provider_configs = agent_m_ai::load_provider_configs(&inputs.agent_dir);
+        let agent_dir = inputs.agent_dir.clone();
+        let runner_options = AgentOptions {
+            ask_gate: Some(ask_gate.clone()),
+            ..inputs.agent_options.clone()
+        };
         let flow_provider = inputs.provider.clone();
         let flow_options = inputs.agent_options.clone();
         let flow_gate = gate.clone();
@@ -396,10 +607,21 @@ impl App {
             last_trust: agent_m_ai::TrustData::default(),
             journal_open: false,
             level_handle,
+            provider_wizard: None,
             session_stem,
             undo_stack,
+            checkpoints,
             model_picker_open: false,
             picker_index: 0,
+            palette_open: false,
+            palette_index: 0,
+            variant: initial_variant,
+            variant_picker_open: false,
+            variant_picker_index: 0,
+            collapsed_sections,
+            turn_started: None,
+            turn_times: Vec::new(),
+            last_sidebar_area: None,
             info_open: false,
             risk,
             pending_approval: None,
@@ -422,8 +644,13 @@ impl App {
         tokio::spawn(async move {
             while let Some(command) = submit_rx.recv().await {
                 match command {
-                    SubmitCommand::Prompt(text) => {
-                        let _ = agent.prompt(text).await;
+                    SubmitCommand::Prompt(text, images) => {
+                        let result = if images.is_empty() {
+                            agent.prompt(text).await
+                        } else {
+                            agent.prompt_with_images(text, images).await
+                        };
+                        let _ = result;
                         // Strategic compaction (ECC): only at turn boundaries,
                         // once usage passes the threshold — never mid-run.
                         let (tokens, window) = agent.context_usage();
@@ -445,7 +672,44 @@ impl App {
                     }
                     SubmitCommand::Interrupt => agent.interrupt(),
                     SubmitCommand::SetModel(model) => agent.set_model(model),
+                    SubmitCommand::SetVariant(variant) => agent.set_variant(variant),
                     SubmitCommand::SetMode(mode) => agent.set_mode(mode),
+                    SubmitCommand::SwitchProvider(id) => {
+                        let config = provider_configs
+                            .iter()
+                            .find(|config| config.id == id)
+                            .cloned();
+                        match config {
+                            Some(config) => {
+                                let new_provider: Arc<dyn Provider> = Arc::new(
+                                    agent_m_ai::provider_from_config(&config, None, &agent_dir),
+                                );
+                                let old_messages = agent.messages().to_vec();
+                                let mut new_agent = Agent::new(
+                                    new_provider.clone(),
+                                    runner_options.clone(),
+                                    gate.clone(),
+                                );
+                                new_agent.restore_messages(old_messages);
+                                let forward = event_tx_runner.clone();
+                                new_agent.subscribe(move |event| {
+                                    let _ = forward.send(event.clone());
+                                });
+                                let _ = event_tx_runner.send(AgentEvent::Notice {
+                                    message: format!(
+                                        "switched provider to `{id}` — model {}",
+                                        config.model
+                                    ),
+                                });
+                                agent = new_agent;
+                            }
+                            None => {
+                                let _ = event_tx_runner.send(AgentEvent::Notice {
+                                    message: format!("provider `{id}` is not configured"),
+                                });
+                            }
+                        }
+                    }
                     SubmitCommand::Compact => {
                         match agent.summarize_and_compact(10).await {
                             Ok(summary) if summary.is_empty() => {
@@ -589,6 +853,27 @@ impl App {
                             MouseEventKind::ScrollDown => {
                                 self.apply_app_action(AppAction::ScrollDown).await
                             }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                // Click a sidebar section header to toggle it.
+                                if let Some(area) = self.last_sidebar_area {
+                                    let x = mouse.column;
+                                    let y = mouse.row;
+                                    let inside = x >= area.x
+                                        && x < area.x + area.width
+                                        && y >= area.y
+                                        && y < area.y + area.height;
+                                    if inside {
+                                        let inner_row = y.saturating_sub(area.y + 1);
+                                        let hit = self
+                                            .sidebar_header_rows()
+                                            .into_iter()
+                                            .find(|(_, header_row)| *header_row == inner_row);
+                                        if let Some((section, _)) = hit {
+                                            self.toggle_section(section);
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                         changed = true;
@@ -665,6 +950,74 @@ impl App {
                 _ => {}
             }
         }
+        // The /provider setup wizard: enter submits the current line, esc
+        // closes the wizard.
+        if self.provider_wizard.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    let answer = self.editor.text();
+                    self.editor.set_text("");
+                    self.editor_view_top = 0;
+                    self.provider_wizard_advance(&answer);
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.provider_wizard = None;
+                    self.editor.set_text("");
+                    self.push_notice("provider wizard closed");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The command palette: up/down navigate, enter completes the
+        // selected command, escape closes it (text stays for editing).
+        if self.palette_open {
+            match key.code {
+                KeyCode::Up => {
+                    self.palette_index = self.palette_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let count = self.filtered_palette().len();
+                    self.palette_index = (self.palette_index + 1).min(count.saturating_sub(1));
+                    return;
+                }
+                KeyCode::Enter => {
+                    let text = self.editor.text();
+                    let filtered = self.filtered_palette();
+                    let selected = filtered.get(self.palette_index).cloned();
+                    self.palette_open = false;
+                    // If the first word is already a complete command name
+                    // (e.g. "/restore 1") submit exactly as typed so the
+                    // argument is never mangled by completion.
+                    let first_word = text.split_whitespace().next().unwrap_or_default();
+                    let is_exact = builtin_palette()
+                        .iter()
+                        .any(|(name, _)| *name == first_word)
+                        || crate::sessions::list_custom_commands(&self.inputs.agent_dir)
+                            .iter()
+                            .any(|custom| format!("/{custom}") == first_word);
+                    if is_exact {
+                        self.submit_text(text).await;
+                        return;
+                    }
+                    if let Some(selection) = selected {
+                        let completed = palette_completion(&selection, &text);
+                        self.editor.set_text(&completed);
+                        self.submit_text(completed).await;
+                    } else {
+                        self.submit_text(text).await;
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.palette_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The plan is ready: e/s/r decide what happens next. Only when the
         // editor is empty so normal typing/messages are never intercepted,
         // and not for ctrl+r (toggle thinking) which shares the 'r' key.
@@ -683,6 +1036,38 @@ impl App {
                 }
                 KeyCode::Char('r' | 'R') => {
                     self.refine_plan();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The variant picker consumes navigation keys while it is open.
+        if self.variant_picker_open {
+            match key.code {
+                KeyCode::Up => {
+                    self.variant_picker_index = self.variant_picker_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let count = self.current_variants().len();
+                    self.variant_picker_index =
+                        (self.variant_picker_index + 1).min(count.saturating_sub(1));
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some(variant) = self.current_variants().get(self.variant_picker_index) {
+                        let selected = if variant == "default" {
+                            None
+                        } else {
+                            Some(variant.clone())
+                        };
+                        self.select_variant(selected);
+                    }
+                    self.variant_picker_open = false;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.variant_picker_open = false;
                     return;
                 }
                 _ => {}
@@ -731,9 +1116,34 @@ impl App {
 
     /// Switch the agent to a model and close any picker.
     fn select_model(&mut self, model: String) {
+        // A different model usually has different reasoning behaviour: reset
+        // the effort variant when the model changes.
+        if self.current_model != model && self.variant.is_some() {
+            self.select_variant(None);
+        }
         let _ = self.submit_tx.send(SubmitCommand::SetModel(model.clone()));
         self.current_model = model;
         self.push_notice(format!("model set to {}", self.current_model));
+    }
+
+    /// Variants the current model declares (OpenCode-style Default/low/high/
+    /// max). Empty → the model has no reasoning-effort selector.
+    fn current_variants(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .find(|spec| spec.id == self.current_model)
+            .map(|spec| spec.variants.clone())
+            .unwrap_or_default()
+    }
+
+    /// Set the effort variant: `None` = default (no `reasoning_effort` on
+    /// the wire). Persisted into the running agent + session options.
+    fn select_variant(&mut self, variant: Option<String>) {
+        self.variant = variant.clone();
+        self.inputs.agent_options.variant = variant.clone();
+        let _ = self.submit_tx.send(SubmitCommand::SetVariant(variant));
+        let label = self.variant.as_deref().unwrap_or("default");
+        self.push_notice(format!("variant: {label}"));
     }
 
     /// Execute the approved plan: flip to build mode and send the plan as a
@@ -763,7 +1173,9 @@ impl App {
         self.streaming = true;
         self.last_error = None;
         self.seal_turn();
-        let _ = self.submit_tx.send(SubmitCommand::Prompt(prompt));
+        let _ = self
+            .submit_tx
+            .send(SubmitCommand::Prompt(prompt, Vec::new()));
         self.push_notice("executing the plan — mark steps with [DONE:n]");
     }
 
@@ -784,6 +1196,7 @@ impl App {
         let _ = self.submit_tx.send(SubmitCommand::Prompt(
             "Please refine the plan above: improve the steps (keep the `Plan:` numbered format)."
                 .to_string(),
+            Vec::new(),
         ));
     }
 
@@ -810,6 +1223,48 @@ impl App {
             EditorAction::Newline => self.editor.newline(),
         }
         self.completion = None;
+        // The slash palette mirrors the editor: "/" opens it, anything else
+        // closes it.
+        self.sync_palette();
+    }
+
+    /// Command names (built-in + custom) matching the current editor filter,
+    /// in registry order.
+    fn filtered_palette(&self) -> Vec<String> {
+        let filter = self.editor.text();
+        let mut names: Vec<String> = builtin_palette()
+            .into_iter()
+            .filter(|(name, description)| palette_matches(&filter, name, description))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for custom in crate::sessions::list_custom_commands(&self.inputs.agent_dir) {
+            if palette_matches(&filter, &format!("/{custom}"), "custom command") {
+                names.push(format!("/{custom}"));
+            }
+        }
+        names
+    }
+
+    /// Open/close the command palette to mirror the editor content: typing
+    /// "/" as the first character opens it (OpenCode-style command menu),
+    /// any other content closes it. Modal overlays take precedence.
+    fn sync_palette(&mut self) {
+        let text = self.editor.text();
+        let modal = self.pending_ask.is_some()
+            || self.provider_wizard.is_some()
+            || self.model_picker_open
+            || self.journal_open;
+        let should_open = text.starts_with('/') && !modal;
+        if should_open && !self.palette_open {
+            self.palette_open = true;
+            self.palette_index = 0;
+        } else if !should_open && self.palette_open {
+            self.palette_open = false;
+        }
+        if self.palette_open {
+            let count = self.filtered_palette().len();
+            self.palette_index = self.palette_index.min(count.saturating_sub(1));
+        }
     }
 
     async fn apply_app_action(&mut self, action: AppAction) {
@@ -841,6 +1296,24 @@ impl App {
             AppAction::ModelCycleForward => self.cycle_model(1),
             AppAction::ModelCycleBackward => self.cycle_model(-1),
             AppAction::ToggleInfo => self.info_open = !self.info_open,
+            AppAction::ToggleVariant => {
+                let variants = self.current_variants();
+                if variants.is_empty() {
+                    self.push_notice(format!(
+                        "model `{}` has no variants (reasoning-effort models expose default/low/high/max)",
+                        self.current_model
+                    ));
+                } else {
+                    self.variant_picker_open = !self.variant_picker_open;
+                    self.variant_picker_index = variants
+                        .iter()
+                        .position(|variant| {
+                            Some(variant.as_str()) == self.variant.as_deref()
+                                || (variant == "default" && self.variant.is_none())
+                        })
+                        .unwrap_or(0);
+                }
+            }
             AppAction::ToggleToolOutput => {
                 let last_tool = self.items.iter_mut().rev().find_map(|item| match item {
                     TranscriptItem::ToolExecution { .. } => Some(item),
@@ -963,6 +1436,386 @@ impl App {
         self.usage.add(&usage);
     }
 
+    /// Pull `@image.png` tokens out of the input into image attachments
+    /// (data URIs). Returns the cleaned text + image list. Non-image `@file`
+    /// tokens are left untouched (they are inline-file syntax elsewhere).
+    fn extract_attachments(&self, text: String) -> (String, Vec<String>) {
+        const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+        let mut images = Vec::new();
+        let mut cleaned = Vec::new();
+        for token in text.split_whitespace() {
+            let Some(path) = token.strip_prefix('@') else {
+                cleaned.push(token);
+                continue;
+            };
+            let full = if std::path::Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                self.cwd.join(path)
+            };
+            let is_image = full
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| IMAGE_EXTS.contains(&ext.to_lowercase().as_str()));
+            if full.is_file() && is_image {
+                let Ok(bytes) = std::fs::read(&full) else {
+                    cleaned.push(token);
+                    continue;
+                };
+                if bytes.len() <= 10 * 1024 * 1024 {
+                    let mime = full
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| match ext.to_lowercase().as_str() {
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif" => "image/gif",
+                            "webp" => "image/webp",
+                            "bmp" => "image/bmp",
+                            _ => "image/png",
+                        })
+                        .unwrap_or("image/png");
+                    images.push(format!(
+                        "data:{mime};base64,{}",
+                        Self::base64_encode(&bytes)
+                    ));
+                    continue;
+                }
+            }
+            cleaned.push(token);
+        }
+        (cleaned.join(" "), images)
+    }
+
+    /// Reload configured providers from disk (the wizard always reads fresh).
+    fn reload_configured_providers(&self) -> Vec<agent_m_ai::ProviderConfig> {
+        agent_m_ai::load_provider_configs(&self.inputs.agent_dir)
+    }
+
+    /// Current wizard prompt text (rendered in the status overlay).
+    fn provider_wizard_prompt(&self) -> String {
+        let providers = self.reload_configured_providers();
+        match &self.provider_wizard {
+            None => String::new(),
+            Some(ProviderWizard::Menu) => {
+                let mut text = String::from(
+                    "providers — 1 add · 2 edit · 3 remove · 4 switch (esc cancels)\n",
+                );
+                for (index, provider) in providers.iter().enumerate() {
+                    let active = if provider.id == self.provider_id {
+                        " ⚡"
+                    } else {
+                        ""
+                    };
+                    text.push_str(&format!(
+                        "  {}. {} ({}){active}\n",
+                        index + 1,
+                        provider.id,
+                        provider.model
+                    ));
+                }
+                text.push_str(&format!("  ⚡ active: {}", self.provider_id));
+                text
+            }
+            Some(ProviderWizard::Select(action)) => format!(
+                "enter the number of the provider to {} (0 = built-in deepseek):",
+                match action {
+                    SelectAction::Edit => "edit",
+                    SelectAction::Remove => "remove",
+                    SelectAction::Switch => "switch to",
+                }
+            ),
+            Some(ProviderWizard::Add(draft, field)) => {
+                format!("add provider — {}", field_prompt(draft, *field))
+            }
+            Some(ProviderWizard::Edit(id, draft, field)) => {
+                format!("edit `{id}` — {}", field_prompt(draft, *field))
+            }
+            Some(ProviderWizard::Remove(id, _)) => {
+                format!("remove provider `{id}`? [y]es / [n]o")
+            }
+        }
+    }
+
+    /// Advance the wizard with the editor's current line.
+    fn provider_wizard_advance(&mut self, input: &str) {
+        let wizard = match self.provider_wizard.take() {
+            Some(wizard) => wizard,
+            None => return,
+        };
+        let input = input.trim().to_string();
+        let providers = self.reload_configured_providers();
+        match wizard {
+            ProviderWizard::Menu => match input.as_str() {
+                "1" => {
+                    self.editor.set_text("");
+                    self.provider_wizard = Some(ProviderWizard::Add(
+                        ProviderDraft::default(),
+                        ProviderField::Id,
+                    ));
+                }
+                "2" => self.provider_wizard = Some(ProviderWizard::Select(SelectAction::Edit)),
+                "3" => self.provider_wizard = Some(ProviderWizard::Select(SelectAction::Remove)),
+                "4" => self.provider_wizard = Some(ProviderWizard::Select(SelectAction::Switch)),
+                other => {
+                    self.push_notice(format!(
+                        "provider: pick 1-4 (got `{other}`); /help for the list"
+                    ));
+                    self.provider_wizard = Some(ProviderWizard::Menu);
+                }
+            },
+            ProviderWizard::Select(action) => {
+                let pick = input.parse::<usize>().ok();
+                let config = pick
+                    .and_then(|index| providers.get(index.saturating_sub(1)).cloned())
+                    .or_else(|| {
+                        (action == SelectAction::Switch && input == "0")
+                            .then(|| provider_config("deepseek"))
+                    });
+                let Some(config) = config else {
+                    self.push_notice(format!(
+                        "provider: no provider number `{input}` (1-{})",
+                        providers.len()
+                    ));
+                    self.provider_wizard = Some(ProviderWizard::Select(action));
+                    return;
+                };
+                match action {
+                    SelectAction::Edit => {
+                        let draft = ProviderDraft {
+                            id: config.id.clone(),
+                            name: config.name.clone().unwrap_or_default(),
+                            base_url: config.base_url.clone(),
+                            model: config.model.clone(),
+                            key_env: config.key_env(),
+                            context: config.context_window.to_string(),
+                        };
+                        self.editor.set_text(&draft.id);
+                        self.provider_wizard = Some(ProviderWizard::Edit(
+                            config.id.clone(),
+                            draft,
+                            ProviderField::Id,
+                        ));
+                    }
+                    SelectAction::Remove => {
+                        self.provider_wizard = Some(ProviderWizard::Remove(config.id, false));
+                    }
+                    SelectAction::Switch => {
+                        self.switch_provider(&config.id);
+                        self.provider_wizard = None;
+                    }
+                }
+            }
+            ProviderWizard::Add(mut draft, field) => {
+                match field {
+                    ProviderField::Id => {
+                        if !agent_m_ai::ProviderConfig::is_valid_id(&input) || input.is_empty() {
+                            self.push_notice(
+                                "provider: id must be [a-z0-9-_] (e.g. openai); try again",
+                            );
+                            self.provider_wizard = Some(ProviderWizard::Add(draft, field));
+                            return;
+                        }
+                        draft.id = input;
+                    }
+                    ProviderField::Name => draft.name = input,
+                    ProviderField::BaseUrl => {
+                        if !(input.starts_with("http://") || input.starts_with("https://"))
+                            || input.len() < 11
+                        {
+                            self.push_notice(
+                                "provider: base URL must start with http(s)://; try again",
+                            );
+                            self.provider_wizard = Some(ProviderWizard::Add(draft, field));
+                            return;
+                        }
+                        draft.base_url = input;
+                    }
+                    ProviderField::Model => {
+                        if input.is_empty() {
+                            self.push_notice("provider: model id cannot be empty; try again");
+                            self.provider_wizard = Some(ProviderWizard::Add(draft, field));
+                            return;
+                        }
+                        draft.model = input;
+                    }
+                    ProviderField::KeyEnv => draft.key_env = input,
+                    ProviderField::Context => {
+                        if !input.is_empty() && input.parse::<u64>().map(|v| v == 0).unwrap_or(true)
+                        {
+                            self.push_notice(
+                                "provider: context window must be a positive number; try again",
+                            );
+                            self.provider_wizard = Some(ProviderWizard::Add(draft, field));
+                            return;
+                        }
+                    }
+                }
+                match field.next() {
+                    Some(next) => {
+                        self.editor.set_text(&prefill(&draft, next));
+                        self.provider_wizard = Some(ProviderWizard::Add(draft, next));
+                    }
+                    None => {
+                        // Done: persist + switch to the new provider.
+                        let config = agent_m_ai::ProviderConfig {
+                            models: None,
+                            id: draft.id.clone(),
+                            name: if draft.name.is_empty() {
+                                None
+                            } else {
+                                Some(draft.name.clone())
+                            },
+                            base_url: draft.base_url.clone(),
+                            model: draft.model.clone(),
+                            reasoning: false,
+                            supports_images: false,
+                            context_window: draft.context.parse().unwrap_or(128_000),
+                            pricing: agent_m_ai::Pricing::default(),
+                            api_key_env: if draft.key_env.is_empty() {
+                                None
+                            } else {
+                                Some(draft.key_env.clone())
+                            },
+                        };
+                        let mut all = self.reload_configured_providers();
+                        if all.iter().any(|p| p.id == config.id) {
+                            self.push_notice(format!(
+                                "provider `{}` already exists — use /provider edit",
+                                config.id
+                            ));
+                            self.provider_wizard = Some(ProviderWizard::Menu);
+                            return;
+                        }
+                        all.push(config);
+                        if let Err(error) =
+                            agent_m_ai::save_provider_configs(&self.inputs.agent_dir, &all)
+                        {
+                            self.push_notice(format!("provider: save failed: {error}"));
+                            self.provider_wizard = Some(ProviderWizard::Menu);
+                            return;
+                        }
+                        self.push_notice(format!("added provider `{}`", draft.id));
+                        self.switch_provider(&draft.id);
+                        self.provider_wizard = None;
+                    }
+                }
+            }
+            ProviderWizard::Edit(id, mut draft, field) => {
+                match field {
+                    ProviderField::Id => {
+                        if !agent_m_ai::ProviderConfig::is_valid_id(&input) || input.is_empty() {
+                            self.push_notice("provider: id must be [a-z0-9-_]; try again");
+                            self.provider_wizard = Some(ProviderWizard::Edit(id, draft, field));
+                            return;
+                        }
+                        draft.id = input;
+                    }
+                    ProviderField::Name => draft.name = input,
+                    ProviderField::BaseUrl => {
+                        if !(input.starts_with("http://") || input.starts_with("https://"))
+                            || input.len() < 11
+                        {
+                            self.push_notice("provider: base URL must start with http(s)://");
+                            self.provider_wizard = Some(ProviderWizard::Edit(id, draft, field));
+                            return;
+                        }
+                        draft.base_url = input;
+                    }
+                    ProviderField::Model => {
+                        if input.is_empty() {
+                            self.push_notice("provider: model id cannot be empty");
+                            self.provider_wizard = Some(ProviderWizard::Edit(id, draft, field));
+                            return;
+                        }
+                        draft.model = input;
+                    }
+                    ProviderField::KeyEnv => draft.key_env = input,
+                    ProviderField::Context => {
+                        if !input.is_empty() && input.parse::<u64>().map(|v| v == 0).unwrap_or(true)
+                        {
+                            self.push_notice("provider: context window must be positive");
+                            self.provider_wizard = Some(ProviderWizard::Edit(id, draft, field));
+                            return;
+                        }
+                    }
+                }
+                match field.next() {
+                    Some(next) => {
+                        self.editor.set_text(&prefill(&draft, next));
+                        self.provider_wizard = Some(ProviderWizard::Edit(id, draft, next));
+                    }
+                    None => {
+                        let mut all = self.reload_configured_providers();
+                        if let Some(index) = all.iter().position(|p| p.id == id) {
+                            all[index].id = draft.id.clone();
+                            all[index].name = if draft.name.is_empty() {
+                                None
+                            } else {
+                                Some(draft.name.clone())
+                            };
+                            all[index].base_url = draft.base_url.clone();
+                            all[index].model = draft.model.clone();
+                            all[index].api_key_env = if draft.key_env.is_empty() {
+                                None
+                            } else {
+                                Some(draft.key_env.clone())
+                            };
+                            all[index].context_window =
+                                draft.context.parse().unwrap_or(all[index].context_window);
+                            if let Err(error) =
+                                agent_m_ai::save_provider_configs(&self.inputs.agent_dir, &all)
+                            {
+                                self.push_notice(format!("provider: save failed: {error}"));
+                            } else {
+                                self.push_notice(format!("updated provider `{}`", draft.id));
+                            }
+                        }
+                        self.provider_wizard = None;
+                    }
+                }
+            }
+            ProviderWizard::Remove(id, _) => {
+                if input == "y" || input == "yes" {
+                    let mut all = self.reload_configured_providers();
+                    all.retain(|provider| provider.id != id);
+                    match agent_m_ai::save_provider_configs(&self.inputs.agent_dir, &all) {
+                        Ok(()) => self.push_notice(format!("removed provider `{id}`")),
+                        Err(error) => self.push_notice(format!("provider: remove failed: {error}")),
+                    }
+                } else {
+                    self.push_notice("provider remove cancelled");
+                }
+                self.provider_wizard = None;
+            }
+        }
+    }
+
+    /// Live-switch the running agent to a provider id (configured or the
+    /// built-in `deepseek`); updates the model picker + cost display.
+    fn switch_provider(&mut self, id: &str) {
+        let config = self
+            .reload_configured_providers()
+            .into_iter()
+            .find(|config| config.id == id)
+            .or_else(|| (id == "deepseek").then(|| provider_config("deepseek")));
+        let Some(config) = config else {
+            self.push_notice(format!("provider `{id}` is not configured"));
+            return;
+        };
+        let metadata = agent_m_ai::provider_from_config(&config, None, &self.inputs.agent_dir);
+        self.models = metadata.models().to_vec();
+        self.current_model = config.model.clone();
+        self.provider_id = config.id.clone();
+        self.editor.set_text("");
+        let _ = self
+            .submit_tx
+            .send(SubmitCommand::SwitchProvider(config.id.clone()));
+        self.push_notice(format!(
+            "switching to provider `{}` ({})",
+            config.id, config.model
+        ));
+    }
+
     async fn submit_text(&mut self, text: String) {
         if text.starts_with('/') {
             self.run_slash_command(&text);
@@ -983,7 +1836,11 @@ impl App {
         self.question_pending = false;
         self.plan_choice_pending = false;
         self.seal_turn();
-        let _ = self.submit_tx.send(SubmitCommand::Prompt(text));
+        let (text, images) = self.extract_attachments(text);
+        if !images.is_empty() {
+            self.push_notice(format!("🖼 attached {} image(s)", images.len()));
+        }
+        let _ = self.submit_tx.send(SubmitCommand::Prompt(text, images));
     }
 
     /// Execute bash directly (pi's `!cmd`), showing the result as a tool block.
@@ -1029,11 +1886,15 @@ impl App {
         let command = parts.next().unwrap_or_default();
         let argument = parts.next().unwrap_or_default();
         match command {
-            "/help" => self.push_notice(
-                "agent-m help\n\nSlash commands: /help /hotkeys /clear /exit /quit /model /new /settings /cache /info /plan /build /todos /context /compact /journal /undo /level <0-4>\n!command runs bash directly. Type a prompt and press Enter to chat.",
-            ),
+            "/help" => {
+                // The palette doubles as help: clear the filter so every
+                // command (with its description) is listed.
+                self.editor.set_text("");
+                self.palette_open = true;
+                self.palette_index = 0;
+            }
             "/hotkeys" => self.push_notice(
-                "enter submit · shift+enter/ctrl+j newline · tab autocomplete\nctrl+c clear (empty: exit) · ctrl+d exit · escape interrupt\nctrl+l model select · ctrl+o tool output · ctrl+r toggle thinking · ctrl+n info · ctrl+p/ctrl+shift+p model cycle\nctrl+a/e line · ctrl+b/f word · ctrl+w/u/k kill · ctrl+y yank · ctrl+- undo\npageUp/pageDown/mouse wheel scroll · ctrl+t toggle cache notices",
+                "enter submit · shift+enter/ctrl+j newline · tab autocomplete\n/ starts the command palette · /sidebar <section> collapses a panel\nctrl+c clear (empty: exit) · ctrl+d exit · escape interrupt\nctrl+l model select · ctrl+v variant · ctrl+o tool output · ctrl+r toggle thinking · ctrl+n info · ctrl+p/ctrl+shift+p model cycle\nctrl+a/e line · ctrl+b/f word · ctrl+w/u/k kill · ctrl+y yank · ctrl+- undo\npageUp/pageDown/mouse wheel scroll · ctrl+t toggle cache notices",
             ),
             "/clear" => {
                 self.items.clear();
@@ -1101,6 +1962,39 @@ impl App {
                     self.push_notice("usage: /level <0-4>  (0 observe · 1 suggest · 2 assisted · 3 trusted · 4 autonomous)");
                 }
             }
+            "/checkpoint" => {
+                match agent_m_agent::create_checkpoint(&self.cwd, "manual") {
+                    Ok(Some(sha)) => {
+                        self.checkpoints.push(crate::sessions::CheckpointEntry {
+                            sha: sha.clone(),
+                            label: "manual".to_string(),
+                            ts: crate::sessions::now_iso(),
+                        });
+                        let _ = crate::sessions::save_checkpoints(
+                            &self.inputs.agent_dir,
+                            &self.session_stem,
+                            &self.checkpoints,
+                        );
+                        self.push_notice(format!(
+                            "checkpoint {} ({})",
+                            &sha[..8.min(sha.len())],
+                            self.checkpoints.len()
+                        ));
+                    }
+                    Ok(None) => self.push_notice(
+                        "checkpoint: working tree is clean (or not a git repo)",
+                    ),
+                    Err(error) => self.push_notice(format!("checkpoint failed: {error}")),
+                }
+            }
+            "/restore" => {
+                let target = if argument.is_empty() {
+                    self.checkpoints.len().to_string()
+                } else {
+                    argument.to_string()
+                };
+                self.restore_checkpoint(&target);
+            }
             "/undo" => {
                 self.undo_last();
             }
@@ -1114,12 +2008,21 @@ impl App {
                 }
             }
             "/sidebar" => {
-                self.show_sidebar = !self.show_sidebar;
-                self.push_notice(if self.show_sidebar {
-                    "sidebar shown (auto-hides under 110 columns)"
-                } else {
-                    "sidebar hidden"
-                });
+                match argument {
+                    "context" | "timing" | "flow" | "todos" => {
+                        self.toggle_section(SidebarSection::from_name(argument));
+                        self.push_notice(format!("section `{argument}` toggled"));
+                    }
+                    _ if argument.is_empty() => {
+                        self.show_sidebar = !self.show_sidebar;
+                        self.push_notice(if self.show_sidebar {
+                            "sidebar shown (auto-hides under 110 columns)"
+                        } else {
+                            "sidebar hidden"
+                        });
+                    }
+                    _ => self.push_notice("unknown section (context|timing|flow|todos)"),
+                }
             }
             "/flows" => {
                 let dir = self.inputs.agent_dir.join("flows");
@@ -1191,6 +2094,17 @@ impl App {
                 self.mode = agent_m_agent::Mode::Build;
                 self.push_notice("build mode: tools enabled");
             }
+            "/provider" => {
+                if argument.is_empty() {
+                    self.editor.set_text("");
+                    self.provider_wizard = Some(ProviderWizard::Menu);
+                    self.push_notice(
+                        "provider wizard — 1 add · 2 edit · 3 remove · 4 switch",
+                    );
+                } else {
+                    self.switch_provider(argument);
+                }
+            }
             "/model" => {
                 if argument.is_empty() {
                     // Open the model picker.
@@ -1231,9 +2145,53 @@ impl App {
                     if self.show_cache_notices { "on" } else { "off" }
                 ));
             }
-            _ => self.push_notice(format!("unknown command {command}; /help for the list")),
+            _ => {
+                // User-defined slash commands: ~/.agent-m/commands/<name>.md
+                // prompt templates with ${cwd} and ${input} substitution.
+                if let Some(template) =
+                    crate::sessions::load_custom_command(&self.inputs.agent_dir, command)
+                {
+                    let input = input
+                        .trim_start_matches(command)
+                        .trim()
+                        .to_string();
+                    let expanded = template
+                        .replace("${cwd}", &self.cwd.to_string_lossy())
+                        .replace("${input}", &input);
+                    let _ = self
+                        .submit_tx
+                        .send(SubmitCommand::Prompt(expanded, Vec::new()));
+                    return;
+                }
+                self.push_notice(format!("unknown command {command}; /help for the list"));
+            }
         }
         self.editor.set_text("");
+    }
+
+    /// Minimal base64 encoder (no external dep): 3 bytes → 4 chars.
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[(n >> 18) as usize & 63] as char);
+            out.push(TABLE[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                out.push(TABLE[(n >> 6) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(TABLE[n as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
     }
 
     fn push_notice(&mut self, message: impl Into<String>) {
@@ -1314,6 +2272,73 @@ impl App {
     /// pure [`apply_flow_step_state`]).
     fn apply_flow_step(&mut self, index: usize, name: String, status: String) {
         apply_flow_step_state(&mut self.flow_run, index, name, status);
+    }
+
+    /// Repo-level rollback (principle 8): auto-checkpoint before mutating
+    /// tools when the cwd is a git repo. Skips clean trees; the SHA lands in
+    /// the per-session ledger for `/restore`.
+    fn checkpoint_maybe(&mut self, name: &str) {
+        if !matches!(name, "bash" | "write" | "edit") {
+            return;
+        }
+        match agent_m_agent::create_checkpoint(&self.cwd, name) {
+            Ok(Some(sha)) => {
+                self.checkpoints.push(crate::sessions::CheckpointEntry {
+                    sha,
+                    label: name.to_string(),
+                    ts: crate::sessions::now_iso(),
+                });
+                let _ = crate::sessions::save_checkpoints(
+                    &self.inputs.agent_dir,
+                    &self.session_stem,
+                    &self.checkpoints,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => self.push_notice(format!("checkpoint skipped: {error}")),
+        }
+    }
+
+    /// `/restore <index|sha>` — roll the working tree back to a checkpoint.
+    fn restore_checkpoint(&mut self, target: &str) {
+        let index = target.parse::<usize>().ok();
+        let entry = index
+            .and_then(|index| self.checkpoints.get(index.saturating_sub(1)))
+            .or_else(|| {
+                self.checkpoints
+                    .iter()
+                    .find(|entry| entry.sha.starts_with(target))
+            })
+            .cloned();
+        let Some(entry) = entry else {
+            let count = self.checkpoints.len();
+            let list: Vec<String> = self
+                .checkpoints
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    format!(
+                        "  {}. {} ({})",
+                        index + 1,
+                        &entry.sha[..8.min(entry.sha.len())],
+                        entry.label
+                    )
+                })
+                .collect();
+            self.push_notice(format!(
+                "usage: /restore <index|sha> — {count} checkpoint(s):\n{}",
+                list.join("\n")
+            ));
+            return;
+        };
+        match agent_m_agent::restore_checkpoint(&self.cwd, &entry.sha) {
+            Ok(()) => self.push_notice(format!(
+                "restored checkpoint {} ({}) — uncommitted changes were discarded",
+                &entry.sha[..8.min(entry.sha.len())],
+                entry.label
+            )),
+            Err(error) => self.push_notice(format!("restore failed: {error}")),
+        }
     }
 
     /// Principle 8: before a write/edit executes, snapshot the target file so
@@ -1437,6 +2462,7 @@ impl App {
             } => {
                 self.active_tool = Some(crate::transcript::narration(&name, &arguments));
                 self.snapshot_for_undo(&name, &arguments);
+                self.checkpoint_maybe(&name);
                 self.items.push(TranscriptItem::ToolExecution {
                     tool_call_id,
                     name,
@@ -1491,10 +2517,20 @@ impl App {
                 self.cache_miss = cache_stats.miss_tokens;
                 self.cache_requests = cache_stats.requests;
             }
-            AgentEvent::AgentStart
-            | AgentEvent::TurnStart { .. }
-            | AgentEvent::TurnEnd { .. }
-            | AgentEvent::MessageEnd {
+            AgentEvent::AgentStart => {}
+            AgentEvent::TurnStart { .. } => {
+                self.turn_started = Some(Instant::now());
+            }
+            AgentEvent::TurnEnd { .. } => {
+                if let Some(started) = self.turn_started.take() {
+                    let ms = started.elapsed().as_millis() as u64;
+                    self.turn_times.push(ms);
+                    if self.turn_times.len() > 10 {
+                        self.turn_times.remove(0);
+                    }
+                }
+            }
+            AgentEvent::MessageEnd {
                 message: SessionMessage::ToolResult { .. },
             }
             | AgentEvent::MessageEnd {
@@ -1579,6 +2615,7 @@ impl App {
         self.draw_editor(frame, areas[2]);
         self.draw_footer(frame, areas[3]);
         if let Some(sidebar_area) = sidebar_area {
+            self.last_sidebar_area = Some(sidebar_area);
             self.draw_sidebar(frame, sidebar_area);
         }
         self.draw_overlay(frame);
@@ -1587,8 +2624,11 @@ impl App {
     fn layout(&self, area: Rect) -> Vec<Rect> {
         let editor_height = self.editor_height_hint();
         // The approval/ask prompts get a multi-line box when pending.
-        let status_height = if self.pending_approval.is_some() || self.pending_ask.is_some() {
-            5
+        let status_height = if self.pending_approval.is_some()
+            || self.pending_ask.is_some()
+            || self.provider_wizard.is_some()
+        {
+            6
         } else {
             1
         };
@@ -1733,6 +2773,36 @@ impl App {
                     Style::default().fg(self.theme.dim),
                 )));
             }
+            frame.render_widget(Paragraph::new(lines), area);
+            return;
+        }
+        if let Some(prompt) = {
+            if self.provider_wizard.is_some() {
+                Some(self.provider_wizard_prompt())
+            } else {
+                None
+            }
+        } {
+            let mut lines = vec![Line::from(Span::styled(
+                "⚙ provider setup",
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))];
+            let width = area.width.max(20) as usize;
+            for wrapped in wrap_lines(&prompt, width.saturating_sub(2)) {
+                if lines.len() >= 8 {
+                    break;
+                }
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(self.theme.warning),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "type your answer below and press enter (esc to cancel)",
+                Style::default().fg(self.theme.dim),
+            )));
             frame.render_widget(Paragraph::new(lines), area);
             return;
         }
@@ -1927,106 +2997,169 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    /// Visible sidebar sections in display order. `flow` and `todos` only
+    /// appear while they have content; `timing` only after the first turn.
+    fn sidebar_sections(&self) -> Vec<SidebarSection> {
+        sidebar_sections_for(
+            !self.turn_times.is_empty(),
+            self.flow_run.is_some(),
+            !self.todos.is_empty(),
+        )
+    }
+
+    fn section_collapsed(&self, section: SidebarSection) -> bool {
+        self.collapsed_sections
+            .iter()
+            .any(|name| name == section.name())
+    }
+
+    /// Toggle a section's collapsed state and persist it.
+    fn toggle_section(&mut self, section: SidebarSection) {
+        toggle_name(&mut self.collapsed_sections, section.name());
+        crate::sessions::save_collapsed_sections(&self.inputs.agent_dir, &self.collapsed_sections);
+    }
+
+    /// Body lines for one sidebar section (no header, no separators).
+    fn section_body_lines(&self, section: SidebarSection) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        match section {
+            SidebarSection::Context => {
+                lines.push(Line::from(format!("model: {}", self.current_model)));
+                lines.push(Line::from(format!(
+                    "tokens in: {}",
+                    fmt_tokens(self.usage.input)
+                )));
+                lines.push(Line::from(format!(
+                    "tokens out: {}",
+                    fmt_tokens(self.usage.output)
+                )));
+                lines.push(Line::from(format!(
+                    "cache read: {} ({}%)",
+                    fmt_tokens(self.usage.cache_read),
+                    self.cache_ratio()
+                )));
+                lines.push(Line::from(format!("cost: ${:.4}", self.usage.cost)));
+                if let Some(window) = self
+                    .models
+                    .iter()
+                    .find(|spec| spec.id == self.current_model)
+                    .and_then(|spec| spec.context_window)
+                {
+                    let percent = self
+                        .last_input
+                        .checked_mul(100)
+                        .and_then(|n| n.checked_div(window))
+                        .unwrap_or(0);
+                    lines.push(Line::from(format!(
+                        "context: {percent}% of {}",
+                        fmt_tokens(window)
+                    )));
+                }
+            }
+            SidebarSection::Timing => {
+                if let Some(last) = self.turn_times.last() {
+                    lines.push(Line::from(format!("last turn: {last} ms")));
+                }
+                if !self.turn_times.is_empty() {
+                    let average: u64 =
+                        self.turn_times.iter().sum::<u64>() / self.turn_times.len() as u64;
+                    lines.push(Line::from(format!(
+                        "avg ({}/{}): {average} ms",
+                        self.turn_times.len(),
+                        10
+                    )));
+                }
+            }
+            SidebarSection::Flow => {
+                if let Some(view) = &self.flow_run {
+                    let (done, total) = flow_progress(view);
+                    let name = if view.name.is_empty() {
+                        "flow".to_string()
+                    } else {
+                        view.name.clone()
+                    };
+                    lines.push(Line::from(format!("{name} ({done}/{total})")));
+                    let filled = done
+                        .checked_mul(BAR_CELLS)
+                        .and_then(|n| n.checked_div(total))
+                        .unwrap_or(0);
+                    lines.push(Line::from(Span::styled(
+                        "█".repeat(filled) + &"░".repeat(BAR_CELLS - filled),
+                        Style::default().fg(self.theme.accent),
+                    )));
+                    for step in &view.steps {
+                        let (icon, style) = match step.status.as_str() {
+                            "succeeded" => ("✓", Style::default().fg(Color::Green)),
+                            "running" => (
+                                "▶",
+                                Style::default()
+                                    .fg(self.theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            "failed" => ("✗", Style::default().fg(self.theme.error)),
+                            _ => ("○", Style::default().fg(self.theme.muted)),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{icon} "), style),
+                            Span::styled(step.name.clone(), style),
+                        ]));
+                    }
+                }
+            }
+            SidebarSection::Todos => {
+                let done = self.todos.iter().filter(|t| t.completed).count();
+                lines.push(Line::from(format!("plan ({done}/{})", self.todos.len())));
+                for todo in &self.todos {
+                    let (icon, style) = if todo.completed {
+                        ("[x]", Style::default().fg(Color::Green))
+                    } else {
+                        ("[ ]", Style::default().fg(self.theme.muted))
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{icon} {}", todo.text),
+                        style,
+                    )));
+                }
+            }
+            SidebarSection::Session => {}
+        }
+        lines
+    }
+
     fn sidebar_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        if let Some(view) = &self.flow_run {
-            let (done, total) = flow_progress(view);
-            let name = if view.name.is_empty() {
-                "flow".to_string()
-            } else {
-                view.name.clone()
-            };
-            lines.push(Line::from(vec![
-                Span::styled("⚙ ", Style::default().fg(self.theme.accent)),
-                Span::styled(
-                    format!("{name} ({done}/{total})"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            // Progress bar.
-            let filled = done
-                .checked_mul(BAR_CELLS)
-                .and_then(|n| n.checked_div(total))
-                .unwrap_or(0);
-            let bar: String = "█".repeat(filled) + &"░".repeat(BAR_CELLS - filled);
+        for section in self.sidebar_sections() {
+            let collapsed = self.section_collapsed(section);
+            lines.push(section.header_line(&self.theme, collapsed));
+            if !collapsed {
+                lines.extend(self.section_body_lines(section));
+            }
+            lines.push(Line::from(""));
+        }
+        // Never leave the panel empty when every section is collapsed.
+        if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                bar,
-                Style::default().fg(self.theme.accent),
-            )));
-            lines.push(Line::from(""));
-            for step in &view.steps {
-                let (icon, style) = match step.status.as_str() {
-                    "succeeded" => ("✓", Style::default().fg(Color::Green)),
-                    "running" => (
-                        "▶",
-                        Style::default()
-                            .fg(self.theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    "failed" => ("✗", Style::default().fg(self.theme.error)),
-                    _ => ("○", Style::default().fg(self.theme.muted)),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{icon} "), style),
-                    Span::styled(step.name.clone(), style),
-                ]));
-            }
-            return lines;
-        }
-        if !self.todos.is_empty() {
-            let done = self.todos.iter().filter(|t| t.completed).count();
-            lines.push(Line::from(vec![
-                Span::styled("📋 ", Style::default().fg(self.theme.warning)),
-                Span::styled(
-                    format!("plan ({done}/{})", self.todos.len()),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            lines.push(Line::from(""));
-            for todo in &self.todos {
-                let (icon, style) = if todo.completed {
-                    ("[x]", Style::default().fg(Color::Green))
-                } else {
-                    ("[ ]", Style::default().fg(self.theme.muted))
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{icon} {}", todo.text),
-                    style,
-                )));
-            }
-            return lines;
-        }
-        // Session stats fallback so the panel is never empty.
-        lines.push(Line::from(Span::styled(
-            "ℹ session",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(format!("model: {}", self.current_model)));
-        lines.push(Line::from(format!(
-            "tokens in: {}",
-            fmt_tokens(self.usage.input)
-        )));
-        lines.push(Line::from(format!(
-            "cache read: {}",
-            fmt_tokens(self.usage.cache_read)
-        )));
-        if let Some(window) = self
-            .models
-            .iter()
-            .find(|spec| spec.id == self.current_model)
-            .and_then(|spec| spec.context_window)
-        {
-            let percent = self
-                .last_input
-                .checked_mul(100)
-                .and_then(|n| n.checked_div(window))
-                .unwrap_or(0);
-            lines.push(Line::from(format!(
-                "context: {percent}% of {}",
-                fmt_tokens(window)
+                "▸ context (click / /sidebar to expand)",
+                Style::default().fg(self.theme.muted),
             )));
         }
         lines
+    }
+
+    /// Rows (inside the content area, below the top border) where each
+    /// section header sits — used by the click-to-toggle mapping.
+    fn sidebar_header_rows(&self) -> Vec<(SidebarSection, u16)> {
+        let mut rows = Vec::new();
+        let mut row: u16 = 0;
+        for section in self.sidebar_sections() {
+            rows.push((section, row));
+            row += 1;
+            if !self.section_collapsed(section) {
+                row += self.section_body_lines(section).len() as u16;
+            }
+            row += 1; // blank separator
+        }
+        rows
     }
 
     fn draw_overlay(&mut self, frame: &mut Frame) {
@@ -2046,6 +3179,15 @@ impl App {
                         }
                         _ => format!("{prefix}{marker}{}", spec.id),
                     };
+                    let label = if spec.id == self.current_model {
+                        if let Some(variant) = &self.variant {
+                            format!("{label} · {variant}")
+                        } else {
+                            label
+                        }
+                    } else {
+                        label
+                    };
                     let style = if selected {
                         Style::default()
                             .fg(self.theme.accent)
@@ -2062,6 +3204,94 @@ impl App {
                 .title_style(Style::default().fg(self.theme.accent))
                 .border_style(Style::default().fg(self.theme.dim));
             let rect = overlay_area(frame.area(), 52, lines.len() as u16 + 2);
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
+
+        if self.variant_picker_open {
+            let variants = self.current_variants();
+            let mut lines: Vec<Line> = variants
+                .iter()
+                .enumerate()
+                .map(|(index, variant)| {
+                    let selected = index == self.variant_picker_index;
+                    let active = self.variant.as_deref() == Some(variant.as_str())
+                        || (variant == "default" && self.variant.is_none());
+                    let prefix = if selected { "› " } else { "  " };
+                    let marker = if active { "• " } else { "  " };
+                    let style = if selected {
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.user_message_text)
+                    };
+                    Line::from(Span::styled(format!("{prefix}{marker}{variant}"), style))
+                })
+                .collect();
+            lines.push(Line::from(Span::styled(
+                "esc",
+                Style::default().fg(self.theme.muted),
+            )));
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" select variant — {} ", self.current_model))
+                .title_style(Style::default().fg(self.theme.accent))
+                .border_style(Style::default().fg(self.theme.dim));
+            let rect = overlay_area(frame.area(), 40, lines.len() as u16 + 2);
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
+
+        if self.palette_open {
+            let filtered = self.filtered_palette();
+            let mut lines: Vec<Line> = Vec::new();
+            if filtered.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "no matching commands",
+                    Style::default().fg(self.theme.muted),
+                )));
+            }
+            for (index, name) in filtered.iter().enumerate() {
+                let selected = index == self.palette_index;
+                let entry = builtin_palette()
+                    .iter()
+                    .find(|(n, _)| *n == name.as_str())
+                    .map(|(_, d)| *d)
+                    .unwrap_or("custom command");
+                let prefix = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(self.theme.user_message_text)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{name}"), style),
+                    Span::styled(
+                        format!("  — {entry}"),
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+            let status = format!(
+                "enter run · esc close · !bash · {} • {} · {}",
+                self.provider_id,
+                self.current_model,
+                self.cwd.display()
+            );
+            lines.push(Line::from(Span::styled(
+                status,
+                Style::default().fg(self.theme.dim),
+            )));
+            let max_h = frame.area().height.saturating_sub(3).min(18);
+            let height = (lines.len() as u16 + 2).min(max_h);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" command palette — {} ", self.editor.text()))
+                .title_style(Style::default().fg(self.theme.accent))
+                .border_style(Style::default().fg(self.theme.dim));
+            let rect = overlay_area(frame.area(), 64, height);
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
 
@@ -2273,7 +3503,7 @@ fn wrap_lines(text: &str, width: usize) -> Vec<String> {
 
 fn push_message_item(items: &mut Vec<TranscriptItem>, message: &SessionMessage) {
     match message {
-        SessionMessage::User { content } => items.push(TranscriptItem::User {
+        SessionMessage::User { content, .. } => items.push(TranscriptItem::User {
             content: content.clone(),
         }),
         SessionMessage::Assistant {
@@ -2322,6 +3552,84 @@ fn apply_flow_step_state(
     view.steps[index] = StepView { name, status };
 }
 
+/// Sidebar sections in display order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SidebarSection {
+    Context,
+    Timing,
+    Flow,
+    Todos,
+    Session,
+}
+
+impl SidebarSection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Timing => "timing",
+            Self::Flow => "flow",
+            Self::Todos => "todos",
+            Self::Session => "session",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "timing" => Self::Timing,
+            "flow" => Self::Flow,
+            "todos" => Self::Todos,
+            "session" => Self::Session,
+            _ => Self::Context,
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Context => "◔",
+            Self::Timing => "⏱",
+            Self::Flow => "⚙",
+            Self::Todos => "📋",
+            Self::Session => "ℹ",
+        }
+    }
+
+    fn header_line(self, theme: &Theme, collapsed: bool) -> Line<'static> {
+        let arrow = if collapsed { "▸" } else { "▾" };
+        Line::from(vec![
+            Span::styled(self.icon(), Style::default().fg(theme.accent)),
+            Span::styled(
+                format!(" {arrow} {}", self.name()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }
+}
+
+/// Section list for a sidebar with the given content flags: context always,
+/// timing after the first turn, then flow/todos while they have content.
+fn sidebar_sections_for(has_timing: bool, has_flow: bool, has_todos: bool) -> Vec<SidebarSection> {
+    let mut sections = vec![SidebarSection::Context];
+    if has_timing {
+        sections.push(SidebarSection::Timing);
+    }
+    if has_flow {
+        sections.push(SidebarSection::Flow);
+    }
+    if has_todos {
+        sections.push(SidebarSection::Todos);
+    }
+    sections
+}
+
+/// Toggle a section name in a collapsed list (add or remove, stable).
+fn toggle_name(list: &mut Vec<String>, name: &str) {
+    if let Some(position) = list.iter().position(|existing| existing == name) {
+        list.remove(position);
+    } else {
+        list.push(name.to_string());
+    }
+}
+
 /// (done, total) for the flow sidebar counter: done = succeeded steps.
 fn flow_progress(view: &FlowRunView) -> (usize, usize) {
     let done = view
@@ -2335,6 +3643,82 @@ fn flow_progress(view: &FlowRunView) -> (usize, usize) {
 #[cfg(test)]
 mod sidebar_tests {
     use super::*;
+
+    #[cfg(test)]
+    mod palette_tests {
+        use super::*;
+
+        #[test]
+        fn palette_matches_filters_by_name_and_description() {
+            assert!(palette_matches("/prov", "/provider", "manage providers"));
+            assert!(palette_matches("provider", "/provider", "manage providers"));
+            assert!(palette_matches("undo", "/undo", "undo the last edit"));
+            assert!(!palette_matches("zzz", "/provider", "manage providers"));
+            assert!(palette_matches("", "/anything", "x"));
+        }
+
+        #[test]
+        fn palette_completion_replaces_first_word_and_keeps_args() {
+            assert_eq!(palette_completion("/level", "/lev 3"), "/level 3");
+            assert_eq!(palette_completion("/provider", "/prov"), "/provider");
+            assert_eq!(palette_completion("/level", "/level 3"), "/level 3");
+        }
+
+        #[test]
+        fn builtin_palette_covers_the_main_commands() {
+            let names: Vec<&str> = builtin_palette()
+                .iter()
+                .map(|(n, _)| n.split_whitespace().next().unwrap())
+                .collect();
+            for expected in [
+                "/help",
+                "/provider",
+                "/checkpoint",
+                "/restore",
+                "/level",
+                "/journal",
+                "/undo",
+                "/compact",
+                "/flow",
+                "/flows",
+                "/sidebar",
+            ] {
+                assert!(names.contains(&expected), "palette missing {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_sections_order_and_gating() {
+        assert_eq!(
+            sidebar_sections_for(false, false, false),
+            vec![SidebarSection::Context]
+        );
+        assert_eq!(
+            sidebar_sections_for(true, true, true),
+            vec![
+                SidebarSection::Context,
+                SidebarSection::Timing,
+                SidebarSection::Flow,
+                SidebarSection::Todos,
+            ]
+        );
+        assert_eq!(
+            sidebar_sections_for(false, true, false),
+            vec![SidebarSection::Context, SidebarSection::Flow]
+        );
+    }
+
+    #[test]
+    fn toggle_name_adds_then_removes_stably() {
+        let mut collapsed = vec!["todos".to_string()];
+        toggle_name(&mut collapsed, "context");
+        assert_eq!(collapsed, vec!["todos", "context"]);
+        toggle_name(&mut collapsed, "todos");
+        assert_eq!(collapsed, vec!["context"]);
+        toggle_name(&mut collapsed, "todos");
+        assert_eq!(collapsed, vec!["context", "todos"]);
+    }
 
     #[test]
     fn apply_flow_step_transitions_and_counts() {
@@ -2367,5 +3751,46 @@ mod sidebar_tests {
         assert_eq!(flow_progress(view.as_ref().unwrap()), (2, 3));
         assert_eq!(view.as_ref().unwrap().steps[1].status, "failed");
         assert_eq!(view.as_ref().unwrap().steps[2].name, "ship");
+    }
+}
+
+#[cfg(test)]
+mod provider_wizard_tests {
+    use super::*;
+
+    #[test]
+    fn field_prompt_and_prefill_cover_all_steps() {
+        let draft = ProviderDraft {
+            id: "acme".into(),
+            name: "Acme".into(),
+            base_url: "https://api.acme.example/v1".into(),
+            model: "acme-1".into(),
+            key_env: "ACME_API_KEY".into(),
+            context: "200000".into(),
+        };
+        assert!(field_prompt(&draft, ProviderField::Id).contains("provider id"));
+        assert!(field_prompt(&draft, ProviderField::Context).contains("128000"));
+        assert_eq!(prefill(&draft, ProviderField::Model), "acme-1");
+        assert_eq!(prefill(&draft, ProviderField::KeyEnv), "ACME_API_KEY");
+        assert_eq!(ProviderField::Id.next(), Some(ProviderField::Name));
+        assert_eq!(ProviderField::Context.next(), None);
+    }
+
+    #[test]
+    fn deepseek_builtin_config_shape() {
+        let config = provider_config("deepseek");
+        assert_eq!(config.id, "deepseek");
+        assert_eq!(config.base_url, "https://api.deepseek.com");
+        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.key_env(), "DEEPSEEK_API_KEY");
+        assert_eq!(config.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn id_validation_shared_with_the_wizard() {
+        assert!(agent_m_ai::ProviderConfig::is_valid_id("openai"));
+        assert!(agent_m_ai::ProviderConfig::is_valid_id("my-provider_2"));
+        assert!(!agent_m_ai::ProviderConfig::is_valid_id("Bad ID"));
+        assert!(!agent_m_ai::ProviderConfig::is_valid_id(""));
     }
 }

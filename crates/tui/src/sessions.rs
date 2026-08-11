@@ -103,8 +103,12 @@ fn session_dir(agent_dir: &Path, cwd: &Path) -> PathBuf {
 
 fn message_to_entry(message: &SessionMessage) -> Result<Value> {
     Ok(match message {
-        SessionMessage::User { content } => {
-            json!({ "type": "message", "kind": "user", "content": content })
+        SessionMessage::User { content, images } => {
+            let mut entry = json!({ "type": "message", "kind": "user", "content": content });
+            if !images.is_empty() {
+                entry["images"] = json!(images);
+            }
+            entry
         }
         SessionMessage::Assistant {
             content,
@@ -151,6 +155,10 @@ fn entry_to_message(value: &Value) -> Result<SessionMessage> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            images: serde_json::from_value(
+                value.get("images").cloned().unwrap_or(Value::Array(vec![])),
+            )
+            .unwrap_or_default(),
         },
         "assistant" => SessionMessage::Assistant {
             content: serde_json::from_value(
@@ -317,6 +325,38 @@ pub struct UndoEntry {
     pub before: Option<String>,
 }
 
+/// One git checkpoint entry (check.md-aligned instant rollback).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointEntry {
+    pub sha: String,
+    pub label: String,
+    pub ts: String,
+}
+
+/// Persist the checkpoint ledger (`<agent_dir>/checkpoints/<stem>.json`).
+pub fn save_checkpoints(
+    agent_dir: &Path,
+    session_stem: &str,
+    entries: &[CheckpointEntry],
+) -> Result<()> {
+    let dir = agent_dir.join("checkpoints");
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string(entries)?;
+    std::fs::write(dir.join(format!("{session_stem}.json")), text)?;
+    Ok(())
+}
+
+/// Load the checkpoint ledger (empty when absent or corrupt).
+pub fn load_checkpoints(agent_dir: &Path, session_stem: &str) -> Vec<CheckpointEntry> {
+    let path = agent_dir
+        .join("checkpoints")
+        .join(format!("{session_stem}.json"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<CheckpointEntry>>(&text).ok())
+        .unwrap_or_default()
+}
+
 /// Persist the undo ledger for a session (`<agent_dir>/undo/<stem>.json`).
 pub fn save_undo(agent_dir: &Path, session_stem: &str, entries: &[UndoEntry]) -> Result<()> {
     let dir = agent_dir.join("undo");
@@ -461,6 +501,7 @@ mod tests {
         store
             .append(&SessionMessage::User {
                 content: "hello".to_string(),
+                images: Vec::new(),
             })
             .unwrap();
         let rows = journal(dir.path(), dir.path());
@@ -496,6 +537,7 @@ mod tests {
         vec![
             SessionMessage::User {
                 content: "hi".to_string(),
+                images: Vec::new(),
             },
             SessionMessage::Assistant {
                 content: vec![ContentPart::Text {
@@ -544,4 +586,110 @@ mod tests {
         let loaded = resume(dir.path(), dir.path()).unwrap();
         assert!(loaded.is_empty());
     }
+}
+
+/// Load a user-defined slash-command template from
+/// `<agent_dir>/commands/<name>.md` (no extension in the command name).
+/// Supports `${cwd}` and `${input}` placeholders.
+pub fn load_custom_command(agent_dir: &Path, name: &str) -> Option<String> {
+    let safe: String = name
+        .trim_start_matches('/')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
+    if safe.is_empty() {
+        return None;
+    }
+    let path = agent_dir.join("commands").join(format!("{safe}.md"));
+    std::fs::read_to_string(&path).ok()
+}
+
+/// List the names of all user-defined slash commands.
+pub fn list_custom_commands(agent_dir: &Path) -> Vec<String> {
+    let dir = agent_dir.join("commands");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[cfg(test)]
+mod custom_command_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn loads_and_sanitizes_command_names() {
+        let dir = tempdir().unwrap();
+        let commands = dir.path().join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("review.md"),
+            "Review ${cwd} focusing on ${input}",
+        )
+        .unwrap();
+        std::fs::write(commands.join("ship.md"), "Ship it").unwrap();
+        assert_eq!(
+            load_custom_command(dir.path(), "/review").as_deref(),
+            Some("Review ${cwd} focusing on ${input}")
+        );
+        assert!(
+            load_custom_command(dir.path(), "../evil").is_none(),
+            "path escape blocked"
+        );
+        let names = list_custom_commands(dir.path());
+        assert_eq!(names, vec!["review", "ship"]);
+    }
+}
+
+/// Sidebar sections the user collapsed, from settings.json
+/// (`collapsedSidebarSections`). Unknown/absent → empty (all expanded).
+pub fn load_collapsed_sections(agent_dir: &Path) -> Vec<String> {
+    let path = agent_dir.join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("collapsedSidebarSections")
+        .and_then(|entry| entry.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist the collapsed sidebar sections, preserving every other key in
+/// settings.json (providers, preferences, …).
+pub fn save_collapsed_sections(agent_dir: &Path, sections: &[String]) {
+    let path = agent_dir.join("settings.json");
+    let mut value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert("collapsedSidebarSections".to_string(), json!(sections));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    );
 }

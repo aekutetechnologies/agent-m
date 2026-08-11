@@ -14,10 +14,20 @@ the bottom.
 | `Enter` | submit |
 | `Shift+Enter` / `ctrl+j` | newline |
 | `Tab` | autocomplete (slash commands, file paths) |
+| `/` | open the **command palette** (searchable list of slash commands with descriptions) |
 | `ctrl+a` / `ctrl+e` | line start / end |
 | `ctrl+b` / `ctrl+f` | word left / right |
 | `ctrl+w` / `ctrl+u` / `ctrl+k` | kill word / backward / forward |
 | `ctrl+y` / `ctrl+-` | yank / undo (text input box) |
+
+## Command palette
+
+Start typing `/` in the editor to open the command palette — a full-screen,
+searchable list of every slash command with a one-line description (custom
+`~/.agent-m/commands/*.md` commands included), plus a status footer with the
+active provider, model, and cwd. `↑`/`↓` select, `Enter` runs the selected
+command (arguments you typed are preserved), `Esc` closes it. `/help` opens
+the same list with every command visible.
 
 ## Session control
 
@@ -33,6 +43,7 @@ the bottom.
 |-----|--------|
 | `ctrl+l` | cycle model |
 | `ctrl+p` / `ctrl+shift+p` | cycle model forward / backward |
+| `ctrl+v` | reasoning-effort variant picker (Default/low/high/max, when the model supports it) |
 | `ctrl+o` | expand/collapse the most recent tool output |
 | `ctrl+r` | expand/collapse the most recent thinking trace |
 | `PageUp` / `PageDown` / mouse wheel | scroll the transcript |
@@ -40,6 +51,21 @@ the bottom.
 Tool output and thinking from a finished turn collapse to a one-line
 receipt/summary once you move on to the next prompt (or `!command`) —
 `ctrl+o` / `ctrl+r` re-expand the most recent one.
+
+## Model & variant selection
+
+`/model` (or `ctrl+l`) opens the model picker for the **selected provider**: it
+lists the provider's configured model first, then any extra `models` ids from
+`settings.json`, then well-known suggestions for `openai`/`anthropic`/
+`groq`/`openrouter` when nothing is configured. The active reasoning-effort
+variant shows on the model row (`model · high`).
+
+`ctrl+v` opens the **variant picker** for the current model
+(Default/low/high/max, OpenCode-style). `default` sends no `reasoning_effort`;
+`low`/`high` map to the OpenAI-compatible parameter; `max` maps to `high`
+(the widest tier the wire format has). Models that don't declare variants
+(including all DeepSeek models — their API has no effort parameter) skip the
+picker with a notice. The variant resets when you switch models.
 
 ## Slash commands
 
@@ -51,5 +77,6 @@ receipt/summary once you move on to the next prompt (or `!command`) —
 - `/journal` — the narrated audit timeline (timestamped JSONL entries).
 - `/undo` — restore the most recent `write`/`edit` snapshot.
 - `/level <0-4>` — set the autonomy level live (persisted to `settings.json`).
-- `/sidebar` — toggle the right-side status sidebar.
+- `/sidebar` — toggle the right-side status sidebar (or `/sidebar
+  <context|timing|flow|todos>` to collapse one section).
 - `!command` — runs bash directly, without the model (e.g. `!git status`).

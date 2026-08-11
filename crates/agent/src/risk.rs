@@ -84,8 +84,12 @@ impl RiskPolicy {
                 )),
             };
         }
-        // Read-only tools are always Low.
-        if crate::agent::PLAN_TOOLS.contains(&call.name.as_str()) && call.name != "ask" {
+        // Read-only tools are always Low (the plan-mode set plus the web
+        // tools, which can never mutate anything).
+        if (crate::agent::PLAN_TOOLS.contains(&call.name.as_str())
+            || matches!(call.name.as_str(), "web_fetch" | "web_search"))
+            && call.name != "ask"
+        {
             return RiskAssessment {
                 level: RiskLevel::Low,
                 reason: None,

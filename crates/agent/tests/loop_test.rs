@@ -156,6 +156,7 @@ fn options() -> AgentOptions {
         mode: agent_m_agent::Mode::Build,
         ask_gate: None,
         context_window: None,
+        variant: None,
     }
 }
 
@@ -503,6 +504,7 @@ async fn plan_mode_hides_mutating_tools() {
             mode: agent_m_agent::Mode::Plan,
             ask_gate: None,
             context_window: None,
+            variant: None,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -659,6 +661,7 @@ async fn ask_tool_returns_user_answer_and_continues() {
             mode: agent_m_agent::Mode::Build,
             ask_gate: Some(Arc::new(gate)),
             context_window: None,
+            variant: None,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -704,6 +707,7 @@ async fn compaction_replaces_older_messages_with_summary() {
             mode: agent_m_agent::Mode::Build,
             ask_gate: None,
             context_window: Some(64_000),
+            variant: None,
         },
         Arc::new(AlwaysAllowGate),
     );

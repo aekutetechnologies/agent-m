@@ -46,6 +46,8 @@ pub struct Usage {
 pub enum ContentPart {
     /// Assistant-visible text.
     Text { text: String },
+    /// A user-supplied image as a data URI (`data:image/png;base64,…`).
+    Image { data: String },
     /// Reasoning text (DeepSeek `reasoning_content`, Anthropic thinking blocks).
     Thinking { thinking: String },
     /// A tool invocation the assistant wants executed.
@@ -62,8 +64,12 @@ pub enum ContentPart {
 pub enum LlmMessage {
     /// System prompt. Exactly one, always first.
     System { content: String },
-    /// User turn. Plain text for now (image parts are a later extension).
-    User { content: String },
+    /// User turn: text plus optional image attachments (data URIs).
+    User {
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// Assistant turn: content parts plus the final usage/stop reason.
     Assistant {
         content: Vec<ContentPart>,
@@ -99,6 +105,10 @@ pub struct ChatRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolSpec>,
     pub temperature: Option<f64>,
+    /// Selected reasoning-effort variant (`default`/`low`/`high`/`max`).
+    /// Providers that support `reasoning_effort` map it to the wire field;
+    /// others ignore it.
+    pub variant: Option<String>,
 }
 
 /// The finished assistant message produced by a provider stream.

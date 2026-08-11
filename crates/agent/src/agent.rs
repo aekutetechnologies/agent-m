@@ -5,6 +5,7 @@ use agent_m_ai::{
     AiError, CacheStats, ChatRequest, ContentPart, Provider, StopReason, StreamEvent, ToolSpec,
 };
 use futures_util::StreamExt;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,11 +38,24 @@ impl Mode {
 const PLAN_MODE_BLOCK: &str = "\n\nYou are in PLAN MODE. You may only read, search, and ask questions — you cannot modify files or run state-changing commands. Available tools: `ls` (list a directory — use this instead of reading a directory), `read` (read one file), `grep` (search file contents), `find` (locate files), `ask` (ask the user a question). There is no `bash` tool in plan mode. Explore the codebase, then create a detailed numbered plan under a heading `Plan:`, one item per line (`1. step`). Each step must be a concrete, verifiable action. Do not execute the plan yet.";
 
 /// The tools a plan-mode agent may call (read-only + ask).
-pub(crate) const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "ask", "search"];
+pub(crate) const PLAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "ask",
+    "search",
+    "web_fetch",
+    "web_search",
+];
 
 /// Static trust-metadata instruction appended to every system prompt
 /// (check.md principles 2/3/4/9/10). Static text keeps the prefix byte-stable.
 const TRUST_BLOCK: &str = "\n\nEnd each reply with a <trust> block the harness machine-reads (it is never shown to the user): <confidence>0-100</confidence>, <reason>, <expected_outcome>, <evidence> with <item file=\"…\" line=\"…\">note</item> entries, <uncertainty>, <plan> with <item> steps, and <estimated_time>. Omit any field you cannot answer honestly; do not invent evidence or confidence.";
+
+/// The `delegate` tool: spawn a fresh-context sub-agent (check.md-inspired
+/// subagents — parallel/isolated work with its own context window).
+const DELEGATE_SPEC: &str = r#"{"type":"object","properties":{"prompt":{"type":"string","description":"Self-contained task for the sub-agent"},"tools":{"type":"array","items":{"type":"string"},"description":"Restrict the sub-agent to these tools (default: the parent's set minus delegate)"},"max_turns":{"type":"integer","description":"Sub-agent turn budget (default 4)"}},"required":["prompt"]}"#;
 
 /// Instructions for the compaction summarizer (memory across sessions).
 const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation by a coding agent. Keep it concise but complete: the goal, key decisions, files touched, important tool results, user preferences, and open questions. 300 words or fewer.";
@@ -80,6 +94,9 @@ pub struct AgentOptions {
     pub ask_gate: Option<Arc<dyn crate::tool::AskGate>>,
     /// The model's context window in tokens (used for compaction + display).
     pub context_window: Option<u64>,
+    /// Selected reasoning-effort variant (`default`/`low`/`high`/`max`),
+    /// forwarded to providers that support `reasoning_effort`.
+    pub variant: Option<String>,
 }
 
 /// Events emitted by the agent loop, in pi's ordering:
@@ -213,10 +230,18 @@ impl Agent {
     }
 
     fn tool_specs_for(options: &AgentOptions) -> Vec<ToolSpec> {
-        Self::active_tools(options)
+        let mut specs: Vec<ToolSpec> = Self::active_tools(options)
             .iter()
             .map(|tool| crate::tool::tool_spec(tool.as_ref()))
-            .collect()
+            .collect();
+        if options.mode == Mode::Build {
+            specs.push(ToolSpec {
+                name: "delegate".to_string(),
+                description: "Delegate a self-contained task to a fresh sub-agent with its own context window and tool budget. Returns the sub-agent's final answer. Use for isolated research, review, or implementation subtasks you should not block on.".to_string(),
+                parameters: serde_json::from_str(DELEGATE_SPEC).unwrap_or_default(),
+            });
+        }
+        specs
     }
 
     /// The system prompt for the current mode (byte-stable within a mode).
@@ -266,6 +291,14 @@ impl Agent {
         self.options.model = model.into();
     }
 
+    pub fn set_variant(&mut self, variant: Option<String>) {
+        self.options.variant = variant;
+    }
+
+    pub fn variant(&self) -> Option<&str> {
+        self.options.variant.as_deref()
+    }
+
     pub fn model(&self) -> &str {
         &self.options.model
     }
@@ -309,6 +342,7 @@ impl Agent {
             older.iter().map(SessionMessage::to_llm_message).collect();
         summary_messages.push(agent_m_ai::LlmMessage::User {
             content: SUMMARY_PROMPT.to_string(),
+            images: Vec::new(),
         });
         let request = ChatRequest {
             model: self.options.model.clone(),
@@ -316,6 +350,7 @@ impl Agent {
             messages: summary_messages,
             tools: vec![],
             temperature: None,
+            variant: self.options.variant.clone(),
         };
         let stream = match self.provider.stream_chat(request).await {
             Ok(stream) => stream,
@@ -365,19 +400,65 @@ impl Agent {
 
     /// Run one user prompt through the loop: stream the assistant reply,
     /// execute any tool calls, and repeat until the model stops calling tools.
-    pub async fn prompt(&mut self, text: String) -> Result<(), AgentError> {
+    ///
+    /// Boxed future: `run_tool` → `run_delegate` → `prompt` recurses (the
+    /// delegate spawns a sub-agent), so the future must be opaque.
+    pub fn prompt(
+        &mut self,
+        text: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + '_>>
+    {
+        Box::pin(async move { self.prompt_inner(text).await })
+    }
+
+    /// Like `prompt`, with image attachments (data URIs) for vision models.
+    pub fn prompt_with_images(
+        &mut self,
+        text: String,
+        images: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.interrupted.store(false, Ordering::SeqCst);
+            self.emit(&AgentEvent::AgentStart);
+            let user_message = SessionMessage::User {
+                content: text,
+                images,
+            };
+            self.emit(&AgentEvent::MessageStart {
+                kind: crate::message::SessionMessageKind::User,
+            });
+            self.messages.push(user_message.clone());
+            self.emit(&AgentEvent::MessageEnd {
+                message: user_message.clone(),
+            });
+            self.run_turns().await
+        })
+    }
+
+    async fn prompt_inner(&mut self, text: String) -> Result<(), AgentError> {
         self.interrupted.store(false, Ordering::SeqCst);
         self.emit(&AgentEvent::AgentStart);
 
-        let user_message = SessionMessage::User { content: text };
+        let user_message = SessionMessage::User {
+            content: text,
+            images: Vec::new(),
+        };
         self.emit(&AgentEvent::MessageStart {
             kind: crate::message::SessionMessageKind::User,
         });
         self.messages.push(user_message.clone());
         self.emit(&AgentEvent::MessageEnd {
-            message: user_message,
+            message: user_message.clone(),
         });
 
+        self.run_turns().await
+    }
+
+    /// Drive the turn loop: stream replies, execute tool calls, repeat until
+    /// the model stops or the turn budget is exhausted. The user message was
+    /// already pushed to `self.messages`.
+    async fn run_turns(&mut self) -> Result<(), AgentError> {
         let mut turn = 0;
         loop {
             if turn >= self.options.max_turns {
@@ -402,6 +483,7 @@ impl Agent {
                     .collect(),
                 tools: self.tool_specs.clone(),
                 temperature: None,
+                variant: self.options.variant.clone(),
             };
 
             let mut stream = match self.provider.stream_chat(request).await {
@@ -616,12 +698,92 @@ impl Agent {
         Ok(())
     }
 
+    /// Spawn a fresh sub-agent for a delegated task: same provider and gate,
+    /// a fresh context window, an optional tool subset, and a turn budget.
+    /// Returns the sub-agent's final answer as the tool outcome.
+    async fn run_delegate(&self, arguments: &Value) -> ToolOutcome {
+        let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
+            return ToolOutcome::error("delegate: missing `prompt` argument");
+        };
+        let max_turns = arguments
+            .get("max_turns")
+            .and_then(Value::as_u64)
+            .unwrap_or(4)
+            .clamp(1, 16) as usize;
+        // Tool subset: `tools` restricts; otherwise the parent's set minus
+        // delegate (no recursion).
+        let tools: Vec<Arc<dyn Tool>> = match arguments.get("tools").and_then(Value::as_array) {
+            Some(names) => self
+                .options
+                .tools
+                .iter()
+                .filter(|tool| {
+                    tool.name() != "delegate"
+                        && names.iter().any(|name| name.as_str() == Some(tool.name()))
+                })
+                .cloned()
+                .collect(),
+            None => self
+                .options
+                .tools
+                .iter()
+                .filter(|tool| tool.name() != "delegate")
+                .cloned()
+                .collect(),
+        };
+        let sub_options = AgentOptions {
+            tools,
+            max_turns,
+            ..self.options.clone()
+        };
+        // Run the sub-agent on its own task: a fresh future root, so the
+        // async recursion (prompt → run_tool → delegate → prompt) never
+        // nests in the parent's stack.
+        let provider = self.provider.clone();
+        let gate = self.gate.clone();
+        let sub_prompt = prompt.to_string();
+        let sub = tokio::task::spawn(async move {
+            let mut sub = Agent::new(provider, sub_options, gate);
+            let _ = sub.prompt(sub_prompt).await;
+            sub
+        })
+        .await;
+        let sub = match sub {
+            Ok(sub) => sub,
+            Err(_) => return ToolOutcome::error("delegate: sub-agent task failed"),
+        };
+
+        // The sub-agent's final answer = its last assistant text.
+        let mut answer = String::new();
+        for message in sub.messages() {
+            if let SessionMessage::Assistant { content, .. } = message {
+                for part in content {
+                    if let ContentPart::Text { text } = part {
+                        answer.push_str(text);
+                        answer.push('\n');
+                    }
+                }
+            }
+        }
+        let answer = answer.trim().to_string();
+        if answer.is_empty() {
+            return ToolOutcome::error("delegate: sub-agent produced no answer");
+        }
+        ToolOutcome {
+            content: answer,
+            is_error: false,
+        }
+    }
+
     async fn run_tool(&self, call: &ToolCallInfo) -> ToolOutcome {
         match self.gate.authorize(call).await {
             Permission::Denied(reason) => ToolOutcome::error(format!(
                 "Permission denied for tool `{}`: {reason}",
                 call.name
             )),
+            Permission::Allowed if call.name == "delegate" => {
+                self.run_delegate(&call.arguments).await
+            }
             Permission::Allowed => {
                 let gated = self.options.mode == Mode::Plan
                     && !PLAN_TOOLS.contains(&call.name.as_str())

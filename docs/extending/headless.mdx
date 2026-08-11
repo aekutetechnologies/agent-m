@@ -1,0 +1,48 @@
+---
+title: Headless mode
+---
+
+# Headless mode
+
+agent-m can run without a TUI for embedding, scripting, and other agents:
+event streaming over stdout, or a framed JSON-RPC loop over stdio.
+
+## `--stream-json`
+
+Print mode with machine-readable events. Each `AgentEvent` becomes one JSON
+line following pi's event ordering:
+
+```
+{"event":"agent_start","data":{}}
+{"event":"message_start","data":{"kind":"User"}}
+{"event":"message_end","data":{...}}
+{"event":"turn_start","data":{"turn":1}}
+{"event":"message_update","data":{"delta":"…"}}
+{"event":"tool_execution_start","data":{"name":"read","arguments":{...}}}
+{"event":"tool_execution_end","data":{"is_error":false,"content":"…"}}
+{"event":"agent_end","data":{}}
+```
+
+```sh
+agent-m --stream-json -p "List the files" | jq -c 'select(.event=="message_update")'
+```
+
+## `--serve` (stdio JSON-RPC)
+
+A minimal JSON-RPC server on stdin/stdout using LSP-style
+`Content-Length` framing. Methods:
+
+| Method | Params | Effect |
+|--------|--------|--------|
+| `prompt` | `{"text": "…"}` | Run a prompt; every event is streamed as a `event` notification |
+| `exit` | — | Close the loop |
+
+Events arrive as notifications before the matching response:
+
+```json
+{"jsonrpc":"2.0","method":"event","params":{"event":"message_update","data":{"delta":"…"}}}
+{"jsonrpc":"2.0","id":1,"result":{"ok":true,"error":null}}
+```
+
+The request/response ids let you correlate the `event` stream with the
+`prompt` that produced it.

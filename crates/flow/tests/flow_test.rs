@@ -172,6 +172,7 @@ fn options() -> AgentOptions {
         mode: Mode::Build,
         ask_gate: None,
         context_window: None,
+        variant: None,
     }
 }
 

@@ -7,6 +7,8 @@ use agent_m_ai::{ContentPart, LlmMessage, StopReason, Usage};
 pub enum SessionMessage {
     User {
         content: String,
+        /// Image attachments as data URIs (vision models).
+        images: Vec<String>,
     },
     Assistant {
         content: Vec<ContentPart>,
@@ -23,9 +25,7 @@ pub enum SessionMessage {
         is_error: bool,
     },
     /// A compacted-history summary (memory across turns/sessions).
-    Summary {
-        text: String,
-    },
+    Summary { text: String },
 }
 
 /// Discriminator used by the UI and tests.
@@ -51,8 +51,9 @@ impl SessionMessage {
     /// separately by the agent loop.
     pub fn to_llm_message(&self) -> LlmMessage {
         match self {
-            SessionMessage::User { content } => LlmMessage::User {
+            SessionMessage::User { content, images } => LlmMessage::User {
                 content: content.clone(),
+                images: images.clone(),
             },
             SessionMessage::Assistant {
                 content,
@@ -78,6 +79,7 @@ impl SessionMessage {
             // conversation history, not instructions.
             SessionMessage::Summary { text } => LlmMessage::User {
                 content: format!("[Session summary]\n{text}"),
+                images: Vec::new(),
             },
         }
     }

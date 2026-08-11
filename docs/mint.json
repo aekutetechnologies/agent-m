@@ -50,7 +50,10 @@
       "group": "Extending",
       "pages": [
         "flows/overview",
-        "plugins/overview"
+        "plugins/overview",
+        "extending/mcp",
+        "extending/headless",
+        "extending/providers"
       ]
     },
     {

@@ -10,7 +10,13 @@ pub struct InstructionFile {
     pub content: String,
 }
 
-/// Discover AGENTS.md instructions for `cwd`: walk from `cwd` up to the
+/// Instruction filenames honored per directory, in precedence order
+/// (agent-m's AGENTS.md first, then other agents' conventions). Loading them
+/// all keeps agent-m useful in repos written for Claude Code / Cursor / Gemini
+/// CLI without fork-specific config.
+pub const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".cursorrules", "GEMINI.md"];
+
+/// Discover instructions for `cwd`: walk from `cwd` up to the
 /// filesystem root (nearest file first so closer instructions override), then
 /// the global `~/.agent-m/agent/AGENTS.md`. Missing files are skipped.
 pub fn discover_instructions(cwd: &Path) -> Vec<InstructionFile> {
@@ -22,14 +28,16 @@ pub fn discover_instructions(cwd: &Path) -> Vec<InstructionFile> {
     let home = PathBuf::from(home);
     let mut current = Some(cwd.to_path_buf());
     while let Some(dir) = current {
-        let candidate = dir.join("AGENTS.md");
-        if candidate.is_file()
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-        {
-            files.push(InstructionFile {
-                path: candidate,
-                content,
-            });
+        for name in INSTRUCTION_FILES {
+            let candidate = dir.join(name);
+            if candidate.is_file()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+            {
+                files.push(InstructionFile {
+                    path: candidate,
+                    content,
+                });
+            }
         }
         if dir == home || dir.parent().is_none() {
             break;
@@ -81,6 +89,29 @@ fn escape_xml(text: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn discovers_cross_tool_rules_files_in_order() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# agent-m rules").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# claude rules").unwrap();
+        std::fs::write(dir.path().join(".cursorrules"), "# cursor rules").unwrap();
+        let files = discover_instructions(dir.path());
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["AGENTS.md", "CLAUDE.md", ".cursorrules"],
+            "precedence order in the same directory: {names:?}"
+        );
+        // The rendered block is deterministic (byte-stable prefix input).
+        let rendered = render_instructions(&files);
+        assert!(rendered.contains("claude rules"));
+        assert!(rendered.contains("cursor rules"));
+        assert_eq!(render_instructions(&files), rendered);
+    }
 
     #[test]
     fn discovers_ancestors_nearest_first() {

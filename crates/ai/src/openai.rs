@@ -13,6 +13,32 @@ use std::collections::{HashMap, VecDeque};
 use crate::models::ModelSpec;
 use crate::provider::{AiError, Provider};
 use crate::types::{AssistantMessage, ChatRequest, ContentPart, StopReason, StreamEvent, Usage};
+use serde_json::{Value, json};
+
+/// Map a selected variant to the OpenAI-compatible `reasoning_effort` value
+/// and inject it into the request body when the model supports it.
+/// `default`/`None` omits the field; `max` maps to `high` (the widest tier
+/// the OpenAI wire format has). Byte-stable: inserting into the sorted-key
+/// map keeps the JSON deterministic.
+fn apply_effort(body: &mut Value, supports_effort: bool, variant: Option<&str>) {
+    if !supports_effort {
+        return;
+    }
+    let effort = match variant.unwrap_or("default") {
+        "low" => Some("low"),
+        "high" => Some("high"),
+        "max" => Some("high"),
+        _ => None, // default (or unknown) → omit
+    };
+    match effort {
+        Some(effort) => body["reasoning_effort"] = json!(effort),
+        None => {
+            if let Some(map) = body.as_object_mut() {
+                map.remove("reasoning_effort");
+            }
+        }
+    };
+}
 use crate::wire::build_chat_request_body;
 
 /// A provider speaking the OpenAI chat-completions protocol.
@@ -61,16 +87,35 @@ impl OpenAiCompatibleProvider {
             vec![
                 ModelSpec::new("deepseek-chat")
                     .name("DeepSeek Chat")
-                    .context_window(64_000)
+                    // Current platform (api-docs.deepseek.com, V4 era):
+                    // 1M context / 384K max output. The window is a planning
+                    // budget for the context gauge + compaction threshold,
+                    // not a hard cap.
+                    .context_window(1_000_000)
                     // Official DeepSeek pricing, USD per 1M tokens:
                     // miss $0.27, cache-hit $0.07, output $1.10.
                     .pricing(0.27, 0.07, 1.10),
                 ModelSpec::new("deepseek-reasoner")
                     .name("DeepSeek Reasoner")
                     .reasoning(true)
-                    .context_window(64_000)
+                    // Same 1M context as deepseek-chat (V4 era docs).
+                    .context_window(1_000_000)
                     // miss $0.55, cache-hit $0.14, output $2.19.
                     .pricing(0.55, 0.14, 2.19),
+                // Current platform models (api-docs.deepseek.com, V4 era):
+                // thinking mode on by default, 1M context / 384K max output.
+                // Pricing is an estimate converted from the CNY list
+                // (v4-flash ¥1/0.02/2, v4-pro ¥3/0.025/6 per 1M tokens).
+                ModelSpec::new("deepseek-v4-flash")
+                    .name("DeepSeek V4 Flash")
+                    .reasoning(true)
+                    .context_window(1_000_000)
+                    .pricing(0.14, 0.003, 0.28),
+                ModelSpec::new("deepseek-v4-pro")
+                    .name("DeepSeek V4 Pro")
+                    .reasoning(true)
+                    .context_window(1_000_000)
+                    .pricing(0.42, 0.004, 0.84),
             ],
         )
     }
@@ -109,9 +154,37 @@ impl Provider for OpenAiCompatibleProvider {
                 provider: self.id.clone(),
                 env_var: format!("{}_API_KEY", self.id.to_uppercase()),
             })?;
+        // Vision capability gate: image attachments require a model whose
+        // spec advertises supports_images.
+        let supports_images = self
+            .models
+            .iter()
+            .find(|spec| spec.id == request.model)
+            .map(|spec| spec.supports_images)
+            .unwrap_or(false);
+        if !supports_images
+            && request.messages.iter().any(|message| match message {
+                crate::types::LlmMessage::User { images, .. } => !images.is_empty(),
+                _ => false,
+            })
+        {
+            return Err(AiError::Api(format!(
+                "model `{}` does not support image input; use a vision-capable model",
+                request.model
+            )));
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = build_chat_request_body(&request);
+        let mut body = build_chat_request_body(&request);
+        // Reasoning-effort variant (OpenCode-style Default/low/high/max) →
+        // OpenAI-compatible `reasoning_effort`, only for models that declare
+        // support. `default`/None omits the field; `max` maps to `high`
+        // (no wider effort tier exists on the OpenAI wire format).
+        let supports_effort = self
+            .models
+            .iter()
+            .any(|spec| spec.id == request.model && spec.supports_effort);
+        apply_effort(&mut body, supports_effort, request.variant.as_deref());
 
         let response = self
             .http
@@ -466,5 +539,39 @@ fn stop_reason_from_wire(reason: &str, has_tool_calls: bool) -> StopReason {
                 StopReason::Stop
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn effort_maps_variants_to_reasoning_effort() {
+        let mut body = serde_json::json!({ "model": "gpt-5" });
+        apply_effort(&mut body, true, Some("low"));
+        assert_eq!(body["reasoning_effort"], "low");
+        apply_effort(&mut body, true, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+        // max has no wider tier on the OpenAI wire format → high.
+        apply_effort(&mut body, true, Some("max"));
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn effort_default_and_unsupported_omit_the_field() {
+        let mut body = serde_json::json!({ "model": "gpt-5" });
+        apply_effort(&mut body, true, None);
+        assert!(body.get("reasoning_effort").is_none());
+        apply_effort(&mut body, true, Some("default"));
+        assert!(body.get("reasoning_effort").is_none());
+        // A previously-set field is removed when the variant becomes default.
+        apply_effort(&mut body, true, Some("high"));
+        apply_effort(&mut body, true, Some("default"));
+        assert!(body.get("reasoning_effort").is_none());
+        // Providers without effort support never get the field.
+        let mut body = serde_json::json!({ "model": "deepseek-reasoner" });
+        apply_effort(&mut body, false, Some("high"));
+        assert!(body.get("reasoning_effort").is_none());
     }
 }

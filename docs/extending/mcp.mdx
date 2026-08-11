@@ -1,0 +1,60 @@
+---
+title: MCP servers
+---
+
+# MCP servers (Model Context Protocol)
+
+agent-m is an **MCP client**: any Model Context Protocol server — local
+(stdin/stdout) or remote (Streamable HTTP) — can contribute tools to the
+agent.
+
+## Configure
+
+Servers live under `mcpServers` in `~/.agent-m/agent/mcp.json` (or
+`settings.json`, which `mcp.json` overrides). The shape matches the
+cross-tool convention:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+    },
+    "remote": {
+      "url": "https://mcp.example.com/mcp"
+    }
+  }
+}
+```
+
+Each entry needs either `command` (+ `args`, optional `env`) for a spawned
+stdio server, or a `url` for a Streamable HTTP server.
+
+## How tools are exposed
+
+At startup agent-m connects to every configured server, runs the JSON-RPC
+`initialize` + `tools/list` handshake, and registers each tool as
+`<server>__<tool>` (so two servers can share tool names). A banner line
+reports the connection:
+
+```
+mcp: connected `filesystem` (2 tool(s))
+```
+
+The `--tools` / `--exclude-tools` filters apply to MCP tools like any other.
+
+## Safety
+
+MCP tools are **opaque** by default: `RiskPolicy` classifies them
+**Critical**, so every call requires your approval — even under `--yes` and
+at autonomy level 4. Tool *output* is trusted as the server reports it; only
+run servers you control.
+
+## Transports
+
+- **stdio** — LSP-style `Content-Length` framing over the child's stdin/stdout.
+- **Streamable HTTP** — JSON-RPC POSTs; SSE responses are consumed until the
+  response object arrives.
+
+Requests time out after 30 s (HTTP: 15 s transport-level).

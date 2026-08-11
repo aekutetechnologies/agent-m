@@ -60,8 +60,23 @@ fn wire_message(message: &LlmMessage) -> Value {
         LlmMessage::System { content } => {
             json!({ "role": "system", "content": content })
         }
-        LlmMessage::User { content } => {
-            json!({ "role": "user", "content": content })
+        LlmMessage::User { content, images } => {
+            if images.is_empty() {
+                json!({ "role": "user", "content": content })
+            } else {
+                // OpenAI-compatible vision: content is an array of parts.
+                let mut parts: Vec<Value> = vec![json!({
+                    "type": "text",
+                    "text": content,
+                })];
+                for data in images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": data },
+                    }));
+                }
+                json!({ "role": "user", "content": parts })
+            }
         }
         LlmMessage::Assistant { content, .. } => {
             let mut text = String::new();
@@ -71,6 +86,9 @@ fn wire_message(message: &LlmMessage) -> Value {
                     ContentPart::Text { text: t } => text.push_str(t),
                     // Reasoning is not sent back to OpenAI-compatible providers.
                     ContentPart::Thinking { .. } => {}
+                    // Images are user-side attachments; never resent from the
+                    // assistant side.
+                    ContentPart::Image { .. } => {}
                     ContentPart::ToolCall {
                         id,
                         name,
@@ -119,6 +137,7 @@ mod tests {
             },
             LlmMessage::User {
                 content: "Read the file".to_string(),
+                images: Vec::new(),
             },
             LlmMessage::Assistant {
                 content: vec![
@@ -163,6 +182,7 @@ mod tests {
         let first = [
             base.clone(),
             vec![LlmMessage::User {
+                images: Vec::new(),
                 content: "First follow-up".to_string(),
             }],
         ]
@@ -171,9 +191,11 @@ mod tests {
             base.clone(),
             vec![
                 LlmMessage::User {
+                    images: Vec::new(),
                     content: "First follow-up".to_string(),
                 },
                 LlmMessage::User {
+                    images: Vec::new(),
                     content: "Second follow-up".to_string(),
                 },
             ],
@@ -186,6 +208,7 @@ mod tests {
             messages: first.clone(),
             tools: vec![],
             temperature: None,
+            variant: None,
         }))
         .unwrap();
         let body_second = serde_json::to_vec(&build_chat_request_body(&ChatRequest {
@@ -194,6 +217,7 @@ mod tests {
             messages: second.clone(),
             tools: vec![],
             temperature: None,
+            variant: None,
         }))
         .unwrap();
 
@@ -225,10 +249,12 @@ mod tests {
             model: "deepseek-chat".to_string(),
             system: "You are a coding agent.".to_string(),
             messages: vec![LlmMessage::User {
+                images: Vec::new(),
                 content: "hi".to_string(),
             }],
             tools: vec![],
             temperature: None,
+            variant: None,
         });
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "You are a coding agent.");
@@ -238,10 +264,12 @@ mod tests {
             model: "deepseek-chat".to_string(),
             system: String::new(),
             messages: vec![LlmMessage::User {
+                images: Vec::new(),
                 content: "hi".to_string(),
             }],
             tools: vec![],
             temperature: None,
+            variant: None,
         });
         assert_eq!(no_system["messages"][0]["role"], "user");
     }

@@ -15,6 +15,7 @@ mod paths;
 mod read;
 mod search;
 mod truncate;
+mod web;
 mod write;
 
 pub use ask::AskTool;
@@ -28,6 +29,7 @@ pub use paths::{resolve_path, set_allowed_paths};
 pub use read::ReadTool;
 pub use search::SearchTool;
 pub use truncate::{MAX_BYTES, MAX_LINES};
+pub use web::{WebFetchTool, WebSearchTool};
 pub use write::WriteTool;
 
 use agent_m_agent::Tool;
@@ -45,6 +47,8 @@ pub fn all_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(LsTool),
         Arc::new(AskTool),
         Arc::new(SearchTool),
+        Arc::new(WebFetchTool),
+        Arc::new(WebSearchTool),
     ]
 }
 
@@ -63,5 +67,7 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(WriteTool),
         Arc::new(AskTool),
         Arc::new(SearchTool),
+        Arc::new(WebFetchTool),
+        Arc::new(WebSearchTool),
     ]
 }

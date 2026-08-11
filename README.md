@@ -12,6 +12,54 @@ stack warp's terminal agent CLI uses (ratatui + crossterm).
 — quickstart, CLI reference, trust principles, flows, plugins, and
 architecture (`mint.json` + `.mdx` pages, validated by `scripts/docs-check.sh`).
 
+## Market-standard features
+
+Beyond the pi-style core, agent-m ships the tooling conventions the market
+expects from a coding agent:
+
+| Feature | How |
+|---------|-----|
+| MCP client | `mcpServers` in `~/.agent-m/agent/mcp.json` (stdio + Streamable HTTP); tools appear as `server__tool`, gated Critical-by-default |
+| Web tools | `web_fetch` (read-only, 10 MB / 10 s caps) + `web_search` (SearXNG-style endpoint via `AGENT_M_SEARCH_URL`) |
+| Subagents | `delegate` tool — fresh-context sub-agent with its own tool/turn budget |
+| Git checkpoints | auto-snapshot before mutating tools + `/checkpoint` + `/restore <index|sha>` (stash-create snapshots, no branch pollution) |
+| Image input | `@image.png` → base64 image parts; provider `supports_images` gate with a clear error on text-only models |
+| Headless | `--stream-json` event lines + `--serve` stdio JSON-RPC (prompt/exit + `event` notifications) |
+| Cross-tool rules | `AGENTS.md` + `CLAUDE.md` + `.cursorrules` + `GEMINI.md` loaded with fixed precedence |
+| Custom slash commands | `~/.agent-m/commands/*.md` prompt templates with `${cwd}` / `${input}` |
+
+## Providers (OpenAI-compatible)
+
+agent-m is model-agnostic over **OpenAI-compatible** endpoints — any service
+with a `/chat/completions` API (OpenAI, DeepSeek, Groq, OpenRouter, Ollama,
+LM Studio, Together, …). The built-in `deepseek` is the zero-config default.
+
+**Config file** — add a `providers` array to `~/.agent-m/agent/settings.json`:
+
+```json
+{ "providers": [
+  { "id": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini", "apiKeyEnv": "OPENAI_API_KEY" },
+  { "id": "local", "name": "Ollama", "baseUrl": "http://localhost:11434/v1",
+    "model": "llama3.2", "contextWindow": 131072 }
+]}
+```
+
+Fields: `id` (`[a-z0-9-_]`, used by `--provider` and the env var `<ID>_API_KEY`),
+`name?`, `baseUrl` (no trailing `/chat/completions`), `model`, `reasoning?`,
+`supportsImages?`, `contextWindow?` (default 128000), `pricing?`
+(`inMiss`/`inHit`/`out`, USD per 1M tokens), `apiKeyEnv?` (default `<ID>_API_KEY`).
+Keys are never stored in the config — they resolve through
+env → `auth.json` → `settings.json` via the named env var.
+
+**TUI wizard** — `/provider` opens an interactive setup: 1 add · 2 edit ·
+3 remove · 4 switch. Each add/switch writes the config and live-switches the
+running agent. `/provider <id>` switches directly.
+
+**CLI** — `--provider <id>` selects a configured provider (or `deepseek`),
+`--api-key` overrides the key, `--list-models` shows every configured
+provider's model plus the built-in DeepSeek pair.
+
 ## Features
 
 - Interactive TUI: streaming markdown replies, tool-execution blocks with
@@ -125,15 +173,24 @@ The denylist arms race cannot be won. The real boundaries are: no tool registere
   in the editor and press Enter (Escape cancels). In print mode `ask` fails
   with a clear message.
 
-## Right-side status sidebar
+## Right-side status sidebar (accordion)
 
-While a flow runs, the right side of the TUI shows a live stage diagram: the
-flow name with a `done/total` counter, a progress bar, and one row per step —
-`✓` done (green), `▶` running (highlighted), `○` pending, `✗` failed — updated
-as each step executes. When no flow is active it shows the plan's task list
-(`[x]`/`[ ]` + `n/m`, the tasks done/pending view) if a plan exists, otherwise
-session stats (model, tokens, cache read, context %). `/sidebar` toggles the
-panel; it auto-hides below 110 terminal columns.
+The right side of the TUI is an accordion of collapsible sections — click a
+section header (or run `/sidebar <section>`) to collapse/expand it; the
+collapsed state persists in `settings.json` (`collapsedSidebarSections`):
+
+- **Context** — model, tokens in/out, cache read %, cost, context % of the
+  model's window.
+- **Timing** — the most recent turn's elapsed time and the average over the
+  last 10 turns.
+- **Flow** — while a flow runs: the name with a `done/total` counter, a
+  progress bar, and one row per step — `✓` done (green), `▶` running
+  (highlighted), `○` pending, `✗` failed.
+- **Plan** — the task list from `/plan` or a flow's plan step (`[x]`/`[ ]`
+  with an `n/m` counter).
+
+`/sidebar` (no argument) toggles the whole panel; it auto-hides below 110
+terminal columns.
 
 ## Flows (Devin-style pipelines)
 

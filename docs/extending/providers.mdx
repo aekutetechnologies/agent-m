@@ -1,0 +1,74 @@
+---
+title: Providers
+---
+
+# Providers (OpenAI-compatible)
+
+agent-m is model-agnostic over **OpenAI-compatible** endpoints — any service
+with a `/chat/completions` API: OpenAI, DeepSeek, Groq, OpenRouter, Ollama,
+LM Studio, Together, and more. The built-in `deepseek` remains the zero-config
+default.
+
+## Configure via settings.json
+
+Add a `providers` array to `~/.agent-m/agent/settings.json`:
+
+```json
+{ "providers": [
+  { "id": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini", "apiKeyEnv": "OPENAI_API_KEY" },
+  { "id": "local", "name": "Ollama", "baseUrl": "http://localhost:11434/v1",
+    "model": "llama3.2", "contextWindow": 131072 }
+]}
+```
+
+| Field | Meaning | Default |
+|-------|---------|---------|
+| `id` | `[a-z0-9-_]`; used by `--provider` and the key env `<ID>_API_KEY` | — |
+| `name` | display name in the TUI list | `id` |
+| `baseUrl` | no trailing `/chat/completions` | — |
+| `model` | model id sent on the wire | — |
+| `reasoning` | thinking deltas | `false` |
+| `supportsImages` | vision parts | `false` |
+| `contextWindow` | planning budget (gauge + compaction) | `128000` |
+| `pricing` | `inMiss` / `inHit` / `out`, USD per 1M | `0` |
+| `apiKeyEnv` | env var (or auth.json key) holding the key | `<ID>_API_KEY` |
+| `models` | extra model ids offered in `/model` alongside `model` | well-known suggestions for `openai`/`anthropic`/`groq`/`openrouter` |
+
+Reasoning models (`reasoning: true`) on OpenAI-compatible endpoints get a
+`ctrl+v` reasoning-effort picker (`Default`/`low`/`high`/`max`), mapped to
+the `reasoning_effort` parameter; `max` maps to `high`. DeepSeek models
+don't (their API has no effort parameter). When `--provider <id>` is given
+without `--model`, the provider's `model` is used — not a hardcoded
+fallback.
+
+Keys are **never stored in the config** — the `apiKeyEnv` names where they
+live, resolved through env → `auth.json` → `settings.json`.
+
+## TUI wizard: `/provider`
+
+`/provider` opens an interactive setup:
+
+```
+providers — 1 add · 2 edit · 3 remove · 4 switch (esc cancels)
+```
+
+- **1 add** — guided prompts: id, display name, base URL, model, key env var,
+  context window. Saves to `settings.json` and live-switches the running agent.
+- **2 edit** — pick a provider by number, update any field (pre-filled).
+- **3 remove** — confirm, removes the entry.
+- **4 switch** — pick a provider (or `0` for the built-in deepseek) and switch
+  without restarting.
+- `/provider <id>` switches directly.
+
+The status bar shows the wizard prompt and the ⚡ marks the active provider.
+
+## CLI
+
+- `--provider <id>` — select a configured provider (or `deepseek`)
+- `--api-key <key>` — override the resolved key
+- `--list-models` — every configured provider's model, plus the built-in
+  DeepSeek pair
+
+Unknown provider ids fail with the list of configured ids rather than a
+generic error.

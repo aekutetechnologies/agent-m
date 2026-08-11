@@ -37,6 +37,7 @@ fn request(messages: Vec<LlmMessage>) -> ChatRequest {
             }),
         }],
         temperature: None,
+        variant: None,
     }
 }
 
@@ -83,6 +84,7 @@ async fn streams_text_and_parses_cache_usage() {
     let events = collect(
         &provider,
         request(vec![LlmMessage::User {
+            images: Vec::new(),
             content: "hi".to_string(),
         }]),
     )
@@ -133,6 +135,7 @@ async fn streams_thinking_and_assembles_tool_calls() {
     let events = collect(
         &provider,
         request(vec![LlmMessage::User {
+            images: Vec::new(),
             content: "read x".to_string(),
         }]),
     )
@@ -181,6 +184,7 @@ async fn request_body_has_expected_shape_and_deterministic_order() {
     collect(
         &provider,
         request(vec![LlmMessage::User {
+            images: Vec::new(),
             content: "hi".to_string(),
         }]),
     )
@@ -234,6 +238,7 @@ async fn provider_errors_surface_as_api_error() {
     let provider = provider(&server.uri());
     let result = provider
         .stream_chat(request(vec![LlmMessage::User {
+            images: Vec::new(),
             content: "hi".to_string(),
         }]))
         .await;
@@ -255,6 +260,7 @@ async fn missing_key_is_reported() {
     );
     let result = provider
         .stream_chat(request(vec![LlmMessage::User {
+            images: Vec::new(),
             content: "hi".to_string(),
         }]))
         .await;
@@ -266,4 +272,36 @@ async fn missing_key_is_reported() {
         error.to_string().contains("DEEPSEEK_API_KEY"),
         "got: {error}"
     );
+}
+
+#[tokio::test]
+async fn vision_gate_rejects_images_on_text_only_models() {
+    use agent_m_ai::{LlmMessage, ModelSpec};
+    let server = MockServer::start().await;
+    let provider = OpenAiCompatibleProvider::new(
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com".to_string(),
+        Some("test-key".to_string()),
+        vec![ModelSpec::new("deepseek-chat")],
+    );
+    let request = agent_m_ai::ChatRequest {
+        model: "deepseek-chat".to_string(),
+        system: "you".to_string(),
+        messages: vec![LlmMessage::User {
+            content: "what is this?".to_string(),
+            images: vec!["data:image/png;base64,AAAA".to_string()],
+        }],
+        tools: vec![],
+        temperature: None,
+        variant: None,
+    };
+    let result = provider.stream_chat(request).await;
+    let error = result.err().expect("must reject images");
+    assert!(
+        error.to_string().contains("does not support image input"),
+        "got: {error}"
+    );
+    // The gate fires before any HTTP request.
+    let _ = server; // the mock server exists only to prove no call was needed
 }

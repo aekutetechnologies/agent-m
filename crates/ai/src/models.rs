@@ -15,6 +15,17 @@ pub struct ModelSpec {
     /// Whether the model emits reasoning (thinking) deltas.
     #[serde(default)]
     pub reasoning: bool,
+    /// Whether the model accepts image attachments (vision).
+    #[serde(default)]
+    pub supports_images: bool,
+    /// Whether the provider accepts a `reasoning_effort` parameter for this
+    /// model (OpenAI-compatible effort APIs). DeepSeek's own API does not.
+    #[serde(default)]
+    pub supports_effort: bool,
+    /// Declared reasoning-effort variants, e.g. `["default", "low", "high",
+    /// "max"]`. Empty means no variant selector for this model.
+    #[serde(default)]
+    pub variants: Vec<String>,
     /// Context window in tokens, when known.
     #[serde(default)]
     pub context_window: Option<u64>,
@@ -36,6 +47,9 @@ impl ModelSpec {
             id: id.into(),
             name: None,
             reasoning: false,
+            supports_images: false,
+            supports_effort: false,
+            variants: Vec::new(),
             context_window: None,
             price_in_miss: 0.0,
             price_in_hit: 0.0,
@@ -50,6 +64,19 @@ impl ModelSpec {
 
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    pub fn supports_images(mut self, supports_images: bool) -> Self {
+        self.supports_images = supports_images;
+        self
+    }
+
+    /// Mark the model as speaking a `reasoning_effort` API parameter and
+    /// declare its variants (OpenCode-style Default/low/high/max).
+    pub fn effort(mut self, variants: &[&str]) -> Self {
+        self.supports_effort = true;
+        self.variants = variants.iter().map(|v| v.to_string()).collect();
         self
     }
 

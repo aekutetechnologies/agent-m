@@ -2,23 +2,33 @@
 title: Status sidebar
 ---
 
-# Right-side status sidebar
+# Right-side status sidebar (accordion)
 
-While a flow runs, the right side of the TUI shows a live stage diagram: the
-flow name with a `done/total` counter, a progress bar, and one row per step —
-`✓` done (green), `▶` running (highlighted), `○` pending, `✗` failed — updated
-as each step executes.
+The right side of the TUI is an accordion of collapsible sections. Click a
+section header — or run `/sidebar <section>` — to collapse/expand it; the
+collapsed state persists in `settings.json` under
+`collapsedSidebarSections`.
 
-When no flow is active, the sidebar shows, in priority order:
+## Sections
 
-1. **Flow stages** — the live `✓/▶/○/✗` diagram described above.
-2. **Plan task list** — `[x]`/`[ ]` with an `n/m` counter, when a plan exists
-   (from `/plan` or a flow's plan step).
-3. **Session stats** — model, tokens, cache read, context %, cost.
+1. **Context** — model, tokens in/out, cache read %, cost, and context % of
+   the model's window (updated as the agent works).
+2. **Timing** — the most recent turn's elapsed time and the average over the
+   last 10 turns.
+3. **Flow** — while a flow runs: the flow name with a `done/total` counter, a
+   progress bar, and one row per step — `✓` done (green), `▶` running
+   (highlighted), `○` pending, `✗` failed.
+4. **Plan** — the task list from `/plan` or a flow's plan step (`[x]`/`[ ]`
+   with an `n/m` counter).
+
+Sections appear only while they have content: Context is always present,
+Timing after the first turn, Flow/Todos while a flow or plan is active.
 
 ## Controls
 
-- `/sidebar` toggles the panel.
+- `/sidebar` toggles the whole panel.
+- `/sidebar context|timing|flow|todos` toggles one section (keyboard path).
+- A mouse click on a section header toggles it.
 - The sidebar auto-hides below 110 terminal columns.
 
 ## Status line

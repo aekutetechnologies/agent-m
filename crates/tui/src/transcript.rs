@@ -89,6 +89,7 @@ impl TranscriptItem {
                         ContentPart::Text { text } => {
                             lines.extend(render_markdown(text, theme));
                         }
+                        ContentPart::Image { .. } => {}
                         ContentPart::Thinking { thinking } => {
                             if stale && !*thinking_expanded {
                                 lines.push(Line::from(Span::styled(
@@ -262,6 +263,7 @@ impl TranscriptItem {
                         ContentPart::Text { text } => {
                             height += crate::markdown::markdown_height(text, theme, width);
                         }
+                        ContentPart::Image { .. } => {}
                         ContentPart::Thinking { thinking } => {
                             if stale && !*thinking_expanded {
                                 height += 1;
