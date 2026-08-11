@@ -320,7 +320,7 @@ async fn run_step_inner(
                     ),
                 });
             };
-            match gate.ask(question, options.clone()).await {
+            match gate.ask(question, options.clone(), false).await {
                 Ok(answer) => {
                     set_step_output(context, name, json!({ "answer": answer }));
                     Ok(StepRecord {
@@ -380,10 +380,9 @@ async fn run_step_inner(
                     error: Some(format!("permission denied: {reason}")),
                 });
             }
-            let tool_context = ToolContext {
-                cwd: deps.agent_options.cwd.clone(),
-                ask_gate: deps.ask_gate.clone(),
-            };
+            let mut tool_context = ToolContext::simple(deps.agent_options.cwd.clone());
+            tool_context.ask_gate = deps.ask_gate.clone();
+            tool_context.output_dir = deps.agent_options.output_dir.clone();
             match tool_impl.execute(expanded, &tool_context).await {
                 Ok(outcome) => {
                     let output = json!({ "content": outcome.content, "isError": outcome.is_error });
@@ -500,10 +499,9 @@ async fn run_verify(
 ) -> Result<StepRecord> {
     let command = command.unwrap_or("cargo test");
     let bash = deps.tools.iter().find(|t| t.name() == "bash");
-    let tool_context = ToolContext {
-        cwd: deps.agent_options.cwd.clone(),
-        ask_gate: deps.ask_gate.clone(),
-    };
+    let mut tool_context = ToolContext::simple(deps.agent_options.cwd.clone());
+    tool_context.ask_gate = deps.ask_gate.clone();
+    tool_context.output_dir = deps.agent_options.output_dir.clone();
     let run_once = move |cmd: String| {
         let tool_context = tool_context.clone();
         let bash = bash;

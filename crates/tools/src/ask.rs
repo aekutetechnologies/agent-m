@@ -30,7 +30,11 @@ impl Tool for AskTool {
                 "options": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional suggested answers"
+                    "description": "Optional suggested answers shown as a picker"
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "Allow the user to select multiple options (requires options)"
                 }
             },
             "required": ["question"]
@@ -57,12 +61,16 @@ impl Tool for AskTool {
                     .map(str::to_string)
                     .collect()
             });
+        let multi_select = arguments
+            .get("multi_select")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let Some(gate) = &context.ask_gate else {
             return Ok(ToolOutcome::error(
                 "the ask tool requires the interactive UI (not available in print mode)",
             ));
         };
-        match gate.ask(question, options).await {
+        match gate.ask(question, options, multi_select).await {
             Ok(answer) => Ok(ToolOutcome::success(format!("User answer: {answer}"))),
             Err(message) => Ok(ToolOutcome::error(format!("ask cancelled: {message}"))),
         }

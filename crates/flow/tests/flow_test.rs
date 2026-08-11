@@ -173,6 +173,7 @@ fn options() -> AgentOptions {
         ask_gate: None,
         context_window: None,
         variant: None,
+        output_dir: None,
     }
 }
 
@@ -182,7 +183,7 @@ async fn tool_and_condition_and_ask_steps() {
         "git status".to_string(),
         ToolOutcome::success("clean"),
     )]));
-    let gate: Arc<dyn AskGate> = Arc::new(ClosureAskGate::new(|_q, _o| {
+    let gate: Arc<dyn AskGate> = Arc::new(ClosureAskGate::new(|_q, _o, _m| {
         Box::pin(async { Ok("approved".to_string()) })
     }));
     let deps = FlowDeps {
@@ -324,7 +325,7 @@ async fn on_progress_emits_running_then_final_per_step() {
         "git status".to_string(),
         ToolOutcome::success("clean"),
     )]));
-    let gate: Arc<dyn AskGate> = Arc::new(ClosureAskGate::new(|_q, _o| {
+    let gate: Arc<dyn AskGate> = Arc::new(ClosureAskGate::new(|_q, _o, _m| {
         Box::pin(async { Ok("approved".to_string()) })
     }));
     let progress = Arc::new(std::sync::Mutex::new(Vec::new()));

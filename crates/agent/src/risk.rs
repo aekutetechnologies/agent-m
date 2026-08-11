@@ -188,6 +188,13 @@ fn segments(command: &str) -> impl Iterator<Item = &str> {
 }
 
 /// Read-only shell commands: auto-approve (Low tier).
+// ponytail: `sed` without `-i`/`--in-place` is allow-listed, but its `w`
+// command and `s///w file` flag can still write a file from inside the
+// script with neither flag present. Not chased — same reasoning as the
+// rest of this module's deliberately-not-exhaustive command scan. `awk` is
+// excluded entirely rather than partially allow-listed: it is a general
+// scripting language (file writes, `system()`) with no single flag that
+// reliably marks "this invocation is read-only."
 fn command_is_read_only(command: &str) -> bool {
     segments(command).all(|segment| {
         let Some(head) = head(segment) else {
@@ -195,11 +202,17 @@ fn command_is_read_only(command: &str) -> bool {
         };
         match head {
             "ls" | "cat" | "pwd" | "echo" | "true" | "false" | "head" | "tail" | "wc" | "grep"
-            | "rg" | "env" | "which" | "printf" | "jq" | "sed" | "awk"
+            | "rg" | "env" | "which" | "printf" | "jq"
                 if !segment.contains(">") =>
             {
                 true
             }
+            "sed" if !segment.contains(">") => !segment.split_whitespace().skip(1).any(|w| {
+                w == "-i"
+                    || w.starts_with("-i")
+                    || w.starts_with("--in-place")
+                    || (w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
+            }),
             // git reads only (status/log/diff/show) are fine.
             "git" => {
                 let rest: Vec<&str> = segment.split_whitespace().skip(1).collect();
@@ -363,6 +376,45 @@ mod tests {
             cwd: PathBuf::from("/work"),
             opaque_tools: vec!["jira-search".to_string()],
         }
+    }
+
+    #[test]
+    fn sed_inplace_edit_is_not_auto_approved() {
+        let policy = policy();
+        for cmd in [
+            "sed -i 's/API_KEY=.*/API_KEY=leaked/' .env",
+            "sed -i.bak 's/x/y/' file.txt",
+            "sed --in-place 's/x/y/' file.txt",
+            "sed -ni 's/x/y/p' file.txt",
+        ] {
+            assert_ne!(
+                policy
+                    .assess(&call("bash", json!({ "command": cmd })))
+                    .level,
+                RiskLevel::Low,
+                "must not auto-approve: {cmd}"
+            );
+        }
+        // Plain read-only sed/awk usage: sed still auto-approves, awk no
+        // longer gets blanket trust (too general-purpose to allow-list).
+        assert_eq!(
+            policy
+                .assess(&call(
+                    "bash",
+                    json!({ "command": "sed -n '1,10p' file.txt" })
+                ))
+                .level,
+            RiskLevel::Low
+        );
+        assert_ne!(
+            policy
+                .assess(&call(
+                    "bash",
+                    json!({ "command": "awk '{print $1}' file.txt" })
+                ))
+                .level,
+            RiskLevel::Low
+        );
     }
 
     #[test]

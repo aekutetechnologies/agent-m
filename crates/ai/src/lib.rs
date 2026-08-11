@@ -10,6 +10,7 @@
 //! turns. That lets providers serve the prefix from their context cache
 //! instead of recomputing it, which is what [`CacheStats`] measures.
 
+mod anthropic;
 mod cache;
 mod keys;
 mod models;
@@ -20,6 +21,7 @@ mod trust;
 mod types;
 mod wire;
 
+pub use anthropic::AnthropicProvider;
 pub use cache::CacheStats;
 pub use keys::resolve_api_key;
 pub use models::ModelSpec;

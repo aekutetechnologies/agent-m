@@ -61,18 +61,54 @@ pub fn discover_instructions(cwd: &Path) -> Vec<InstructionFile> {
     files
 }
 
+/// Per-file cap on injected project instructions (matching OpenClaw).
+const PER_FILE_CAP: usize = 12_000;
+/// Total cap across all instruction files.
+const TOTAL_CAP: usize = 60_000;
+
+/// Trim `content` to `cap` chars using a 75% head / 25% tail split, preserving
+/// the most useful parts of verbose instruction files.
+fn head_tail_split(content: &str, cap: usize) -> String {
+    if content.len() <= cap {
+        return content.to_string();
+    }
+    let head_chars = cap * 3 / 4;
+    let tail_chars = cap - head_chars;
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let omitted = content.len() - cap;
+    format!("{head}\n…[{omitted} chars omitted]…\n{tail}")
+}
+
 /// Render the discovered instructions as an XML context block, each wrapped
 /// in `<project_instructions path="…">…</project_instructions>`.
+/// Applies a per-file cap of 12 K chars and a 60 K total cap to avoid
+/// consuming a large fraction of the context window before the first turn.
 pub fn render_instructions(files: &[InstructionFile]) -> String {
     if files.is_empty() {
         return String::new();
     }
     let mut out = String::from("\n\nProject instructions:\n");
+    let mut total = 0usize;
     for file in files {
+        let remaining = TOTAL_CAP.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        let cap = PER_FILE_CAP.min(remaining).max(512);
+        let content = head_tail_split(&file.content, cap);
+        total += content.len();
         out.push_str(&format!(
             "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
             escape_xml(&file.path.display().to_string()),
-            escape_xml(&file.content)
+            escape_xml(&content)
         ));
     }
     out

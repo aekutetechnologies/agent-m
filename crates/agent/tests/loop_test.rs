@@ -157,6 +157,7 @@ fn options() -> AgentOptions {
         ask_gate: None,
         context_window: None,
         variant: None,
+        output_dir: None,
     }
 }
 
@@ -505,6 +506,7 @@ async fn plan_mode_hides_mutating_tools() {
             ask_gate: None,
             context_window: None,
             variant: None,
+            output_dir: None,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -635,7 +637,7 @@ impl Tool for AskStub {
         let Some(gate) = &context.ask_gate else {
             return Ok(ToolOutcome::error("ask requires the interactive UI"));
         };
-        match gate.ask(question.to_string(), None).await {
+        match gate.ask(question.to_string(), None, false).await {
             Ok(answer) => Ok(ToolOutcome::success(format!("User answer: {answer}"))),
             Err(message) => Ok(ToolOutcome::error(format!("ask cancelled: {message}"))),
         }
@@ -644,7 +646,7 @@ impl Tool for AskStub {
 
 #[tokio::test]
 async fn ask_tool_returns_user_answer_and_continues() {
-    let gate = agent_m_agent::ClosureAskGate::new(|_question, _options| {
+    let gate = agent_m_agent::ClosureAskGate::new(|_question, _options, _multi| {
         Box::pin(async { Ok("blue".to_string()) })
     });
     let mut agent = Agent::new(
@@ -662,6 +664,7 @@ async fn ask_tool_returns_user_answer_and_continues() {
             ask_gate: Some(Arc::new(gate)),
             context_window: None,
             variant: None,
+            output_dir: None,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -708,6 +711,7 @@ async fn compaction_replaces_older_messages_with_summary() {
             ask_gate: None,
             context_window: Some(64_000),
             variant: None,
+            output_dir: None,
         },
         Arc::new(AlwaysAllowGate),
     );

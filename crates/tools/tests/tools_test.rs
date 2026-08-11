@@ -11,10 +11,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 fn context(cwd: PathBuf) -> ToolContext {
-    ToolContext {
-        cwd,
-        ask_gate: None,
-    }
+    ToolContext::simple(cwd)
 }
 
 #[tokio::test]
@@ -313,13 +310,11 @@ async fn read_on_directory_points_at_ls() {
 #[tokio::test]
 async fn ask_returns_answer_via_gate_and_errors_without() {
     let gate: Arc<dyn agent_m_agent::AskGate> =
-        Arc::new(agent_m_agent::ClosureAskGate::new(|_question, _options| {
+        Arc::new(agent_m_agent::ClosureAskGate::new(|_question, _options, _multi| {
             Box::pin(async { Ok("yes".to_string()) })
         }));
-    let with_gate = ToolContext {
-        cwd: PathBuf::from("."),
-        ask_gate: Some(gate),
-    };
+    let mut with_gate = ToolContext::simple(PathBuf::from("."));
+    with_gate.ask_gate = Some(gate);
     let result = AskTool
         .execute(json!({ "question": "continue?" }), &with_gate)
         .await
@@ -330,10 +325,7 @@ async fn ask_returns_answer_via_gate_and_errors_without() {
         result.content
     );
 
-    let no_gate = ToolContext {
-        cwd: PathBuf::from("."),
-        ask_gate: None,
-    };
+    let no_gate = ToolContext::simple(PathBuf::from("."));
     let result = AskTool
         .execute(json!({ "question": "continue?" }), &no_gate)
         .await
@@ -469,10 +461,7 @@ async fn web_fetch_blocks_loopback_targets() {
     // A wiremock server binds to 127.0.0.1 — exactly the SSRF case the
     // guard must reject, so the fetch never reaches the server.
     let server = wiremock::MockServer::start().await;
-    let context = agent_m_agent::ToolContext {
-        cwd: std::path::PathBuf::from("."),
-        ask_gate: None,
-    };
+    let context = agent_m_agent::ToolContext::simple(std::path::PathBuf::from("."));
     let url = format!("{}/page", server.uri());
     let outcome = WebFetchTool
         .execute(serde_json::json!({ "url": url }), &context)
@@ -499,10 +488,7 @@ async fn web_fetch_captures_html_content() {
     // stripped (no raw tags) using a local file server on a non-loopback
     // interface would need network — instead assert the content-type sniffing
     // on the unit level already covered. This test guards the refusal path.
-    let context = agent_m_agent::ToolContext {
-        cwd: std::path::PathBuf::from("."),
-        ask_gate: None,
-    };
+    let context = agent_m_agent::ToolContext::simple(std::path::PathBuf::from("."));
     let outcome = WebFetchTool
         .execute(serde_json::json!({ "url": "file:///etc/passwd" }), &context)
         .await

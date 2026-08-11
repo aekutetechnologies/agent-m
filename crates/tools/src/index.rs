@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use tree_sitter::StreamingIterator;
 
 /// A symbol found at `line` (1-based) in a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +199,35 @@ fn walk_files(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 /// Best-effort per-language symbol extraction. Each (kind, name, line).
+///
+/// Uses tree-sitter for the three most-used languages (Rust, Python,
+/// TypeScript/TSX) so multi-line signatures and nested definitions are found
+/// semantically; every other extension falls back to the line-by-line regex
+/// extractor.
 pub fn extract_symbols(extension: &str, text: &str) -> Vec<SymbolHit> {
+    match extension {
+        "rs" => {
+            return tree_sitter_symbols(text, tree_sitter_rust::LANGUAGE.into(), rust_queries());
+        }
+        "py" => {
+            return tree_sitter_symbols(
+                text,
+                tree_sitter_python::LANGUAGE.into(),
+                python_queries(),
+            );
+        }
+        "ts" | "tsx" => {
+            let language: tree_sitter::Language =
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+            return tree_sitter_symbols(text, language, typescript_queries());
+        }
+        _ => {}
+    }
+    regex_symbols(extension, text)
+}
+
+/// The regex-based extractor, kept as the fallback for all other extensions.
+fn regex_symbols(extension: &str, text: &str) -> Vec<SymbolHit> {
     let patterns: Vec<(&str, &str)> = match extension {
         "rs" => vec![
             (
@@ -325,6 +354,96 @@ pub fn extract_symbols(extension: &str, text: &str) -> Vec<SymbolHit> {
                             line: index + 1,
                         });
                     }
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// A tree-sitter query: a `(kind, query)` pair where `kind` is the symbol
+/// kind label and `query` is a tree-sitter query string with a `@name`
+/// capture naming the symbol.
+type TsQuery = (&'static str, &'static str);
+
+fn rust_queries() -> Vec<TsQuery> {
+    vec![
+        ("fn", "(function_item name: (identifier) @name)"),
+        ("struct", "(struct_item name: (type_identifier) @name)"),
+        ("enum", "(enum_item name: (type_identifier) @name)"),
+        ("trait", "(trait_item name: (type_identifier) @name)"),
+        ("impl", "(impl_item type: (type_identifier) @name)"),
+        ("const", "(const_item name: (identifier) @name)"),
+        ("type", "(type_item name: (type_identifier) @name)"),
+        ("mod", "(mod_item name: (identifier) @name)"),
+    ]
+}
+
+fn python_queries() -> Vec<TsQuery> {
+    vec![
+        ("def", "(function_definition name: (identifier) @name)"),
+        ("class", "(class_definition name: (identifier) @name)"),
+    ]
+}
+
+fn typescript_queries() -> Vec<TsQuery> {
+    vec![
+        (
+            "function",
+            "(function_declaration name: (identifier) @name)",
+        ),
+        ("class", "(class_declaration name: (type_identifier) @name)"),
+        (
+            "interface",
+            "(interface_declaration name: (type_identifier) @name)",
+        ),
+        (
+            "const",
+            "(lexical_declaration (variable_declarator name: (identifier) @name))",
+        ),
+        (
+            "type",
+            "(type_alias_declaration name: (type_identifier) @name)",
+        ),
+    ]
+}
+
+/// Extract symbols from `text` using a tree-sitter grammar and queries. Falls
+/// back to an empty result (never panics) if parsing fails.
+fn tree_sitter_symbols(
+    text: &str,
+    language: tree_sitter::Language,
+    queries: Vec<TsQuery>,
+) -> Vec<SymbolHit> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&language)
+        .expect("tree-sitter language is valid");
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (kind, query) in queries {
+        let Ok(query) = tree_sitter::Query::new(&language, query) else {
+            continue;
+        };
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                let node = capture.node;
+                let name = node.utf8_text(text.as_bytes()).unwrap_or("").to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let line = node.start_position().row + 1;
+                if seen.insert((kind.to_string(), name.clone(), line)) {
+                    hits.push(SymbolHit {
+                        kind: kind.to_string(),
+                        name,
+                        line,
+                    });
                 }
             }
         }
@@ -477,5 +596,54 @@ mod tests {
         );
         assert_eq!(split_identifier("MAX_BYTES"), vec!["max", "bytes"]);
         assert_eq!(split_identifier("PrefixCache"), vec!["prefix", "cache"]);
+    }
+
+    #[test]
+    fn tree_sitter_finds_multiline_rust_struct() {
+        // A struct whose fields span multiple lines — the regex extractor
+        // would still catch the name, but this exercises the tree-sitter path.
+        let text = "pub struct MultiLine {\n    pub field_a: u64,\n    pub field_b: String,\n}\n";
+        let hits = extract_symbols("rs", text);
+        assert!(
+            hits.iter()
+                .any(|h| h.kind == "struct" && h.name == "MultiLine"),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_finds_python_class_and_def() {
+        let text = "class Greeter:\n    def greet(self, name):\n        return f\"hi {name}\"\n";
+        let hits = extract_symbols("py", text);
+        assert!(
+            hits.iter()
+                .any(|h| h.kind == "class" && h.name == "Greeter"),
+            "{hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.kind == "def" && h.name == "greet"),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_finds_typescript_function() {
+        let text = "export function computeTotal(items: number[]): number {\n  return items.reduce((a, b) => a + b, 0);\n}\n";
+        let hits = extract_symbols("ts", text);
+        assert!(
+            hits.iter()
+                .any(|h| h.kind == "function" && h.name == "computeTotal"),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn regex_fallback_still_works_for_other_languages() {
+        let text = "func main() {\n\tfmt.Println(\"hi\")\n}\n";
+        let hits = extract_symbols("go", text);
+        assert!(
+            hits.iter().any(|h| h.kind == "func" && h.name == "main"),
+            "{hits:?}"
+        );
     }
 }

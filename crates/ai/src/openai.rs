@@ -268,26 +268,44 @@ struct WireFunctionDelta {
     arguments: Option<String>,
 }
 
+/// OpenAI nests cache info under `prompt_tokens_details`; DeepSeek uses top-level fields.
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct WireUsage {
     #[serde(default, rename = "prompt_tokens")]
     prompt_tokens: u64,
     #[serde(default, rename = "completion_tokens")]
     completion_tokens: u64,
+    /// DeepSeek field name.
     #[serde(default, rename = "prompt_cache_hit_tokens")]
     prompt_cache_hit_tokens: u64,
+    /// DeepSeek field name.
     #[serde(default, rename = "prompt_cache_miss_tokens")]
     prompt_cache_miss_tokens: u64,
     #[serde(default, rename = "total_tokens")]
     total_tokens: u64,
+    /// OpenAI nests cached token counts here.
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetails,
 }
 
 impl WireUsage {
     fn into_usage(self) -> Usage {
+        // DeepSeek: top-level prompt_cache_hit_tokens.
+        // OpenAI:   prompt_tokens_details.cached_tokens.
+        // Take whichever is non-zero; both zero means provider doesn't report caching.
+        let cache_read = self
+            .prompt_cache_hit_tokens
+            .max(self.prompt_tokens_details.cached_tokens);
         Usage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
-            cache_read_tokens: self.prompt_cache_hit_tokens,
+            cache_read_tokens: cache_read,
             cache_creation_tokens: self.prompt_cache_miss_tokens,
             total_tokens: self.total_tokens,
             cost: 0.0,

@@ -21,7 +21,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
 use std::path::PathBuf;
@@ -110,6 +112,7 @@ fn provider_config(id: &str) -> agent_m_ai::ProviderConfig {
             context_window: 1_000_000,
             pricing: agent_m_ai::Pricing::default(),
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            r#type: None,
         }
     } else {
         agent_m_ai::ProviderConfig {
@@ -123,6 +126,7 @@ fn provider_config(id: &str) -> agent_m_ai::ProviderConfig {
             context_window: 128_000,
             pricing: agent_m_ai::Pricing::default(),
             api_key_env: None,
+            r#type: None,
         }
     }
 }
@@ -229,8 +233,9 @@ const BAR_CELLS: usize = 20;
 const SIDEBAR_MIN_WIDTH: u16 = 110;
 
 type AskRequest = (
-    String,
-    Option<Vec<String>>,
+    String,                                    // question
+    Option<Vec<String>>,                       // options
+    bool,                                      // multi_select
     oneshot::Sender<Result<String, String>>,
 );
 
@@ -409,6 +414,10 @@ pub struct App {
     variant_picker_open: bool,
     /// Selected row in the variant picker.
     variant_picker_index: usize,
+    /// Highlighted row in the ask overlay picker.
+    ask_picker_index: usize,
+    /// Checked rows in a multi-select ask picker.
+    ask_picker_selected: std::collections::BTreeSet<usize>,
     /// Collapsed sidebar sections (by name: context/timing/flow/todos).
     collapsed_sections: Vec<String>,
     /// When the current agent turn started (for the Timing section).
@@ -505,10 +514,10 @@ impl App {
         // Ask gate: route the model's `ask` tool to a TUI dialog.
         let (ask_tx, ask_rx) = mpsc::unbounded_channel::<AskRequest>();
         let ask_gate: Arc<dyn agent_m_agent::AskGate> = Arc::new(
-            agent_m_agent::ClosureAskGate::new(move |question, options| {
+            agent_m_agent::ClosureAskGate::new(move |question, options, multi_select| {
                 let ask_tx = ask_tx.clone();
                 let (response_tx, response_rx) = oneshot::channel();
-                let _ = ask_tx.send((question, options, response_tx));
+                let _ = ask_tx.send((question, options, multi_select, response_tx));
                 Box::pin(async move {
                     response_rx
                         .await
@@ -618,6 +627,8 @@ impl App {
             variant: initial_variant,
             variant_picker_open: false,
             variant_picker_index: 0,
+            ask_picker_index: 0,
+            ask_picker_selected: std::collections::BTreeSet::new(),
             collapsed_sections,
             turn_started: None,
             turn_times: Vec::new(),
@@ -681,7 +692,7 @@ impl App {
                             .cloned();
                         match config {
                             Some(config) => {
-                                let new_provider: Arc<dyn Provider> = Arc::new(
+                                let new_provider: Arc<dyn Provider> = Arc::from(
                                     agent_m_ai::provider_from_config(&config, None, &agent_dir),
                                 );
                                 let old_messages = agent.messages().to_vec();
@@ -920,7 +931,7 @@ impl App {
             if self.pending_ask.is_none() {
                 self.pending_ask = Some(request);
             } else {
-                let (_, _, response) = request;
+                let (_, _, _, response) = request;
                 let _ = response.send(Err("another question is already pending".to_string()));
             }
             changed = true;
@@ -929,25 +940,111 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
-        // The model is asking a question: enter answers, escape cancels.
+        // The model is asking a question: picker overlay when options are
+        // provided, free-text otherwise.
         if self.pending_ask.is_some() {
-            match key.code {
-                KeyCode::Enter => {
-                    let answer = self.editor.text();
-                    self.editor.set_text("");
-                    self.editor_view_top = 0;
-                    if let Some((_, _, response)) = self.pending_ask.take() {
-                        let _ = response.send(Ok(answer));
+            let has_options = matches!(&self.pending_ask, Some((_, Some(_), _, _)));
+            let is_multi = matches!(&self.pending_ask, Some((_, _, true, _)));
+            if has_options {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.ask_picker_index =
+                            self.ask_picker_index.saturating_sub(1);
+                        return;
                     }
-                    return;
-                }
-                KeyCode::Esc => {
-                    if let Some((_, _, response)) = self.pending_ask.take() {
-                        let _ = response.send(Err("cancelled by user".to_string()));
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let count = self
+                            .pending_ask
+                            .as_ref()
+                            .and_then(|(_, o, _, _)| o.as_ref())
+                            .map(|o| o.len())
+                            .unwrap_or(0);
+                        self.ask_picker_index =
+                            (self.ask_picker_index + 1).min(count.saturating_sub(1));
+                        return;
                     }
-                    return;
+                    KeyCode::Char(' ') if is_multi => {
+                        let i = self.ask_picker_index;
+                        if self.ask_picker_selected.contains(&i) {
+                            self.ask_picker_selected.remove(&i);
+                        } else {
+                            self.ask_picker_selected.insert(i);
+                        }
+                        return;
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && !is_multi => {
+                        let n = (c as usize).wrapping_sub('1' as usize);
+                        if let Some((_, Some(opts), _, _)) = &self.pending_ask {
+                            if n < opts.len() {
+                                let answer = opts[n].clone();
+                                if let Some((_, _, _, response)) =
+                                    self.pending_ask.take()
+                                {
+                                    let _ = response.send(Ok(answer));
+                                }
+                                self.ask_picker_index = 0;
+                            }
+                        }
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        if is_multi {
+                            if let Some((_, Some(opts), _, response)) =
+                                self.pending_ask.take()
+                            {
+                                let answer = self
+                                    .ask_picker_selected
+                                    .iter()
+                                    .filter_map(|&i| opts.get(i))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let _ = response.send(Ok(answer));
+                                self.ask_picker_selected.clear();
+                                self.ask_picker_index = 0;
+                            }
+                        } else if let Some((_, Some(opts), _, response)) =
+                            self.pending_ask.take()
+                        {
+                            let answer = opts
+                                .get(self.ask_picker_index)
+                                .cloned()
+                                .unwrap_or_default();
+                            let _ = response.send(Ok(answer));
+                            self.ask_picker_index = 0;
+                        }
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        if let Some((_, _, _, response)) = self.pending_ask.take() {
+                            let _ = response.send(Err("cancelled by user".to_string()));
+                        }
+                        self.ask_picker_index = 0;
+                        self.ask_picker_selected.clear();
+                        return;
+                    }
+                    _ => return,
                 }
-                _ => {}
+            } else {
+                // free-text mode
+                match key.code {
+                    KeyCode::Enter => {
+                        let answer = self.editor.text();
+                        self.editor.set_text("");
+                        self.editor_view_top = 0;
+                        if let Some((_, _, _, response)) = self.pending_ask.take() {
+                            let _ = response.send(Ok(answer));
+                        }
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        if let Some((_, _, _, response)) = self.pending_ask.take() {
+                            let _ = response.send(Err("cancelled by user".to_string()));
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
             }
         }
         // The /provider setup wizard: enter submits the current line, esc
@@ -1676,6 +1773,7 @@ impl App {
                             } else {
                                 Some(draft.key_env.clone())
                             },
+                            r#type: None,
                         };
                         let mut all = self.reload_configured_providers();
                         if all.iter().any(|p| p.id == config.id) {
@@ -1857,10 +1955,8 @@ impl App {
         });
         self.follow_end = true;
 
-        let context = ToolContext {
-            cwd: self.cwd.clone(),
-            ask_gate: None,
-        };
+        let mut context = ToolContext::simple(self.cwd.clone());
+        context.output_dir = self.inputs.agent_options.output_dir.clone();
         let outcome = BashTool
             .execute(serde_json::json!({ "command": command }), &context)
             .await
@@ -2677,6 +2773,14 @@ impl App {
             .scroll((top as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+
+        // Scrollbar on the right edge: only meaningful when scrolled back.
+        if !self.follow_end {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::new().fg(self.theme.scrollbar));
+            let mut sb_state = ScrollbarState::new(total).position(top);
+            frame.render_stateful_widget(scrollbar, area, &mut sb_state);
+        }
     }
 
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
@@ -2745,35 +2849,40 @@ impl App {
             frame.render_widget(Paragraph::new(lines), area);
             return;
         }
-        if let Some((question, options, _)) = &self.pending_ask {
-            // The model asked a question: show it and let the user answer in
-            // the editor (enter sends, escape cancels).
-            let mut text = format!("❓ {question}");
-            if let Some(options) = options {
-                for (index, option) in options.iter().enumerate() {
-                    text.push_str(&format!("  {}. {option}", index + 1));
+        if let Some((question, options, _, _)) = &self.pending_ask {
+            if options.is_none() {
+                // Free-text mode: show question + hint in the status bar.
+                let mut lines = vec![Line::from(Span::styled(
+                    format!("❓ {question}"),
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                let width = area.width.max(20) as usize;
+                for wrapped in wrap_lines(
+                    "type your answer below and press enter (esc to cancel)",
+                    width.saturating_sub(2),
+                ) {
+                    if lines.len() >= 4 {
+                        break;
+                    }
+                    lines.push(Line::from(Span::styled(
+                        wrapped,
+                        Style::default().fg(self.theme.dim),
+                    )));
                 }
+                frame.render_widget(Paragraph::new(lines), area);
+                return;
             }
-            let mut lines = vec![Line::from(Span::styled(
-                text,
-                Style::default()
-                    .fg(self.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ))];
-            let width = area.width.max(20) as usize;
-            for wrapped in wrap_lines(
-                "type your answer below and press enter (esc to cancel)",
-                width.saturating_sub(2),
-            ) {
-                if lines.len() >= 4 {
-                    break;
-                }
-                lines.push(Line::from(Span::styled(
-                    wrapped,
+            // Options present: the overlay picker handles rendering (draw_overlay).
+            // Show a minimal status-bar hint so the user knows the picker is up.
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "❓ select an option above (↑↓ or 1-9 · esc cancel)",
                     Style::default().fg(self.theme.dim),
-                )));
-            }
-            frame.render_widget(Paragraph::new(lines), area);
+                ))),
+                area,
+            );
             return;
         }
         if let Some(prompt) = {
@@ -2915,9 +3024,16 @@ impl App {
         self.editor_view_top = view_top;
         let (visible, cursor_line, cursor_col) = self.editor.visible_lines(view_top, inner_height);
 
+        let title = if self.streaming && self.active_tool.is_some() {
+            " working… "
+        } else if self.streaming {
+            " thinking… "
+        } else {
+            " agent-m "
+        };
         let block = Block::default()
             .borders(Borders::TOP)
-            .title(" agent-m ")
+            .title(title)
             .title_style(Style::default().fg(self.theme.accent));
         let paragraph = Paragraph::new(
             visible
@@ -2945,13 +3061,37 @@ impl App {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(area);
         // Line 1: keybinding hints (pi/Claude style footer badges).
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "enter send · tab complete · ctrl+l model · ctrl+o output · ctrl+d exit · /help",
-                Style::default().fg(self.theme.dim),
-            )),
-            rows[0],
-        );
+        let hints =
+            "enter send · tab complete · ctrl+l model · ctrl+o output · ctrl+d exit · /help";
+        let mut hint_line = Line::from(Span::styled(hints, Style::default().fg(self.theme.dim)));
+        if self.scroll_back > 0 {
+            let width = area.width.max(1) as usize;
+            let total = self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| item.height(&self.theme, width, index < self.collapsed_before))
+                .sum::<usize>();
+            let viewport = rows[0].height as usize;
+            let top = total
+                .saturating_sub(viewport)
+                .saturating_sub(self.scroll_back.min(total));
+            let percent = total
+                .saturating_sub(top)
+                .saturating_mul(100)
+                .checked_div(total.max(1))
+                .unwrap_or(0);
+            let indicator = format!("↑ {percent}%");
+            let pad = area
+                .width
+                .saturating_sub(UnicodeWidthStr::width(hints) as u16)
+                .saturating_sub(UnicodeWidthStr::width(indicator.as_str()) as u16);
+            hint_line.spans.push(Span::styled(
+                format!("{}{indicator}", " ".repeat(pad as usize)),
+                Style::default().fg(self.theme.warning),
+            ));
+        }
+        frame.render_widget(Paragraph::new(hint_line), rows[0]);
         // Line 2: working directory (home shortened to ~) and the model.
         let cwd = self.cwd.display().to_string();
         let home = dirs::home_dir()
@@ -3238,6 +3378,58 @@ impl App {
                 .title_style(Style::default().fg(self.theme.accent))
                 .border_style(Style::default().fg(self.theme.dim));
             let rect = overlay_area(frame.area(), 40, lines.len() as u16 + 2);
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
+
+        if let Some((question, Some(options), multi_select, _)) = &self.pending_ask {
+            let multi_select = *multi_select;
+            let mut lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    let cursor = i == self.ask_picker_index;
+                    let checked = self.ask_picker_selected.contains(&i);
+                    let prefix = if multi_select {
+                        if checked { "[x] " } else { "[ ] " }
+                    } else if cursor {
+                        "›   "
+                    } else {
+                        "    "
+                    };
+                    let style = if cursor || (multi_select && checked) {
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.user_message_text)
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{prefix}{}: ", i + 1), style),
+                        Span::styled(opt.clone(), style),
+                    ])
+                })
+                .collect();
+            let hint = if multi_select {
+                "↑↓ navigate · space toggle · enter confirm · esc cancel"
+            } else {
+                "↑↓ navigate · enter select · 1-9 quick pick · esc cancel"
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(self.theme.muted),
+            )));
+            let width = (options.iter().map(|o| o.len()).max().unwrap_or(20) + 14)
+                .clamp(44, 72) as u16;
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" ❓ {} ", question))
+                .title_style(
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(self.theme.dim));
+            let rect = overlay_area(frame.area(), width, lines.len() as u16 + 2);
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
 

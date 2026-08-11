@@ -65,6 +65,20 @@ impl Tool for ReadTool {
                 metadata.len() / (1024 * 1024)
             )));
         }
+
+        // Read dedup: if the file hasn't changed since the last read of this
+        // range, return a stub to avoid duplicating tokens in context.
+        let cache_key = (path.clone(), offset, limit);
+        let mtime = metadata.modified().ok();
+        if let Some(mtime) = mtime {
+            let cache = context.read_cache.lock().unwrap();
+            if cache.get(&cache_key).is_some_and(|cached| *cached == mtime) {
+                return Ok(ToolOutcome::success(format!(
+                    "(file unchanged since last read — use read again with offset/limit to re-fetch)"
+                )));
+            }
+        }
+
         let contents = tokio::time::timeout(READ_TIMEOUT, tokio::fs::read_to_string(&path))
             .await
             .map_err(|_| {
@@ -99,6 +113,12 @@ impl Tool for ReadTool {
         if result.is_empty() {
             result = "(empty file or no lines in range)".to_string();
         }
+
+        // Update read cache with current mtime.
+        if let Some(mtime) = mtime {
+            context.read_cache.lock().unwrap().insert(cache_key, mtime);
+        }
+
         Ok(ToolOutcome::success(result))
     }
 }

@@ -38,6 +38,11 @@ pub struct ProviderConfig {
     /// resolved through `keys.rs` (env → auth.json → settings.json).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Provider wire protocol: `"openai"` (default) or `"anthropic"`.
+    /// Anthropic providers speak the native Messages API with prefix caching
+    /// and extended thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
     /// Extra model ids to offer in `/model` beyond `model` (e.g. a reasoning
     /// sibling). When absent, well-known ids get a built-in suggestion list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +137,7 @@ mod tests {
             context_window: 128_000,
             pricing: Pricing::default(),
             api_key_env: None,
+            r#type: None,
         };
         let specs = config_models(&config);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
@@ -157,6 +163,7 @@ mod tests {
             context_window: 128_000,
             pricing: Pricing::default(),
             api_key_env: None,
+            r#type: None,
         };
         let specs = config_models(&config);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
@@ -178,6 +185,7 @@ mod tests {
             context_window: 1_000_000,
             pricing: Pricing::default(),
             api_key_env: None,
+            r#type: None,
         };
         let specs = config_models(&config);
         let first = &specs[0];
@@ -251,6 +259,7 @@ mod tests {
             context_window: 128_000,
             pricing: Pricing::default(),
             api_key_env: None,
+            r#type: None,
         }];
         save_provider_configs(dir.path(), &configs).unwrap();
         let saved: serde_json::Value = serde_json::from_str(
@@ -357,24 +366,32 @@ pub fn provider_from_config(
     config: &ProviderConfig,
     api_key_override: Option<String>,
     agent_dir: &Path,
-) -> crate::OpenAiCompatibleProvider {
+) -> Box<dyn crate::Provider> {
     let api_key = api_key_override
         .or_else(|| crate::resolve_api_key(&config.key_env(), &config.id, agent_dir));
     let specs = config_models(config);
+    if config.r#type.as_deref() == Some("anthropic") {
+        return Box::new(crate::AnthropicProvider::new(
+            config.id.clone(),
+            config.name.clone().unwrap_or_else(|| config.id.clone()),
+            config.base_url.clone(),
+            api_key,
+            specs,
+        ));
+    }
     // The primary model spec keeps its name; mark it explicitly.
-    crate::OpenAiCompatibleProvider::new(
+    Box::new(crate::OpenAiCompatibleProvider::new(
         config.id.clone(),
         config.name.clone().unwrap_or_else(|| config.id.clone()),
         config.base_url.clone(),
         api_key,
         specs,
-    )
+    ))
 }
 
 #[cfg(test)]
 mod factory_tests {
     use super::*;
-    use crate::Provider;
     use tempfile::tempdir;
 
     fn config(id: &str) -> ProviderConfig {
@@ -393,6 +410,7 @@ mod factory_tests {
                 out: 2.0,
             },
             api_key_env: None,
+            r#type: None,
         }
     }
 

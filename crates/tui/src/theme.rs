@@ -3,6 +3,15 @@
 
 use ratatui::style::Color;
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
+
+/// OSC-11 background query: ask the terminal for its background color.
+const OSC_11_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+/// OSC-11 response terminator (ST).
+const OSC_ST: &[u8] = b"\x1b\\";
+/// How long to wait for the terminal to answer before falling back.
+const OSC_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Resolved theme: every color as a concrete ratatui `Color`.
 #[derive(Debug, Clone)]
@@ -79,17 +88,14 @@ impl Theme {
         Self::from_map("light", &Self::light_colors())
     }
 
-    /// Pick dark/light from the terminal environment. Priority: `COLORFGBG`
-    /// (rxvt/urxvt/Konsole convention), then macOS system appearance (a
-    /// proxy for Terminal.app's default profile), else `dark()`.
-    // ponytail: a raw OSC-11 background query (what pi does) is the correct
-    // cross-platform answer, but hand-rolling it safely — bounded read,
-    // guaranteed raw-mode restore on every exit path including panics —
-    // is a bigger, riskier change than this heuristic warrants today. The
-    // macOS check covers the common case (default profile follows system
-    // appearance) without touching terminal state; it does not see a
-    // custom profile color. Promote to OSC-11 if that proves insufficient.
+    /// Pick dark/light from the terminal environment. Priority: an OSC-11
+    /// background query (the terminal's actual background color), then
+    /// `COLORFGBG` (rxvt/urxvt/Konsole convention), then macOS system
+    /// appearance (a proxy for Terminal.app's default profile), else `dark()`.
     pub fn default_for_terminal() -> Self {
+        if let Some(dark) = osc11_background_is_dark() {
+            return if dark { Self::dark() } else { Self::light() };
+        }
         if let Ok(colorfg) = std::env::var("COLORFGBG") {
             let background = colorfg.split(';').nth(1).unwrap_or("0");
             if let Ok(index) = background.trim().parse::<u8>() {
@@ -250,6 +256,105 @@ fn macos_dark_mode() -> Option<bool> {
     None
 }
 
+/// Query the terminal's background color via OSC-11 and return whether it is
+/// dark. Returns `None` on timeout, parse failure, or when stdin/stdout are
+/// not a TTY (so the caller falls back to the heuristic). Raw mode is enabled
+/// for the query and restored on every exit path via a `Drop` guard.
+fn osc11_background_is_dark() -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut stdout = std::io::stdout();
+    let mut stdin = std::io::stdin();
+    if !isatty(stdout.as_raw_fd()) || !isatty(stdin.as_raw_fd()) {
+        return None;
+    }
+    // Enable raw mode so the response bytes reach us unprocessed.
+    let _guard = RawModeGuard::new()?;
+    stdout.write_all(OSC_11_QUERY).ok()?;
+    stdout.flush().ok()?;
+
+    // Read until the ST terminator or the timeout, whichever comes first.
+    let mut buf = [0u8; 64];
+    let mut response = Vec::new();
+    let deadline = Instant::now() + OSC_TIMEOUT;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Poll for readability so we don't block past the deadline.
+        let mut pollfd = libc::pollfd {
+            fd: stdin.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis() as i32) };
+        if ready <= 0 {
+            break;
+        }
+        let n = stdin.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.windows(OSC_ST.len()).any(|w| w == OSC_ST) {
+            break;
+        }
+    }
+    parse_osc11(&response)
+}
+
+/// Parse an OSC-11 response like `\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\` (or
+/// `rgb:1e1e1e/...`) into a dark/light decision. Returns `None` on any
+/// malformed input.
+fn parse_osc11(response: &[u8]) -> Option<bool> {
+    let text = String::from_utf8_lossy(response);
+    // Strip the leading CSI/OSC and trailing ST.
+    let body = text
+        .trim_start_matches('\x1b')
+        .trim_start_matches(']')
+        .trim_start_matches("11;")
+        .trim_end_matches('\x1b')
+        .trim_end_matches('\\');
+    let rgb = body.strip_prefix("rgb:")?;
+    // Components may be 2 or 4 hex digits, separated by '/'.
+    let parts: Vec<&str> = rgb.split('/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut channels = [0u8; 3];
+    for (index, part) in parts.iter().enumerate() {
+        let hex = &part[..part.len().min(2)];
+        channels[index] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    let (r, g, b) = (channels[0] as f32, channels[1] as f32, channels[2] as f32);
+    // Perceived luminance (Rec. 709 coefficients); < 0.5 → dark.
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    Some(luminance < 127.5)
+}
+
+/// Enables raw mode on construction and restores it on drop, so the terminal
+/// is left in a sane state on every exit path (including panics).
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Option<Self> {
+        crossterm::terminal::enable_raw_mode().ok()?;
+        Some(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// `isatty(3)` — true when `fd` refers to a terminal.
+fn isatty(fd: i32) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
 /// De-facto standard set by iTerm2, Ghostty, WezTerm, kitty, Alacritty and
 /// VS Code; Terminal.app leaves it unset. Unknown → assume 256-color, which
 /// fails safe (a quantized palette on a truecolor terminal looks nearly
@@ -366,5 +471,18 @@ mod tests {
         assert_eq!(Theme::default_for_terminal().name, "dark");
         unsafe { std::env::set_var("COLORFGBG", "0;15") };
         assert_eq!(Theme::default_for_terminal().name, "light");
+    }
+
+    #[test]
+    fn parses_osc11_dark_and_light() {
+        // Dark background (1e1e1e).
+        let dark = parse_osc11(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\");
+        assert_eq!(dark, Some(true));
+        // Light background (f0f0f0).
+        let light = parse_osc11(b"\x1b]11;rgb:f0f0/f0f0/f0f0\x1b\\");
+        assert_eq!(light, Some(false));
+        // Malformed → None.
+        assert_eq!(parse_osc11(b"garbage"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:zz/zz/zz\x1b\\"), None);
     }
 }

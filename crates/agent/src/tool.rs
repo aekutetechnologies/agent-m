@@ -15,6 +15,7 @@ pub trait AskGate: Send + Sync {
         &self,
         question: String,
         options: Option<Vec<String>>,
+        multi_select: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 }
 
@@ -24,6 +25,7 @@ where
     F: Fn(
             String,
             Option<Vec<String>>,
+            bool,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync;
@@ -33,6 +35,7 @@ where
     F: Fn(
             String,
             Option<Vec<String>>,
+            bool,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
@@ -47,6 +50,7 @@ where
     F: Fn(
             String,
             Option<Vec<String>>,
+            bool,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
@@ -55,8 +59,9 @@ where
         &self,
         question: String,
         options: Option<Vec<String>>,
+        multi_select: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        (self.0)(question, options)
+        (self.0)(question, options, multi_select)
     }
 }
 
@@ -69,6 +74,7 @@ impl AskGate for UnavailableAskGate {
         &self,
         _question: String,
         _options: Option<Vec<String>>,
+        _multi_select: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         Box::pin(async {
             Err(
@@ -79,6 +85,12 @@ impl AskGate for UnavailableAskGate {
     }
 }
 
+/// Shared read-dedup cache: maps (path, offset, limit) → mtime at last read.
+/// When the file hasn't changed, the read tool returns a stub instead of
+/// re-reading, saving tokens on repeated reads of the same range.
+pub type ReadCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<(PathBuf, usize, Option<usize>), std::time::SystemTime>>>;
+
 /// Context passed to a tool execution.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -86,13 +98,32 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// The ask gate for the `ask` tool (None → ask fails).
     pub ask_gate: Option<Arc<dyn AskGate>>,
+    /// Directory for offloading large tool outputs. When set, results over
+    /// the threshold are written here and replaced with a 2KB preview + path.
+    pub output_dir: Option<PathBuf>,
+    /// Per-session read dedup cache shared across all tool invocations.
+    pub read_cache: ReadCache,
 }
 
 impl fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolContext")
             .field("cwd", &self.cwd)
+            .field("output_dir", &self.output_dir)
             .finish_non_exhaustive()
+    }
+}
+
+impl ToolContext {
+    /// Construct a minimal context (no output offloading, empty read cache).
+    /// Useful for tests and callers that don't need these features.
+    pub fn simple(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            ask_gate: None,
+            output_dir: None,
+            read_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 }
 

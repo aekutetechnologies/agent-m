@@ -55,7 +55,10 @@ impl TranscriptItem {
                 // pi/Claude style: a solid background block with a leading
                 // prompt chevron — no borders, one blank line after.
                 let mut lines = Vec::new();
-                for (index, line) in render_markdown(content, theme).into_iter().enumerate() {
+                for (index, line) in render_markdown(content, theme, _width as u16)
+                    .into_iter()
+                    .enumerate()
+                {
                     let mut styled = line;
                     for span in &mut styled.spans {
                         if span.style.fg.is_none() {
@@ -87,7 +90,7 @@ impl TranscriptItem {
                 for part in parts {
                     match part {
                         ContentPart::Text { text } => {
-                            lines.extend(render_markdown(text, theme));
+                            lines.extend(render_markdown(text, theme, _width as u16));
                         }
                         ContentPart::Image { .. } => {}
                         ContentPart::Thinking { thinking } => {

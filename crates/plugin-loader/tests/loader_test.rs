@@ -49,10 +49,7 @@ fn builds_and_loads_the_fixture_plugin() {
         .expect("fixture-hello tool");
     assert!(hello.description().contains("fixture plugin"));
 
-    let context = ToolContext {
-        cwd: PathBuf::from("."),
-        ask_gate: None,
-    };
+    let context = ToolContext::simple(PathBuf::from("."));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let outcome = runtime
         .block_on(hello.execute(json!({ "name": "plugin" }), &context))

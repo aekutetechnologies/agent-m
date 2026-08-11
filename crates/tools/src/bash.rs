@@ -47,10 +47,8 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut process = tokio::process::Command::new(&shell);
+        let mut process = crate::sandbox::sandboxed_command(&context.cwd, &shell, command);
         process
-            .arg("-c")
-            .arg(command)
             .current_dir(&context.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -119,28 +117,21 @@ impl Tool for BashTool {
         }
         let combined = combined.trim_end().to_string();
 
-        let (kept, truncation_notice) = crate::truncate::truncate_output(&combined);
+        let output =
+            crate::truncate::offload_or_truncate(&combined, "bash", context.output_dir.as_deref());
 
         let mut result = if status.success() {
-            let mut text = if kept.is_empty() {
+            let text = if output.is_empty() {
                 "command succeeded with no output".to_string()
             } else {
-                kept
+                output
             };
-            if let Some(notice) = truncation_notice {
-                text.push('\n');
-                text.push_str(&notice);
-            }
             ToolOutcome::success(text)
         } else {
             let mut text = format!("command exited with code {}", status.code().unwrap_or(-1));
-            if !kept.is_empty() {
+            if !output.is_empty() {
                 text.push_str(":\n");
-                text.push_str(&kept);
-            }
-            if let Some(notice) = truncation_notice {
-                text.push('\n');
-                text.push_str(&notice);
+                text.push_str(&output);
             }
             ToolOutcome::error(text)
         };

@@ -13,6 +13,7 @@ mod index;
 mod ls;
 mod paths;
 mod read;
+mod sandbox;
 mod search;
 mod truncate;
 mod web;

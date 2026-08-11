@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::Instrument;
 
 use crate::message::SessionMessage;
 use crate::tool::{Permission, PermissionGate, Tool, ToolCallInfo, ToolContext, ToolOutcome};
@@ -62,6 +63,20 @@ const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation 
 
 /// Pull the `<trust>` block out of the last text part (the model is
 /// instructed to end the reply with it) and return (trust, parts-without).
+/// Truncate `ToolResult` content in `messages` to `max_chars` in-place.
+/// Used as a pre-step before retrying a compaction summarization that failed
+/// because the old messages were too large.
+fn clamp_tool_results(messages: &mut Vec<SessionMessage>, max_chars: usize) {
+    for msg in messages.iter_mut() {
+        if let SessionMessage::ToolResult { content, .. } = msg {
+            if content.len() > max_chars {
+                content.truncate(max_chars);
+                content.push_str("\n…[clamped for compaction]");
+            }
+        }
+    }
+}
+
 fn extract_trust(parts: &[ContentPart]) -> (agent_m_ai::TrustData, Vec<ContentPart>) {
     let mut result = parts.to_vec();
     let Some(last_text) = result.iter_mut().rev().find_map(|part| match part {
@@ -97,6 +112,10 @@ pub struct AgentOptions {
     /// Selected reasoning-effort variant (`default`/`low`/`high`/`max`),
     /// forwarded to providers that support `reasoning_effort`.
     pub variant: Option<String>,
+    /// Directory for offloading large tool outputs outside the context window.
+    /// When set, bash/grep results over 10KB are written here and replaced with
+    /// a 2KB preview + path hint. None → plain truncation (existing behavior).
+    pub output_dir: Option<std::path::PathBuf>,
 }
 
 /// Events emitted by the agent loop, in pi's ordering:
@@ -190,6 +209,8 @@ pub struct Agent {
     interrupt_notify: Arc<tokio::sync::Notify>,
     /// Provider-reported prompt tokens of the most recent turn (≈ context size).
     last_input_tokens: u64,
+    /// Per-session read dedup cache shared across all ToolContext instances.
+    read_cache: crate::tool::ReadCache,
 }
 
 impl Agent {
@@ -210,6 +231,9 @@ impl Agent {
             interrupted: Arc::new(AtomicBool::new(false)),
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             last_input_tokens: 0,
+            read_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -333,13 +357,71 @@ impl Agent {
     /// session log, which is the cross-session memory mechanism.
     pub async fn summarize_and_compact(&mut self, keep_messages: usize) -> Result<String, AiError> {
         let keep = keep_messages.max(1);
-        let split = self.messages.len().saturating_sub(keep);
+        let mut split = self.messages.len().saturating_sub(keep);
+        // Gap 4: advance split forward past any ToolResult at the boundary to
+        // avoid orphaned results (a ToolResult with no preceding Assistant call).
+        while split < self.messages.len()
+            && matches!(self.messages[split], SessionMessage::ToolResult { .. })
+        {
+            split += 1;
+        }
         if split < 2 {
             return Ok(String::new());
         }
         let older = self.messages.drain(..split).collect::<Vec<_>>();
+
+        // Gap 5: three-stage compaction fallback.
+        // Stage 0: normal summarization of the older messages.
+        // Stage 1: clamp ToolResult content to 5 K and retry.
+        // Stage 2: keep only head+tail (30%/30%) of older and clamp.
+        let summary = match self.try_summarize(older.clone()).await {
+            Ok(s) => Ok(s),
+            Err(_) => {
+                let mut clamped = older.clone();
+                clamp_tool_results(&mut clamped, 5_000);
+                match self.try_summarize(clamped).await {
+                    Ok(s) => Ok(s),
+                    Err(_) => {
+                        let head = older.len() * 3 / 10;
+                        let tail = older.len() * 3 / 10;
+                        let tail_start = older.len().saturating_sub(tail);
+                        let mut reduced: Vec<SessionMessage> = older[..head]
+                            .iter()
+                            .chain(&older[tail_start..])
+                            .cloned()
+                            .collect();
+                        clamp_tool_results(&mut reduced, 5_000);
+                        self.try_summarize(reduced).await
+                    }
+                }
+            }
+        };
+
+        match summary {
+            Ok(text) if !text.trim().is_empty() => {
+                self.messages.insert(0, SessionMessage::Summary { text: text.clone() });
+                self.emit(&AgentEvent::Compacted {
+                    summary: text.clone(),
+                    messages_removed: split,
+                });
+                Ok(text)
+            }
+            Ok(_) => {
+                self.messages.splice(0..0, older);
+                Ok(String::new())
+            }
+            Err(error) => {
+                self.messages.splice(0..0, older);
+                Err(error)
+            }
+        }
+    }
+
+    /// Run one summarization attempt against `messages`. Returns the summary
+    /// text or the first API error; does NOT touch `self.messages`.
+    async fn try_summarize(&self, messages: Vec<SessionMessage>) -> Result<String, AiError> {
         let mut summary_messages: Vec<agent_m_ai::LlmMessage> =
-            older.iter().map(SessionMessage::to_llm_message).collect();
+            messages.iter().map(SessionMessage::to_llm_message).collect();
         summary_messages.push(agent_m_ai::LlmMessage::User {
             content: SUMMARY_PROMPT.to_string(),
             images: Vec::new(),
@@ -352,22 +434,13 @@ impl Agent {
             temperature: None,
             variant: self.options.variant.clone(),
         };
-        let stream = match self.provider.stream_chat(request).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                // Restore the removed messages; compaction failed safely.
-                self.messages.splice(0..0, older);
-                return Err(error);
-            }
-        };
+        let stream = self.provider.stream_chat(request).await?;
         futures_util::pin_mut!(stream);
         let mut summary = String::new();
         let mut failed = false;
         while let Some(event) = stream.next().await {
             match event {
                 StreamEvent::TextDelta { delta } => summary.push_str(&delta),
-                // A mid-stream error leaves a truncated summary; restore the
-                // removed messages and report failure.
                 StreamEvent::Error { .. } => {
                     failed = true;
                     break;
@@ -375,20 +448,9 @@ impl Agent {
                 _ => {}
             }
         }
-        if failed || summary.trim().is_empty() {
-            self.messages.splice(0..0, older);
-            return Ok(String::new());
+        if failed {
+            return Err(AiError::Api("stream error during compaction".into()));
         }
-        self.messages.insert(
-            0,
-            SessionMessage::Summary {
-                text: summary.clone(),
-            },
-        );
-        self.emit(&AgentEvent::Compacted {
-            summary: summary.clone(),
-            messages_removed: split,
-        });
         Ok(summary)
     }
 
@@ -408,7 +470,12 @@ impl Agent {
         text: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + '_>>
     {
-        Box::pin(async move { self.prompt_inner(text).await })
+        let span = tracing::info_span!(
+            "agent.prompt",
+            model = %self.options.model,
+            mode = %self.options.mode.as_str(),
+        );
+        Box::pin(async move { self.prompt_inner(text).await }.instrument(span))
     }
 
     /// Like `prompt`, with image attachments (data URIs) for vision models.
@@ -464,14 +531,33 @@ impl Agent {
             if turn >= self.options.max_turns {
                 self.emit(&AgentEvent::Notice {
                     message: format!(
-                        "max turns ({}) reached; ending the run",
+                        "agent-m has been working on this problem for a while ({} turns). \
+                         It can continue to iterate, or you can send a new message to refine your prompt.",
                         self.options.max_turns
                     ),
                 });
-                break;
+                let should_continue = if let Some(gate) = &self.options.ask_gate {
+                    matches!(
+                        gate.ask(
+                            "Continue for more turns?".into(),
+                            Some(vec!["yes".into(), "no".into()]),
+                            false,
+                        )
+                        .await,
+                        Ok(ref ans) if ans.trim().eq_ignore_ascii_case("yes")
+                    )
+                } else {
+                    false
+                };
+                if should_continue {
+                    self.options.max_turns += 20;
+                } else {
+                    break;
+                }
             }
             turn += 1;
             self.emit(&AgentEvent::TurnStart { turn });
+            tracing::info!(turn, model = %self.options.model, "turn_start");
 
             let request = ChatRequest {
                 model: self.options.model.clone(),
@@ -626,6 +712,13 @@ impl Agent {
             if let Some(usage) = &usage {
                 self.cache_stats.record(usage);
                 self.last_input_tokens = usage.input_tokens;
+                tracing::info!(
+                    turn,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    cache_hit_tokens = usage.cache_read_tokens,
+                    "turn_end"
+                );
             }
 
             if stop_reason == StopReason::Aborted {
@@ -662,7 +755,14 @@ impl Agent {
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
                     });
-                    let outcome = self.run_tool(&call).await;
+                    let outcome = self
+                        .run_tool(&call)
+                        .instrument(tracing::info_span!(
+                            "agent.tool",
+                            tool.name = %call.name,
+                            tool.call_id = %call.tool_call_id,
+                        ))
+                        .await;
                     tool_results += 1;
                     self.emit(&AgentEvent::ToolExecutionEnd {
                         tool_call_id: call.tool_call_id.clone(),
@@ -805,6 +905,8 @@ impl Agent {
                 let context = ToolContext {
                     cwd: self.options.cwd.clone(),
                     ask_gate: self.options.ask_gate.clone(),
+                    output_dir: self.options.output_dir.clone(),
+                    read_cache: self.read_cache.clone(),
                 };
                 match tool.execute(call.arguments.clone(), &context).await {
                     Ok(outcome) => outcome,

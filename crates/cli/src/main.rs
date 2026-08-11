@@ -30,7 +30,6 @@ You have access to tools (bash, read, write, edit, grep, find, ls) for working w
 user's codebase. Be concise and precise. Use tools when they help; do not invent file \
 contents.";
 
-const MAX_TURNS: usize = 20;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-m", version, about)]
@@ -112,6 +111,10 @@ struct Cli {
     /// Serve a stdio JSON-RPC prompt/respond loop (headless embedding).
     #[arg(long = "serve")]
     serve: bool,
+
+    /// Max agent turns per message (default 20). Raise for long tasks.
+    #[arg(long = "max-turns", default_value_t = 20)]
+    max_turns: usize,
 
     /// Autonomy level 0-4 (check.md principle 12): 0 observe · 1 suggest ·
     /// 2 assisted (everything asks) · 3 trusted (default; auto low/medium,
@@ -277,7 +280,7 @@ fn non_interactive_gate(yes: bool, risk: Arc<RiskPolicy>) -> Arc<dyn PermissionG
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing();
+    let _otel = init_tracing(); // dropped at end of main → flushes batch exporter
 
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     let agent_dir = cli.session_dir.clone().unwrap_or_else(default_agent_dir);
@@ -312,7 +315,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "deepseek".to_string());
     let provider: Arc<dyn Provider> =
         if let Some(config) = configured.iter().find(|config| config.id == provider_id) {
-            Arc::new(agent_m_ai::provider_from_config(
+            Arc::from(agent_m_ai::provider_from_config(
                 config,
                 cli.api_key.clone(),
                 &agent_dir,
@@ -478,7 +481,7 @@ async fn main() -> Result<()> {
         model: model.clone(),
         system_prompt,
         tools,
-        max_turns: MAX_TURNS,
+        max_turns: cli.max_turns,
         cwd: cwd.clone(),
         mode: if cli.mode_plan {
             agent_m_agent::Mode::Plan
@@ -492,6 +495,7 @@ async fn main() -> Result<()> {
             .find(|m| m.id == model)
             .and_then(|m| m.context_window),
         variant: None,
+        output_dir: Some(agent_dir.join("tool_outputs")),
     };
 
     if let Some(flow_path) = &cli.flow {
@@ -792,10 +796,60 @@ async fn run_print(
     Ok(())
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+/// Initialise the tracing subscriber. When `OTEL_EXPORTER_OTLP_ENDPOINT` is
+/// set, a `tracing-opentelemetry` layer is added that exports spans via OTLP/HTTP
+/// (proto) using the already-present reqwest client. The returned guard flushes
+/// the batch exporter on drop, covering every exit path from `main`.
+fn init_tracing() -> OtelGuard {
+    use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agent_m=info,warn"));
+    let fmt = tracing_subscriber::fmt::layer().with_target(false);
+
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok()
+        && let Ok(provider) = build_otlp_provider()
+    {
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "agent-m");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt)
+            .with(otel_layer)
+            .try_init();
+        return OtelGuard(Some(provider));
+    }
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt)
+        .try_init();
+    OtelGuard(None)
+}
+
+/// Flushes the OTLP batch exporter on drop, covering every exit path.
+struct OtelGuard(Option<opentelemetry_sdk::trace::TracerProvider>);
+impl Drop for OtelGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.0.take() {
+            let _ = opentelemetry_sdk::trace::TracerProvider::shutdown(&provider);
+        }
+    }
+}
+
+fn build_otlp_provider()
+-> Result<opentelemetry_sdk::trace::TracerProvider, Box<dyn std::error::Error + Send + Sync>> {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()?;
+    let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+        "service.name",
+        "agent-m",
+    )]);
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(resource)
+        .build();
+    Ok(provider)
 }
 
 /// Map an agent event to a stable JSON shape for `--stream-json` and

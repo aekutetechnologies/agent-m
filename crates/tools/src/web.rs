@@ -432,10 +432,7 @@ mod tests {
 
     #[test]
     fn web_fetch_refuses_non_http_urls() {
-        let context = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            ask_gate: None,
-        };
+        let context = ToolContext::simple(std::path::PathBuf::from("."));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let outcome = runtime
             .block_on(WebFetchTool.execute(json!({ "url": "file:///etc/passwd" }), &context))
@@ -451,10 +448,7 @@ mod tests {
             // Rust 2024: env mutation is unsafe.
             unsafe { std::env::remove_var("AGENT_M_SEARCH_URL") };
         }
-        let context = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            ask_gate: None,
-        };
+        let context = ToolContext::simple(std::path::PathBuf::from("."));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let outcome = runtime
             .block_on(WebSearchTool.execute(json!({ "query": "rust mcp" }), &context))

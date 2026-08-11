@@ -6,10 +6,7 @@ use agent_m_mcp::{McpClient, connect_tools};
 use serde_json::json;
 
 fn tool_context() -> ToolContext {
-    ToolContext {
-        cwd: std::path::PathBuf::from("."),
-        ask_gate: None,
-    }
+    ToolContext::simple(std::path::PathBuf::from("."))
 }
 
 /// A tiny stdio MCP server written in Python: answers `initialize` with the
