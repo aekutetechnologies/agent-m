@@ -73,9 +73,9 @@ impl Tool for ReadTool {
         if let Some(mtime) = mtime {
             let cache = context.read_cache.lock().unwrap();
             if cache.get(&cache_key).is_some_and(|cached| *cached == mtime) {
-                return Ok(ToolOutcome::success(format!(
-                    "(file unchanged since last read — use read again with offset/limit to re-fetch)"
-                )));
+                return Ok(ToolOutcome::success(
+                    "(file unchanged since last read — use read again with offset/limit to re-fetch)".to_string(),
+                ));
             }
         }
 

@@ -26,6 +26,7 @@ Add a `providers` array to `~/.agent-m/agent/settings.json`:
 |-------|---------|---------|
 | `id` | `[a-z0-9-_]`; used by `--provider` and the key env `<ID>_API_KEY` | — |
 | `name` | display name in the TUI list | `id` |
+| `type` | `anthropic` → native [Anthropic provider](/extending/anthropic); omitted/`openai` → OpenAI-compatible | OpenAI-compatible |
 | `baseUrl` | no trailing `/chat/completions` | — |
 | `model` | model id sent on the wire | — |
 | `reasoning` | thinking deltas | `false` |
@@ -44,6 +45,11 @@ fallback.
 
 Keys are **never stored in the config** — the `apiKeyEnv` names where they
 live, resolved through env → `auth.json` → `settings.json`.
+
+Anthropic (native Messages API) is configured the same way with
+`"type": "anthropic"` — see [Anthropic](/extending/anthropic). The
+`/provider` wizard writes OpenAI-compatible entries; edit `settings.json`
+directly for an Anthropic provider.
 
 ## TUI wizard: `/provider`
 

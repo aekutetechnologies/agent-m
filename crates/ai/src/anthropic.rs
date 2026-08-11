@@ -224,11 +224,16 @@ fn wire_message(message: &LlmMessage, cache_mark: bool) -> Value {
             }
             let mut message = json!({ "role": "user", "content": parts });
             if cache_mark {
-                // Mark the last content block for caching.
-                if let Some(parts) = message["content"].as_array_mut()
-                    && let Some(last) = parts.last_mut()
-                {
-                    last["cache_control"] = json!({ "type": "ephemeral" });
+                // Mark the last *text* block for caching — Anthropic forbids
+                // cache_control breakpoints on image blocks (HTTP 400), so
+                // walk back to the last text block when images are present.
+                if let Some(parts) = message["content"].as_array_mut() {
+                    let mark_index = parts
+                        .iter()
+                        .rposition(|part| part.get("type") != Some(&json!("image")));
+                    if let Some(index) = mark_index {
+                        parts[index]["cache_control"] = json!({ "type": "ephemeral" });
+                    }
                 }
             }
             message
@@ -573,10 +578,24 @@ impl<S> SseParser<S> {
                         !self.state.tool_calls.is_empty(),
                     ));
                 }
+                // Anthropic sends input/cache tokens in `message_start` and
+                // only `output_tokens` in `message_delta` — merge, never
+                // overwrite, or the final usage loses the input side
+                // (review: usage accounting bug).
                 if let Some(message) = event.message
                     && let Some(usage) = message.usage
                 {
-                    self.state.usage = Some(usage.into_usage());
+                    let delta_usage = usage.into_usage();
+                    match &mut self.state.usage {
+                        Some(existing) => {
+                            existing.output_tokens = delta_usage.output_tokens;
+                            existing.total_tokens = existing.input_tokens
+                                + existing.cache_read_tokens
+                                + existing.cache_creation_tokens
+                                + existing.output_tokens;
+                        }
+                        None => self.state.usage = Some(delta_usage),
+                    }
                 }
             }
             "message_stop" => {

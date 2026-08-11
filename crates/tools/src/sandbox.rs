@@ -64,6 +64,13 @@ fn macos_sandbox_exec(cwd: &Path, shell: &str, command: &str) -> Option<tokio::p
     let real_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let cwd_str = real_cwd.to_string_lossy();
 
+    // A `"`, `\` or newline in the path would break the SBPL profile string
+    // (fail-closed: sandbox-exec fails to spawn — but reject explicitly so
+    // the caller gets a clear error instead of silently no sandbox).
+    if cwd_str.contains(['"', '\\', '\n']) {
+        return None;
+    }
+
     // SBPL: most-specific subpath match wins, so the .git deny overrides the
     // parent cwd allow even though it appears after it.
     let profile = format!(

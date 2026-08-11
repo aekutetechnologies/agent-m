@@ -31,6 +31,8 @@ there is no interactive approval in print mode.
 | `--mode-plan` | Start in plan mode (read-only; the model produces a numbered plan) |
 | `--compact-threshold <F>` | Auto-compact fraction of the context window (default `0.5`) |
 | `--flow <PATH>` | Run a YAML flow in print mode |
+| `--stream-json` | Print mode: emit machine-readable JSON event lines (`agent_start`, `message_*`, `tool_execution_*`, …) instead of plain text |
+| `--serve` | Headless stdio server: LSP-framed JSON-RPC (`prompt`, `exit`) streaming agent events — see [Headless](/extending/headless) |
 | `--level <0-4>` | Autonomy level: 0 observe · 1 suggest · 2 assisted · 3 trusted (default) · 4 autonomous |
 | `--allow-path <PATH>` | Extra directory the file tools may access (repeatable) |
 | `-v`, `--version` | Print the version |

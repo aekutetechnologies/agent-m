@@ -309,10 +309,9 @@ async fn read_on_directory_points_at_ls() {
 
 #[tokio::test]
 async fn ask_returns_answer_via_gate_and_errors_without() {
-    let gate: Arc<dyn agent_m_agent::AskGate> =
-        Arc::new(agent_m_agent::ClosureAskGate::new(|_question, _options, _multi| {
-            Box::pin(async { Ok("yes".to_string()) })
-        }));
+    let gate: Arc<dyn agent_m_agent::AskGate> = Arc::new(agent_m_agent::ClosureAskGate::new(
+        |_question, _options, _multi| Box::pin(async { Ok("yes".to_string()) }),
+    ));
     let mut with_gate = ToolContext::simple(PathBuf::from("."));
     with_gate.ask_gate = Some(gate);
     let result = AskTool

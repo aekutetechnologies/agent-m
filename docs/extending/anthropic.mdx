@@ -1,0 +1,70 @@
+---
+title: Anthropic
+---
+
+# Anthropic provider (native Messages API)
+
+agent-m ships a native Anthropic client that speaks the Messages API
+directly — it does **not** go through the OpenAI-compatible adapter. Enable it
+by adding `"type": "anthropic"` to a provider entry in
+`~/.agent-m/agent/settings.json`:
+
+```json
+{ "providers": [
+  { "id": "anthropic", "name": "Anthropic", "type": "anthropic",
+    "baseUrl": "https://api.anthropic.com/v1", "model": "claude-sonnet-5",
+    "reasoning": true, "apiKeyEnv": "ANTHROPIC_API_KEY" }
+]}
+```
+
+The key resolves like any other provider (env → `auth.json` → `settings.json`),
+defaulting to the `<ID>_API_KEY` env var — set `ANTHROPIC_API_KEY` (or add an
+`anthropic` entry to `auth.json`).
+
+## Why a native provider
+
+The Anthropic wire format differs from OpenAI-compatible endpoints in ways
+the generic adapter cannot express:
+
+- `system` is a **top-level field**, not a `system` role message.
+- Tool definitions use `input_schema` (not `parameters`).
+- Prefix caching is explicit: `cache_control: { "type": "ephemeral" }`
+  breakpoints mark which blocks stay cached between requests.
+- SSE events are `content_block_start` / `content_block_delta` /
+  `content_block_stop` / `message_delta` (not `choices[].delta`).
+- Thinking arrives as `type: "thinking"` content blocks and maps to
+  `ContentPart::Thinking` (the TUI's thinking toggle).
+
+## Prefix caching
+
+The provider marks the system prompt and the last text block of user turns
+with `cache_control: { "type": "ephemeral" }`, so repeated turns hit the
+provider's prefix cache (`cache_read_input_tokens` / `cache_creation_input_tokens`
+are parsed into the session usage and the sidebar's cache-read %). Cache
+creation is billed at 1.25× input on Anthropic's pricing.
+
+## Models & thinking budgets
+
+See [Models reference](/MODELS) for the full Anthropic model table
+(claude-opus-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5, …),
+context windows, and pricing. For models with a `thinking_toggle`, the
+variant selector (`ctrl+v`) maps to the thinking budget:
+
+| Variant | `budget_tokens` |
+|---|---|
+| `low` | 1 024 |
+| `high` | 16 384 |
+| `max` | 64 000 |
+
+`default` sends no `thinking` field (provider default budget).
+
+## Notes & limits
+
+- Config entries without `"type"` (or with `"openai"`) use the
+  OpenAI-compatible adapter — the existing `/provider` wizard writes that
+  shape, so Anthropic is configured by editing `settings.json` directly.
+- Anthropic forbids `cache_control` breakpoints on image blocks; the provider
+  marks the last **text** block of a turn instead.
+- Usage accounting merges `message_start` (input/cache tokens) with
+  `message_delta` (output tokens) — the session totals stay accurate across
+  multi-turn conversations.

@@ -66,13 +66,21 @@ const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation 
 /// Truncate `ToolResult` content in `messages` to `max_chars` in-place.
 /// Used as a pre-step before retrying a compaction summarization that failed
 /// because the old messages were too large.
-fn clamp_tool_results(messages: &mut Vec<SessionMessage>, max_chars: usize) {
+fn clamp_tool_results(messages: &mut [SessionMessage], max_chars: usize) {
     for msg in messages.iter_mut() {
-        if let SessionMessage::ToolResult { content, .. } = msg {
-            if content.len() > max_chars {
-                content.truncate(max_chars);
-                content.push_str("\n…[clamped for compaction]");
+        if let SessionMessage::ToolResult { content, .. } = msg
+            && content.len() > max_chars
+        {
+            // String::truncate takes a *byte* index and panics if it lands
+            // inside a multi-byte UTF-8 char — walk back to a char boundary
+            // (review: compaction-failure recovery must never crash the
+            // agent on non-ASCII tool output).
+            let mut boundary = max_chars;
+            while !content.is_char_boundary(boundary) {
+                boundary -= 1;
             }
+            content.truncate(boundary);
+            content.push_str("\n…[clamped for compaction]");
         }
     }
 }
@@ -231,9 +239,9 @@ impl Agent {
             interrupted: Arc::new(AtomicBool::new(false)),
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             last_input_tokens: 0,
-            read_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            read_cache: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
         }
     }
 
@@ -399,7 +407,8 @@ impl Agent {
 
         match summary {
             Ok(text) if !text.trim().is_empty() => {
-                self.messages.insert(0, SessionMessage::Summary { text: text.clone() });
+                self.messages
+                    .insert(0, SessionMessage::Summary { text: text.clone() });
                 self.emit(&AgentEvent::Compacted {
                     summary: text.clone(),
                     messages_removed: split,
@@ -420,8 +429,10 @@ impl Agent {
     /// Run one summarization attempt against `messages`. Returns the summary
     /// text or the first API error; does NOT touch `self.messages`.
     async fn try_summarize(&self, messages: Vec<SessionMessage>) -> Result<String, AiError> {
-        let mut summary_messages: Vec<agent_m_ai::LlmMessage> =
-            messages.iter().map(SessionMessage::to_llm_message).collect();
+        let mut summary_messages: Vec<agent_m_ai::LlmMessage> = messages
+            .iter()
+            .map(SessionMessage::to_llm_message)
+            .collect();
         summary_messages.push(agent_m_ai::LlmMessage::User {
             content: SUMMARY_PROMPT.to_string(),
             images: Vec::new(),
@@ -913,6 +924,47 @@ impl Agent {
                     Err(error) => ToolOutcome::error(error.to_string()),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    fn tool_result(content: &str) -> SessionMessage {
+        SessionMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            name: "bash".to_string(),
+            content: content.to_string(),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn clamp_tool_results_truncates_on_char_boundary() {
+        // 5000-byte boundary lands inside a 3-byte UTF-8 char (é = 0xC3 0xA9):
+        // a byte-truncate would panic; the char-boundary walk must not.
+        let mut content = "é".repeat(2500); // 5000 bytes exactly
+        content.push_str("trailing");
+        let mut messages = vec![tool_result(&content)];
+        clamp_tool_results(&mut messages, 5000);
+        let clamped = match &messages[0] {
+            SessionMessage::ToolResult { content, .. } => content,
+            _ => unreachable!(),
+        };
+        assert!(clamped.is_char_boundary(5000) || clamped.len() <= 5000);
+        assert!(clamped.ends_with("[clamped for compaction]"));
+        assert!(clamped.starts_with("éé"));
+    }
+
+    #[test]
+    fn clamp_tool_results_leaves_short_output_untouched() {
+        let mut messages = vec![tool_result("short")];
+        clamp_tool_results(&mut messages, 5000);
+        match &messages[0] {
+            SessionMessage::ToolResult { content, .. } => assert_eq!(content, "short"),
+            _ => unreachable!(),
         }
     }
 }

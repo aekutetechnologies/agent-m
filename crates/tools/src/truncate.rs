@@ -39,8 +39,7 @@ pub fn truncate_output(content: &str) -> (String, Option<String>) {
 }
 
 /// Monotonic counter for unique offload filenames within a process lifetime.
-static OFFLOAD_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static OFFLOAD_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Threshold above which tool output is offloaded to disk (10 KB).
 const OFFLOAD_THRESHOLD: usize = 10 * 1024;
@@ -63,18 +62,18 @@ pub fn offload_or_truncate(content: &str, tool_prefix: &str, output_dir: Option<
             None => kept,
         };
     }
-    if let Some(dir) = output_dir {
-        if std::fs::create_dir_all(dir).is_ok() {
-            let path = dir.join(filename);
-            if std::fs::write(&path, content).is_ok() {
-                let preview: String = content.chars().take(INLINE_PREVIEW_BYTES).collect();
-                return format!(
-                    "{preview}\n…\n[Output truncated. Full {} bytes saved to {}.\nUse: read path=\"{}\" to inspect it.]",
-                    content.len(),
-                    path.display(),
-                    path.display(),
-                );
-            }
+    if let Some(dir) = output_dir
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let path = dir.join(filename);
+        if std::fs::write(&path, content).is_ok() {
+            let preview: String = content.chars().take(INLINE_PREVIEW_BYTES).collect();
+            return format!(
+                "{preview}\n…\n[Output truncated. Full {} bytes saved to {}.\nUse: read path=\"{}\" to inspect it.]",
+                content.len(),
+                path.display(),
+                path.display(),
+            );
         }
     }
     // Fallback: plain truncation (output_dir absent or write failed).

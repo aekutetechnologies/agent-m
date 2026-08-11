@@ -233,9 +233,9 @@ const BAR_CELLS: usize = 20;
 const SIDEBAR_MIN_WIDTH: u16 = 110;
 
 type AskRequest = (
-    String,                                    // question
-    Option<Vec<String>>,                       // options
-    bool,                                      // multi_select
+    String,              // question
+    Option<Vec<String>>, // options
+    bool,                // multi_select
     oneshot::Sender<Result<String, String>>,
 );
 
@@ -948,8 +948,7 @@ impl App {
             if has_options {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.ask_picker_index =
-                            self.ask_picker_index.saturating_sub(1);
+                        self.ask_picker_index = self.ask_picker_index.saturating_sub(1);
                         return;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -974,24 +973,20 @@ impl App {
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() && !is_multi => {
                         let n = (c as usize).wrapping_sub('1' as usize);
-                        if let Some((_, Some(opts), _, _)) = &self.pending_ask {
-                            if n < opts.len() {
-                                let answer = opts[n].clone();
-                                if let Some((_, _, _, response)) =
-                                    self.pending_ask.take()
-                                {
-                                    let _ = response.send(Ok(answer));
-                                }
-                                self.ask_picker_index = 0;
+                        if let Some((_, Some(opts), _, _)) = &self.pending_ask
+                            && n < opts.len()
+                        {
+                            let answer = opts[n].clone();
+                            if let Some((_, _, _, response)) = self.pending_ask.take() {
+                                let _ = response.send(Ok(answer));
                             }
+                            self.ask_picker_index = 0;
                         }
                         return;
                     }
                     KeyCode::Enter => {
                         if is_multi {
-                            if let Some((_, Some(opts), _, response)) =
-                                self.pending_ask.take()
-                            {
+                            if let Some((_, Some(opts), _, response)) = self.pending_ask.take() {
                                 let answer = self
                                     .ask_picker_selected
                                     .iter()
@@ -1003,13 +998,9 @@ impl App {
                                 self.ask_picker_selected.clear();
                                 self.ask_picker_index = 0;
                             }
-                        } else if let Some((_, Some(opts), _, response)) =
-                            self.pending_ask.take()
-                        {
-                            let answer = opts
-                                .get(self.ask_picker_index)
-                                .cloned()
-                                .unwrap_or_default();
+                        } else if let Some((_, Some(opts), _, response)) = self.pending_ask.take() {
+                            let answer =
+                                opts.get(self.ask_picker_index).cloned().unwrap_or_default();
                             let _ = response.send(Ok(answer));
                             self.ask_picker_index = 0;
                         }
@@ -3418,8 +3409,8 @@ impl App {
                 hint,
                 Style::default().fg(self.theme.muted),
             )));
-            let width = (options.iter().map(|o| o.len()).max().unwrap_or(20) + 14)
-                .clamp(44, 72) as u16;
+            let width =
+                (options.iter().map(|o| o.len()).max().unwrap_or(20) + 14).clamp(44, 72) as u16;
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" ❓ {} ", question))

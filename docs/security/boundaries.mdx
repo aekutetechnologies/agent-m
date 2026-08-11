@@ -37,10 +37,36 @@ even inside the workspace. But `bash` can access anything you can, and untrusted
 plugin tools are always flagged for approval.
 
 **Honest ceiling:** an OS sandbox (`sandbox-exec` / `bubblewrap` / container)
-around the `bash` tool is the real upgrade path. Until then, agent-m is safe
-for work on codebases you trust, not for untrusted repos or adversarial
-prompts — prompt injection (hidden instructions in file contents the agent
-reads) reaches the tool loop.
+around the `bash` tool is the real upgrade path. It's now **opt-in** — set
+`AGENT_M_SANDBOX=1` and the `bash` tool runs inside a kernel-enforced
+sandbox (next section). Until you enable it, agent-m is safe for work on
+codebases you trust, not for untrusted repos or adversarial prompts — prompt
+injection (hidden instructions in file contents the agent reads) reaches the
+tool loop.
+
+## 4. OS-level sandbox for bash (opt-in: `AGENT_M_SANDBOX=1`)
+
+Set `AGENT_M_SANDBOX=1` to run every `bash` tool invocation inside an
+OS-enforced sandbox:
+
+- **macOS** — `sandbox-exec` with a Seatbelt (SBPL) profile: denies all
+  `file-write*` operations, then re-allows writes under `/private/tmp`,
+  `/var/folders`, and the canonical project cwd — and re-denies `cwd/.git`
+  (so hooks and refs stay protected).
+- **Linux** — Landlock (kernel ≥ 5.13) via the `pre_exec` hook, falling back
+  to `bwrap` (bubblewrap) when unsupported.
+
+What it does and doesn't cover:
+
+| Enforced | Not covered |
+|---|---|
+| Filesystem **writes** outside cwd/tmp (kernel) | Reads (the agent needs them) |
+| Writes into `cwd/.git` (macOS) | Network egress |
+| A cwd with `"`/`\`/newline fails closed with a clear error | `.git` write protection on Linux (Landlock/bwrap profiles) |
+
+Sandboxing is defense-in-depth against a *cooperative* model making a
+destructive mistake — it is not a security boundary against adversarial
+prompts (reads, network, and the host environment remain available).
 
 ## Guardrails
 

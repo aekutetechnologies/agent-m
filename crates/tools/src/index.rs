@@ -451,6 +451,10 @@ fn tree_sitter_symbols(
     hits
 }
 
+/// Hard cap on the identifier set extracted from a single file, so a huge
+/// generated file can't balloon the index.
+const MAX_IDENTIFIERS: usize = 2000;
+
 /// Deduplicated identifier tokens (camelCase/snake_case words) from the file.
 pub fn extract_identifiers(text: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
@@ -459,9 +463,17 @@ pub fn extract_identifiers(text: &str) -> Vec<String> {
             continue;
         }
         for token in split_identifier(word) {
-            if token.len() >= 3 && seen.insert(token.clone()) && seen.len() > 2000 {
-                break;
+            if token.len() >= 3 {
+                seen.insert(token.clone());
             }
+            // Hard cap on the identifier set (review: the old `break` only
+            // exited the inner loop, so the set kept growing unbounded).
+            if seen.len() >= MAX_IDENTIFIERS {
+                return seen.into_iter().collect();
+            }
+        }
+        if seen.len() >= MAX_IDENTIFIERS {
+            return seen.into_iter().collect();
         }
     }
     seen.into_iter().collect()

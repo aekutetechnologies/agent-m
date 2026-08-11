@@ -30,7 +30,6 @@ You have access to tools (bash, read, write, edit, grep, find, ls) for working w
 user's codebase. Be concise and precise. Use tools when they help; do not invent file \
 contents.";
 
-
 #[derive(Debug, Parser)]
 #[command(name = "agent-m", version, about)]
 struct Cli {

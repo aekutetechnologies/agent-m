@@ -29,7 +29,9 @@ def walk(items, group=""):
         if isinstance(item, dict):
             walk(item.get("pages", []), item.get("group", group))
         elif isinstance(item, str):
-            if not os.path.exists(f"docs/{item}.mdx"):
+            if not (
+                os.path.exists(f"docs/{item}.mdx") or os.path.exists(f"docs/{item}.md")
+            ):
                 missing.append(item)
 for group in nav:
     walk([group])
@@ -39,7 +41,7 @@ if [ $? -ne 0 ]; then
     echo "FAIL: navigation references pages that do not exist (see above)"
     FAIL=1
 else
-    echo "ok: every navigation path resolves to docs/<path>.mdx"
+    echo "ok: every navigation path resolves to docs/<path>.mdx (or .md)"
 fi
 
 # 3) internal markdown links (](/path) must resolve to docs/<path>.mdx.

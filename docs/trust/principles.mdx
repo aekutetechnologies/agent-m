@@ -18,7 +18,7 @@ the harness *enforces* (risk tiers, autonomy levels, approvals, audit).
 | 5 | Risk-based permissions | Four harness-assigned tiers — Low / Medium / High / Critical — enforced by `RiskPolicy` + `TierGate`/`LevelGate` |
 | 6 | Meaningful interruptions | Consequence framing ("This can destroy data…") + tier badges (⚠️ HIGH / 🔴 CRITICAL). High and Critical always ask — even under `--yes` |
 | 7 | Complete audit trail | Every session entry is timestamped; `/journal` renders the narrated timeline (time, action, outcome) |
-| 8 | Reversible actions | `/undo` restores `write`/`edit` before-snapshots; the undo ledger persists per session |
+| 8 | Reversible actions | `/undo` restores `write`/`edit` before-snapshots; the undo ledger persists per session. Repo-level rollback: `/checkpoint` snapshots the git state (a stash-free snapshot that touches neither index nor branch) before mutating tools run; `/restore <n\|sha>` rolls the working tree back |
 | 9 | Evidence-driven conclusions | `<evidence>` items render as `file:line — note` citations |
 | 10 | Honest uncertainty | `<uncertainty>` notes are shown in the decision block |
 | 11 | Learn user preferences | Learns `!command` families + `/undo` signals → `preferences.json` → a static "Known preferences" system-prompt block |
