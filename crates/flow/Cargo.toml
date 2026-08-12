@@ -8,7 +8,6 @@ description = "Devin-style flow engine: YAML-defined step pipelines for agent-m"
 [dependencies]
 agent-m-agent = { path = "../agent" }
 agent-m-ai = { path = "../ai" }
-agent-m-tools = { path = "../tools" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
@@ -16,7 +15,6 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

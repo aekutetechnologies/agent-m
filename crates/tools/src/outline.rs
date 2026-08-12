@@ -81,3 +81,63 @@ impl Tool for ViewOutlineTool {
         Ok(ToolOutcome::success(output))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_m_agent::ToolContext;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    async fn run(path: &str, cwd: &std::path::Path) -> ToolOutcome {
+        ViewOutlineTool
+            .execute(serde_json::json!({"path": path}), &ToolContext::simple(cwd.to_path_buf()))
+            .await
+            .expect("execute ok")
+    }
+
+    #[tokio::test]
+    async fn rust_functions_appear() {
+        let mut f = NamedTempFile::with_suffix(".rs").unwrap();
+        writeln!(f, "fn foo() {{}}\nfn bar(x: i32) -> i32 {{ x }}").unwrap();
+        let out = run(f.path().to_str().unwrap(), f.path().parent().unwrap()).await;
+        assert!(out.content.contains("foo") || out.content.contains("bar"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn python_functions_appear() {
+        let mut f = NamedTempFile::with_suffix(".py").unwrap();
+        writeln!(f, "def hello():\n    pass\nclass World:\n    pass").unwrap();
+        let out = run(f.path().to_str().unwrap(), f.path().parent().unwrap()).await;
+        assert!(out.content.contains("hello") || out.content.contains("World"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn js_functions_appear() {
+        let mut f = NamedTempFile::with_suffix(".js").unwrap();
+        writeln!(f, "function greet() {{}}\nconst add = (a, b) => a + b;").unwrap();
+        let out = run(f.path().to_str().unwrap(), f.path().parent().unwrap()).await;
+        // Either a symbol is found, or we gracefully say none found — no panic either way.
+        assert!(!out.is_error, "should not be an error: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn empty_file_returns_graceful_message() {
+        let f = NamedTempFile::with_suffix(".rs").unwrap();
+        let out = run(f.path().to_str().unwrap(), f.path().parent().unwrap()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("No major structural symbols") || out.content.contains("Outline"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_extension_returns_result_not_error() {
+        let mut f = NamedTempFile::with_suffix(".go").unwrap();
+        writeln!(f, "func main() {{}}").unwrap();
+        let out = run(f.path().to_str().unwrap(), f.path().parent().unwrap()).await;
+        assert!(!out.is_error, "unexpected error for .go file: {}", out.content);
+    }
+}

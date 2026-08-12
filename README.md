@@ -84,24 +84,22 @@ visible in `ps`).
 
 ## Install & run
 
-Requires Rust (stable) and a DeepSeek API key.
+```bash
+curl -LsSf https://raw.githubusercontent.com/aekutetechnologies/agent-m/main/install.sh | sh
+```
+
+Installs the latest pre-built binary to `~/.local/bin/agent-m`. No Rust required.
+
+**Build from source:**
 
 ```bash
 ./check.sh                          # fmt + clippy -D warnings + tests
 cargo build --release               # target/release/agent-m
-# or run from source:
-./agent-m.sh
 ```
 
 ### Use it from any folder (like `pi`)
 
-Install the release binary once, then `agent-m` works everywhere — it starts the
-chat in the folder you're in, and tools/sessions are scoped to that folder:
-
 ```bash
-cargo build --release
-cp target/release/agent-m ~/.cargo/bin/agent-m   # ~/.cargo/bin is on your PATH
-
 cd ~/some/project
 agent-m        # chat mode starts, scoped to ~/some/project
 ```

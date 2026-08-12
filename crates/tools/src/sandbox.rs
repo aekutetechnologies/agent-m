@@ -184,6 +184,44 @@ fn bubblewrap(cwd: &Path, shell: &str, command: &str) -> Option<tokio::process::
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_basic_execution_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENT_M_SANDBOX", "1") };
+        let mut cmd = sandboxed_command(tmp.path(), "sh", "echo hello");
+        unsafe { std::env::remove_var("AGENT_M_SANDBOX") };
+        let out = cmd.output().await.expect("command ran");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "SBPL explicitly allows /private/tmp; need a path outside all allowed roots to isolate sandbox denial from OS permission denial — run manually with a curated target path"]
+    async fn macos_write_outside_cwd_is_denied() {
+        // /etc is not in the SBPL allow list AND not writable without sudo, so
+        // non-zero exit is expected from either the sandbox or the OS.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = format!("/private/etc/agent-m-sandbox-deny-{}", std::process::id());
+        unsafe { std::env::set_var("AGENT_M_SANDBOX", "1") };
+        let mut cmd = sandboxed_command(tmp.path(), "sh", &format!("touch {target}"));
+        unsafe { std::env::remove_var("AGENT_M_SANDBOX") };
+        let out = cmd.output().await.expect("command ran");
+        assert!(!out.status.success(), "write outside cwd should be denied");
+    }
+
+    #[tokio::test]
+    async fn fallback_runs_without_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENT_M_SANDBOX", "0") };
+        let mut cmd = sandboxed_command(tmp.path(), "sh", "echo fallback");
+        unsafe { std::env::remove_var("AGENT_M_SANDBOX") };
+        let out = cmd.output().await.expect("command ran");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fallback");
+    }
+
     #[test]
     fn sandbox_flag_parsing() {
         // These run sequentially within the test binary; no parallel interference.

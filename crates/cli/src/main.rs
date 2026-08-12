@@ -30,9 +30,12 @@ mod plugins;
 mod repl;
 mod commands;
 mod gate;
-mod progress;
+mod toolout;
+mod ansi;
+mod section;
 mod daemon;
 mod attach;
+mod ask;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::io::{IsTerminal, Write};
@@ -281,6 +284,7 @@ fn non_interactive_gate(yes: bool, risk: Arc<RiskPolicy>) -> Arc<dyn PermissionG
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    crate::ansi::init_color();
     let _otel = init_tracing(); // dropped at end of main → flushes batch exporter
 
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
@@ -503,7 +507,7 @@ async fn main() -> Result<()> {
         } else {
             agent_m_agent::Mode::Build
         },
-        ask_gate: None,
+        ask_gate: Some(Arc::new(crate::ask::make_repl_ask_gate())),
         context_window: provider
             .models()
             .iter()

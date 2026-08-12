@@ -16,20 +16,14 @@ const FAKE_SERVER: &str = r#"
 import json, sys
 
 def send(obj):
-    body = json.dumps(obj).encode()
-    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    sys.stdout.buffer.write(json.dumps(obj).encode() + b"\n")
     sys.stdout.buffer.flush()
 
 def read_msg():
-    headers = {}
-    while True:
-        line = sys.stdin.buffer.readline()
-        if line in (b"\r\n", b"\n", b""):
-            break
-        key, _, value = line.decode().partition(":")
-        headers[key.strip().lower()] = value.strip()
-    length = int(headers.get("content-length", 0))
-    return json.loads(sys.stdin.buffer.read(length))
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    return json.loads(line)
 
 while True:
     try:

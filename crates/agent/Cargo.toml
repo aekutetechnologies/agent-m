@@ -7,17 +7,13 @@ description = "Agent loop, message/session types, and event stream"
 
 [dependencies]
 agent-m-ai = { path = "../ai" }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-dirs = { workspace = true }
 futures-util = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

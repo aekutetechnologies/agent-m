@@ -9,25 +9,25 @@ friendly — paste it, press **Enter**, wait.
 
 ## Step 1 — Install
 
-You need three things already on your computer (most Macs have them):
+You need one thing: **a terminal app** (macOS: "Terminal" or "iTerm").
 
-- **A terminal app** (macOS: "Terminal" or "iTerm").
-- **Rust's toolchain** — run this and follow the prompts:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-- **A code editor** (VS Code, Zed, or anything you like) — not strictly
-  required for this guide.
-
-Now build and install agent-m (this takes a few minutes the first time):
+Paste this and press **Enter** — it downloads the right binary for your machine:
 
 ```bash
-git clone https://github.com/your-org/agent-m.git   # or wherever you have it
-cd agent-m
-cargo build --release
+curl -LsSf https://raw.githubusercontent.com/aekutetechnologies/agent-m/main/install.sh | sh
 ```
+
+This puts `agent-m` in `~/.local/bin/`. No Rust required.
+
+**Build from source instead** (if you prefer):
+```bash
+cargo install --git https://github.com/aekutetechnologies/agent-m agent-m-cli
+```
+
+- **`command not found: agent-m` after install?** Add `~/.local/bin` to your PATH:
+  ```bash
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+  ```
 
 ## Step 2 — Give it an AI to talk to
 
@@ -97,8 +97,7 @@ state (see [Trust](/trust/principles)).
 
 ## Troubleshooting
 
-- **`command not found: agent-m`** — the install path isn't in your PATH. Run
-  `~/.cargo/bin/agent-m` instead, or add `~/.cargo/bin` to your PATH.
+- **`command not found: agent-m`** — run `~/.local/bin/agent-m` directly, or add `~/.local/bin` to your PATH. If you built from source, use `~/.cargo/bin` instead.
 - **`no API key for provider 'deepseek'`** — Step 2's `auth.json` didn't land.
   Re-run the `echo` command, then start agent-m again.
 - **It's slow on the first message** — the first request warms up the

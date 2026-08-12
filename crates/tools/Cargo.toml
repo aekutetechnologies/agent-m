@@ -7,7 +7,6 @@ description = "Built-in agent tools: bash, read, write, edit, grep, find, ls"
 
 [dependencies]
 agent-m-agent = { path = "../agent" }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
@@ -16,9 +15,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.23"
