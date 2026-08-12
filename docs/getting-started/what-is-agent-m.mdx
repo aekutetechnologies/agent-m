@@ -1,0 +1,54 @@
+---
+title: What is agent-m?
+---
+
+# What is agent-m?
+
+**agent-m is a helper that lives in your terminal and works on code with you.**
+
+Think of it as an extra pair of hands for programming. You type a question or
+a request — "what does this file do?", "add a login page", "why is this test
+failing?" — and agent-m:
+
+1. **Reads** your project's files,
+2. **Plans** what to do (and tells you its confidence),
+3. **Asks you first** before it changes anything or runs commands,
+4. **Shows its work** as it streams the answer, and
+5. **Remembers** the conversation so you can pick it up later.
+
+## The one-sentence pitch
+
+> A coding agent that lives in your terminal: talk to it, watch it read and
+> edit your code, approve what it wants to run, and pick the conversation back
+> up tomorrow.
+
+## Who is it for?
+
+- **Programmers** who want a faster way to explore, explain, and edit code.
+- **People learning to code** who want to ask "what does this do?" in plain
+  words and get a plain-words answer with the file open.
+- **Anyone tired of copy-pasting** between a chatbot and their editor.
+
+## What it is NOT
+
+- ❌ It does **not** replace you — you approve every risky action.
+- ❌ It is **not** in the cloud — it runs locally, reads your files locally,
+  and only talks to the AI provider you choose.
+- ❌ It is **not** magic — it is a tool that can make mistakes, which is why
+  it shows you what it's doing and lets you undo (more in
+  [Trust](/trust/principles)).
+
+## How it relates to other tools
+
+| Thing | What it is |
+|---|---|
+| **agent-m** | The program in this documentation — a coding agent in your terminal. |
+| An **AI model** | The brain. agent-m can talk to many (DeepSeek, OpenAI-compatible, Anthropic) and you can switch. |
+| An **editor** (VS Code, etc.) | Where *you* write code. agent-m works next to it — it edits files on disk, your editor shows the changes. |
+| A **chatbot website** | A chat without file access. agent-m adds the "read your code, edit your code, run your commands" part. |
+
+## Where to go next
+
+- [Install agent-m and have your first chat in 5 minutes](/getting-started/install)
+- [Plain-English concepts: model, provider, tokens, cache…](/getting-started/concepts)
+- [The full command reference](/cli/reference)

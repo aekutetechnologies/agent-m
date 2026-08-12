@@ -1,0 +1,70 @@
+---
+title: Self-improvement (/refine)
+---
+
+# Self-improvement: the Continual Harness
+
+agent-m keeps a small, durable layer of **memories, prompt notes, and skills**
+on top of its system prompt — the *harness state*. The model can propose
+improvements to it based on what it actually experienced in a session; you
+review and apply them. This is the "Continual Harness" idea (see
+[Prime Agent](https://www.primeintellect.ai/blog/prime-agent)): the harness
+adapts to what the agent learns, instead of being frozen at design time.
+
+## The three kinds of entries
+
+| Kind | What it's for | Example |
+|---|---|---|
+| `memory` | durable facts learned from the session | `flaky tests need three retries` |
+| `note` | instructions to follow | `always check the cache before assuming staleness` |
+| `skill` | reusable tactics | `prefer interactive rebase over merge` |
+
+State lives in **`~/.agent-m/harness.json`** alongside `preferences.json` (the
+observed signals — `!command` usage, `/undo` counts — stay separate and are
+never edited by the model).
+
+## How it works
+
+1. **`/refine [focus]`** — the planner (a one-shot, no-tools call to your
+   session's provider) reads the recent session trajectory + the current
+   harness state and proposes the *smallest* useful edit: create, update, or
+   delete an entry, with a one-line reason. An empty proposal is a valid
+   answer — nothing changes.
+2. **Review** — a panel lists every proposed op (`+ create memory …`, `~
+   update skill …`, `− delete note …`). **Enter applies, Esc dismisses.**
+   Nothing is ever applied without your confirmation.
+3. **Apply** — ops are written to `harness.json`, each recorded in the
+   `refine_log` audit trail, and the system-prompt block is rebuilt and pushed
+   to the running agent.
+
+**The base system prompt is immutable.** Only the harness block between it and
+the trust suffix changes — one prefix-cache miss at apply, then the prompt is
+byte-stable again (see [Providers](/extending/providers)).
+
+## Automatic refinement
+
+The planner also runs **in the background** (never blocking the agent loop)
+when the harness suspects it should learn:
+
+- after **3 consecutive tool failures**, or
+- after **3 `/undo`s** in a session.
+
+The proposal still waits for your review — auto-triggering never auto-applies.
+A notice tells you the proposal is ready.
+
+## Inspect and roll back
+
+- **`/harness`** — lists the current entries and the recent ops.
+- **`/harness rollback <op-id>`** — reverts an op: a `create` removes the
+  entry, an `update` restores the previous text, a `delete` re-creates it.
+  Every rollback is itself recorded.
+
+## Costs & guardrails
+
+- The planner is an extra LLM call only when you run `/refine` (or an
+  auto-trigger fires) — there is no background cost otherwise.
+- Proposals are capped (5 ops, 300 chars each) and parsed tolerantly:
+  malformed model output degrades to "nothing worth changing", never a crash.
+- Model output is treated as *proposal*, not policy: the harness (risk tiers,
+  approvals, rollback) still enforces safety, and the refinement loop cannot
+  touch the trust layer, permissions, or the base prompt.

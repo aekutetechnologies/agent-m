@@ -202,6 +202,14 @@ enum SubmitCommand {
     Interrupt,
     SetModel(String),
     SetVariant(Option<String>),
+    ResumeSession {
+        messages: Vec<SessionMessage>,
+    },
+    SetHarnessBlock(String),
+    /// Run the background refinement planner (manual or auto).
+    RunRefine {
+        focus: Option<String>,
+    },
     SetMode(agent_m_agent::Mode),
     Compact,
     RunFlow(std::path::PathBuf),
@@ -311,8 +319,10 @@ fn builtin_palette() -> Vec<(&'static str, &'static str)> {
         ("/undo", "undo the last edit"),
         ("/checkpoint", "snapshot the current git state"),
         ("/restore <n|sha>", "restore a checkpoint"),
+        ("/sessions", "list past sessions and resume one"),
         ("/level <0-4>", "set the autonomy level"),
         ("/sidebar", "toggle the status sidebar"),
+        ("/worktree", "show / detach the git worktree session"),
         ("/flow <file>", "run a flow from a YAML file"),
         ("/flows", "list available flows"),
     ]
@@ -414,6 +424,23 @@ pub struct App {
     variant_picker_open: bool,
     /// Selected row in the variant picker.
     variant_picker_index: usize,
+    /// The `/sessions` picker is open.
+    sessions_open: bool,
+    /// Selected row in the sessions picker.
+    sessions_index: usize,
+    /// Cached session list (loaded when the picker opens).
+    session_metas: Vec<crate::sessions::SessionMeta>,
+    /// A refinement proposal awaiting user review (JSON from the runner).
+    refine_preview: Option<crate::refine::RefineProposal>,
+    /// Whether the pending proposal came from the auto-trigger.
+    refine_auto: bool,
+    /// Consecutive tool failures (auto-trigger counter).
+    consecutive_failures: u32,
+    /// `/undo`s in this session (auto-trigger counter).
+    session_undos: u32,
+    /// Transcript search modal state.
+    search_open: bool,
+    search_query: String,
     /// Highlighted row in the ask overlay picker.
     ask_picker_index: usize,
     /// Checked rows in a multi-select ask picker.
@@ -424,8 +451,10 @@ pub struct App {
     turn_started: Option<Instant>,
     /// Per-turn elapsed times in ms (last 10, for the Timing section).
     turn_times: Vec<u64>,
-    /// The sidebar rect from the last draw, for click-to-toggle mapping.
+    // Mouse hit-testing cache.
     last_sidebar_area: Option<Rect>,
+    last_palette_area: Option<Rect>,
+    last_palette_offset: usize,
     info_open: bool,
 
     risk: Arc<agent_m_agent::RiskPolicy>,
@@ -530,6 +559,10 @@ impl App {
         // agents, so we hand it the provider + options + gates).
         let provider_configs = agent_m_ai::load_provider_configs(&inputs.agent_dir);
         let agent_dir = inputs.agent_dir.clone();
+        // Cloned before `inputs` moves into `App`: the runner needs the
+        // provider, model, and cwd for background refinement planning.
+        let runner_provider = inputs.provider.clone();
+        let runner_cwd = inputs.agent_options.cwd.clone();
         let runner_options = AgentOptions {
             ask_gate: Some(ask_gate.clone()),
             ..inputs.agent_options.clone()
@@ -627,12 +660,24 @@ impl App {
             variant: initial_variant,
             variant_picker_open: false,
             variant_picker_index: 0,
+            sessions_open: false,
+            sessions_index: 0,
+            session_metas: Vec::new(),
+            refine_preview: None,
+            refine_auto: false,
+            consecutive_failures: 0,
+            session_undos: 0,
+            search_open: false,
+            search_query: String::new(),
             ask_picker_index: 0,
             ask_picker_selected: std::collections::BTreeSet::new(),
             collapsed_sections,
             turn_started: None,
             turn_times: Vec::new(),
+            // Mouse hit-testing cache.
             last_sidebar_area: None,
+            last_palette_area: None,
+            last_palette_offset: 0,
             info_open: false,
             risk,
             pending_approval: None,
@@ -684,6 +729,49 @@ impl App {
                     SubmitCommand::Interrupt => agent.interrupt(),
                     SubmitCommand::SetModel(model) => agent.set_model(model),
                     SubmitCommand::SetVariant(variant) => agent.set_variant(variant),
+                    SubmitCommand::ResumeSession { messages } => {
+                        agent.restore_messages(messages);
+                        let _ = event_tx_runner.send(AgentEvent::Notice {
+                            message: "session resumed — continuing where it left off".to_string(),
+                        });
+                    }
+                    SubmitCommand::SetHarnessBlock(block) => {
+                        agent.set_harness_block(block);
+                    }
+                    SubmitCommand::RunRefine { focus } => {
+                        let provider = runner_provider.clone();
+                        let model = agent.model().to_string();
+                        let cwd = runner_cwd.clone();
+                        let agent_dir = agent_dir.clone();
+                        let tx = event_tx_runner.clone();
+                        tokio::spawn(async move {
+                            let trajectory =
+                                crate::refine::collect_trajectory(&agent_dir, &cwd, 60);
+                            let harness = crate::harness::load(&agent_dir);
+                            let state = crate::refine::render_harness_state(&harness);
+                            match crate::refine::propose_refinement(
+                                provider.as_ref(),
+                                &model,
+                                &trajectory,
+                                &state,
+                                focus.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(proposal) => {
+                                    let _ = tx.send(AgentEvent::RefineResult {
+                                        proposal_json: serde_json::to_string(&proposal)
+                                            .unwrap_or_else(|_| "{\"ops\":[]}".to_string()),
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(AgentEvent::Notice {
+                                        message: format!("refine planning failed: {error}"),
+                                    });
+                                }
+                            }
+                        });
+                    }
                     SubmitCommand::SetMode(mode) => agent.set_mode(mode),
                     SubmitCommand::SwitchProvider(id) => {
                         let config = provider_configs
@@ -881,6 +969,27 @@ impl App {
                                             .find(|(_, header_row)| *header_row == inner_row);
                                         if let Some((section, _)) = hit {
                                             self.toggle_section(section);
+                                        }
+                                    }
+                                }
+                                if self.palette_open
+                                    && let Some(area) = self.last_palette_area
+                                {
+                                    let x = mouse.column;
+                                    let y = mouse.row;
+                                    let inside = x >= area.x
+                                        && x < area.x + area.width
+                                        && y >= area.y
+                                        && y < area.y + area.height;
+                                    if inside {
+                                        // Title and border top is 1 row
+                                        let inner_row = y.saturating_sub(area.y + 1);
+                                        // The footer is 2 rows, we don't handle clicks on it.
+                                        let max_rows = area.height.saturating_sub(3);
+                                        if inner_row < max_rows {
+                                            self.palette_index =
+                                                self.last_palette_offset + inner_row as usize;
+                                            self.apply_app_action(AppAction::Submit).await;
                                         }
                                     }
                                 }
@@ -1129,6 +1238,48 @@ impl App {
                 _ => {}
             }
         }
+        // The refinement preview consumes Enter/Esc while open.
+        if self.refine_preview.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    let trigger = if self.refine_auto { "auto" } else { "manual" };
+                    self.apply_refine(trigger);
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.refine_preview = None;
+                    self.refine_auto = false;
+                    self.push_notice("refine: dismissed — nothing changed");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The sessions picker consumes navigation keys while it is open.
+        if self.sessions_open {
+            match key.code {
+                KeyCode::Up => {
+                    self.sessions_index = self.sessions_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let count = self.session_metas.len();
+                    self.sessions_index = (self.sessions_index + 1).min(count.saturating_sub(1));
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some(meta) = self.session_metas.get(self.sessions_index) {
+                        self.resume_session(meta.clone());
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.sessions_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The variant picker consumes navigation keys while it is open.
         if self.variant_picker_open {
             match key.code {
@@ -1187,6 +1338,40 @@ impl App {
                 _ => {}
             }
         }
+        if self.search_open {
+            if key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('f')
+            {
+                self.search_open = false;
+                self.search_query.clear();
+                return;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.search_open = false;
+                    if key.code == KeyCode::Esc {
+                        self.search_query.clear();
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.intersects(
+                        ratatui::crossterm::event::KeyModifiers::CONTROL
+                            | ratatui::crossterm::event::KeyModifiers::ALT,
+                    ) {
+                        self.search_query.push(c);
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
         let context = keybindings::KeyContext {
             editor_empty: self.editor.is_empty(),
             approval_pending: self.pending_approval.is_some(),
@@ -1200,6 +1385,148 @@ impl App {
             }
             Action::App(app_action) => self.apply_app_action(app_action).await,
         }
+    }
+
+    /// Resume a past session (Xirp-style): re-point the session store + all
+    /// ledgers at the target file, rebuild the transcript from its messages,
+    /// and tell the runner agent to restore that history.
+    fn resume_session(&mut self, meta: crate::sessions::SessionMeta) {
+        let messages = crate::sessions::load_session_file(&meta.path).unwrap_or_default();
+        self.session_store = crate::sessions::SessionStore::at_path(&meta.path).ok();
+        self.session_path = meta.path.clone();
+        self.session_stem = meta.stem.clone();
+        self.todos = crate::sessions::load_todos(&self.inputs.agent_dir, &self.session_stem);
+        self.undo_stack = crate::sessions::load_undo(&self.inputs.agent_dir, &self.session_stem);
+        self.checkpoints =
+            crate::sessions::load_checkpoints(&self.inputs.agent_dir, &self.session_stem);
+        let mut items = Vec::new();
+        for message in &messages {
+            push_message_item(&mut items, message);
+        }
+        if !self.todos.is_empty() {
+            items.push(TranscriptItem::Plan {
+                todos: self.todos.clone(),
+            });
+        }
+        self.items = items;
+        self.collapsed_before = self.items.len();
+        self.scroll_back = 0;
+        self.follow_end = true;
+        self.sessions_open = false;
+        let _ = self
+            .submit_tx
+            .send(SubmitCommand::ResumeSession { messages });
+        // The runner confirms with its own "session resumed" notice; pushing
+        // another one here would be clobbered before the first redraw.
+    }
+
+    /// Apply the pending refinement proposal to the harness store, rebuild
+    /// the prompt block, and push it to the running agent.
+    fn apply_refine(&mut self, trigger: &str) {
+        let Some(proposal) = self.refine_preview.take() else {
+            return;
+        };
+        self.refine_auto = false;
+        let mut harness = crate::harness::load(&self.inputs.agent_dir);
+        let now = crate::sessions::now_iso();
+        let mut applied = 0usize;
+        for op in &proposal.ops {
+            let kind = match op.kind.as_str() {
+                "memory" => crate::harness::EntryKind::Memory,
+                "note" => crate::harness::EntryKind::Note,
+                "skill" => crate::harness::EntryKind::Skill,
+                _ => continue,
+            };
+            match op.action.as_str() {
+                "create" | "update" => {
+                    let id = if op.id.is_empty() {
+                        crate::harness::new_entry_id(&kind, &now)
+                    } else {
+                        op.id.clone()
+                    };
+                    crate::harness::upsert_entry(
+                        &mut harness,
+                        id,
+                        kind,
+                        op.text.clone(),
+                        trigger,
+                        &now,
+                    );
+                    applied += 1;
+                }
+                "delete" => {
+                    applied += usize::from(
+                        crate::harness::delete_entry(&mut harness, &op.id, trigger, &now).is_some(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if applied > 0 {
+            crate::harness::save(&self.inputs.agent_dir, &harness);
+            let block = self.harness_block(&harness);
+            let _ = self.submit_tx.send(SubmitCommand::SetHarnessBlock(block));
+            self.push_notice(format!(
+                "refine: applied {applied} op(s) — the harness block updated (one cache miss, then stable)"
+            ));
+        } else {
+            self.push_notice("refine: nothing applied");
+        }
+    }
+
+    /// Rebuild the harness prompt block from the store + observed prefs.
+    fn harness_block(&self, harness: &crate::harness::Harness) -> String {
+        let prefs = crate::prefs::load(&self.inputs.agent_dir);
+        crate::harness::harness_block(harness, &crate::prefs::prompt_block(&prefs))
+    }
+
+    /// `/harness` — list the current state + recent refine ops.
+    fn show_harness(&mut self) {
+        let harness = crate::harness::load(&self.inputs.agent_dir);
+        if harness.entries.is_empty() && harness.refine_log.is_empty() {
+            self.push_notice("harness: empty — run /refine to learn from this session");
+            return;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for entry in &harness.entries {
+            lines.push(format!(
+                "{} [{}] v{}: {}",
+                entry.kind.as_str(),
+                entry.id,
+                entry.version,
+                entry.text
+            ));
+        }
+        let ops: Vec<String> = harness
+            .refine_log
+            .iter()
+            .rev()
+            .take(5)
+            .map(|op| format!("{} {} {} {}", op.id, op.action, op.kind, op.entry_id))
+            .collect();
+        if !ops.is_empty() {
+            lines.push(String::new());
+            lines.push("recent refine ops:".to_string());
+            lines.extend(ops);
+        }
+        self.push_notice(format!(
+            "harness state:\n{}\n/harness rollback <op-id> reverts an op",
+            lines.join("\n")
+        ));
+    }
+
+    /// `/harness rollback <id>` — invert a refine op and rebuild the block.
+    fn rollback_refine(&mut self, op_id: &str) {
+        let mut harness = crate::harness::load(&self.inputs.agent_dir);
+        let Some(op) = crate::harness::rollback_op(&mut harness, op_id) else {
+            self.push_notice(format!("harness: no refine op `{op_id}`"));
+            return;
+        };
+        harness.updated_at = Some(crate::sessions::now_iso());
+        crate::harness::save(&self.inputs.agent_dir, &harness);
+        let block = self.harness_block(&harness);
+        let _ = self.submit_tx.send(SubmitCommand::SetHarnessBlock(block));
+        self.push_notice(format!("harness: rolled back {op_id} ({})", op.action));
     }
 
     /// Switch the agent to a model and close any picker.
@@ -1432,6 +1759,12 @@ impl App {
             AppAction::ToggleCacheNotices => {
                 self.show_cache_notices = !self.show_cache_notices;
             }
+            AppAction::Search => {
+                self.search_open = !self.search_open;
+                if !self.search_open {
+                    self.search_query.clear();
+                }
+            }
             AppAction::ApproveTool => self.respond_to_approval(Permission::Allowed),
             AppAction::DenyTool => self
                 .respond_to_approval(Permission::Denied("user denied the tool call".to_string())),
@@ -1452,6 +1785,54 @@ impl App {
             AppAction::ScrollBottom => {
                 self.follow_end = true;
                 self.scroll_back = 0;
+            }
+            AppAction::YankLastCodeBlock => {
+                let mut found_code = None;
+                for item in self.items.iter().rev() {
+                    if let TranscriptItem::Assistant { parts, .. } = item {
+                        for part in parts.iter().rev() {
+                            if let ContentPart::Text { text } = part {
+                                let mut in_fence = false;
+                                let mut block = Vec::new();
+                                for line in text.lines().rev() {
+                                    if line.starts_with("```") {
+                                        if in_fence {
+                                            // Found opening fence
+                                            block.reverse();
+                                            found_code = Some(block.join("\n"));
+                                            break;
+                                        } else {
+                                            // Found closing fence
+                                            in_fence = true;
+                                        }
+                                    } else if in_fence {
+                                        block.push(line);
+                                    }
+                                }
+                                if found_code.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        if found_code.is_some() {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(code) = found_code {
+                    if let Ok(mut ctx) = arboard::Clipboard::new() {
+                        if ctx.set_text(code).is_ok() {
+                            self.push_notice("Code block copied to clipboard!".to_string());
+                        } else {
+                            self.push_notice("Failed to copy to clipboard".to_string());
+                        }
+                    } else {
+                        self.push_notice("Clipboard not available".to_string());
+                    }
+                } else {
+                    self.push_notice("No code block found to yank".to_string());
+                }
             }
         }
     }
@@ -1971,7 +2352,9 @@ impl App {
     fn run_slash_command(&mut self, input: &str) {
         let mut parts = input.split_whitespace();
         let command = parts.next().unwrap_or_default();
-        let argument = parts.next().unwrap_or_default();
+        // The argument is the REST of the line (multi-word args like
+        // `/harness rollback op-1`), not just the second token.
+        let argument: String = parts.collect::<Vec<_>>().join(" ");
         match command {
             "/help" => {
                 // The palette doubles as help: clear the filter so every
@@ -2015,7 +2398,7 @@ impl App {
                 let arg = if argument.is_empty() {
                     command.trim_start_matches("/level").trim()
                 } else {
-                    argument
+                    argument.as_str()
                 };
                 if let Ok(number) = arg.parse::<u8>()
                     && let Some(level) = agent_m_agent::AutonomyLevel::from_number(number)
@@ -2084,6 +2467,28 @@ impl App {
             }
             "/undo" => {
                 self.undo_last();
+                self.session_undos += 1;
+                if self.session_undos == 3 && self.refine_preview.is_none() {
+                    self.push_notice("repeated /undo — run `/refine` to learn what to stop doing");
+                }
+            }
+            "/refine" => {
+                // `focus` is the argument after "/refine".
+                let focus = (!argument.is_empty()).then(|| argument.to_string());
+                self.push_notice("refine: planning in the background…");
+                self.refine_auto = false;
+                let _ = self
+                    .submit_tx
+                    .send(SubmitCommand::RunRefine { focus });
+            }
+            "/harness" => {
+                if argument == "rollback" {
+                    self.push_notice("usage: /harness rollback <op-id>");
+                } else if let Some(op_id) = argument.strip_prefix("rollback ") {
+                    self.rollback_refine(op_id);
+                } else {
+                    self.show_harness();
+                }
             }
             "/journal" => {
                 self.journal_open = !self.journal_open;
@@ -2095,9 +2500,9 @@ impl App {
                 }
             }
             "/sidebar" => {
-                match argument {
+                match argument.as_str() {
                     "context" | "timing" | "flow" | "todos" => {
-                        self.toggle_section(SidebarSection::from_name(argument));
+                        self.toggle_section(SidebarSection::from_name(argument.as_str()));
                         self.push_notice(format!("section `{argument}` toggled"));
                     }
                     _ if argument.is_empty() => {
@@ -2109,6 +2514,41 @@ impl App {
                         });
                     }
                     _ => self.push_notice("unknown section (context|timing|flow|todos)"),
+                }
+            }
+            "/worktree" => {
+                if argument == "detach" {
+                    match agent_m_agent::remove_worktree(&self.cwd) {
+                        Ok(path) => self.push_notice(format!(
+                            "removed worktree {path} — exit and re-run in the main checkout"
+                        )),
+                        Err(error) => self.push_notice(error.to_string()),
+                    }
+                } else {
+                    let current = if agent_m_agent::is_git_repo(&self.cwd) {
+                        std::process::Command::new("git")
+                            .args(["rev-parse", "--show-toplevel"])
+                            .current_dir(&self.cwd)
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let worktrees = agent_m_agent::list_worktrees(&self.cwd);
+                    let current_line = if current.is_empty() {
+                        String::new()
+                    } else {
+                        format!("current worktree: {current}\n")
+                    };
+                    let list = if worktrees.is_empty() {
+                        "not a git repo — `--worktree` isolates a session in a fresh worktree"
+                            .to_string()
+                    } else {
+                        format!("worktrees:\n{}", worktrees.join("\n"))
+                    };
+                    self.push_notice(format!("{current_line}{list}\n/worktree detach removes this one"));
                 }
             }
             "/flows" => {
@@ -2157,6 +2597,16 @@ impl App {
                     percent
                 ));
             }
+            "/sessions" => {
+                self.session_metas =
+                    crate::sessions::list_sessions(&self.inputs.agent_dir);
+                if self.session_metas.is_empty() {
+                    self.push_notice("no past sessions yet — finish a conversation first");
+                } else {
+                    self.sessions_open = true;
+                    self.sessions_index = 0;
+                }
+            }
             "/todos" => {
                 if self.todos.is_empty() {
                     self.push_notice("no plan yet — ask for one in plan mode");
@@ -2189,7 +2639,7 @@ impl App {
                         "provider wizard — 1 add · 2 edit · 3 remove · 4 switch",
                     );
                 } else {
-                    self.switch_provider(argument);
+                    self.switch_provider(argument.as_str());
                 }
             }
             "/model" => {
@@ -2465,7 +2915,7 @@ impl App {
             self.push_notice("nothing to undo");
             return;
         };
-        match crate::sessions::apply_undo(&entry) {
+        match crate::sessions::apply_undo(&entry, &self.cwd) {
             Ok("restored") => self.push_notice(format!(
                 "restored {} (undo stack has {} left)",
                 entry.path,
@@ -2563,6 +3013,7 @@ impl App {
                 tool_call_id,
                 outcome,
             } => {
+                let is_error = outcome.is_error;
                 self.active_tool = None;
                 for item in self.items.iter_mut().rev() {
                     if let TranscriptItem::ToolExecution {
@@ -2575,6 +3026,31 @@ impl App {
                         *result = Some(outcome);
                         break;
                     }
+                }
+                if is_error {
+                    self.consecutive_failures += 1;
+                    if self.consecutive_failures == 3 && self.refine_preview.is_none() {
+                        self.push_notice(
+                            "repeated tool failures — run `/refine` to learn what went wrong",
+                        );
+                    }
+                } else {
+                    self.consecutive_failures = 0;
+                }
+            }
+            AgentEvent::RefineResult { proposal_json } => {
+                if let Ok(proposal) =
+                    serde_json::from_str::<crate::refine::RefineProposal>(&proposal_json)
+                    && !proposal.ops.is_empty()
+                {
+                    self.refine_preview = Some(proposal);
+                    self.push_notice(if self.refine_auto {
+                        "refine: proposal ready — review with Enter (esc to dismiss)"
+                    } else {
+                        "refine: proposal ready — Enter applies, esc dismisses"
+                    });
+                } else {
+                    self.push_notice("refine: nothing worth changing right now");
                 }
             }
             AgentEvent::FlowStep {
@@ -2733,7 +3209,11 @@ impl App {
 
     fn transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let query = self.search_query.to_lowercase();
         for (index, item) in self.items.iter().enumerate() {
+            if self.search_open && !query.is_empty() && !item.matches(&query) {
+                continue;
+            }
             lines.extend(item.render(&self.theme, width, index < self.collapsed_before));
         }
         lines
@@ -2745,10 +3225,12 @@ impl App {
         }
         let width = area.width.max(10) as usize;
         let lines = self.transcript_lines(width);
+        let query = self.search_query.to_lowercase();
         let total: usize = self
             .items
             .iter()
             .enumerate()
+            .filter(|(_, item)| !self.search_open || query.is_empty() || item.matches(&query))
             .map(|(index, item)| item.height(&self.theme, width, index < self.collapsed_before))
             .sum();
         let viewport = area.height as usize;
@@ -3424,6 +3906,23 @@ impl App {
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
 
+        if self.search_open {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" search/filter transcript ")
+                .title_style(
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(self.theme.dim));
+            let text = format!(" {}_", self.search_query);
+            let p = Paragraph::new(text).block(block);
+            let mut rect = overlay_area(frame.area(), 40, 3);
+            rect.y = frame.area().y + 1; // Top-centered
+            frame.render_widget(p, rect);
+        }
+
         if self.palette_open {
             let filtered = self.filtered_palette();
             let mut lines: Vec<Line> = Vec::new();
@@ -3467,15 +3966,139 @@ impl App {
                 status,
                 Style::default().fg(self.theme.dim),
             )));
+            // Entries scroll; the blank + status footer stays pinned.
+            let footer_len = 2usize;
+            let entry_count = lines.len().saturating_sub(footer_len);
             let max_h = frame.area().height.saturating_sub(3).min(18);
             let height = (lines.len() as u16 + 2).min(max_h);
+            let visible_rows = height.saturating_sub(2 + footer_len as u16).max(1) as usize;
+            let offset = self
+                .palette_index
+                .saturating_sub(visible_rows.saturating_sub(1))
+                .min(entry_count.saturating_sub(visible_rows));
+            let end = (offset + visible_rows).min(entry_count);
+            let mut window: Vec<Line> = lines[offset..end].to_vec();
+            window.extend_from_slice(&lines[entry_count..]);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" command palette — {} ", self.editor.text()))
                 .title_style(Style::default().fg(self.theme.accent))
                 .border_style(Style::default().fg(self.theme.dim));
             let rect = overlay_area(frame.area(), 64, height);
+            self.last_palette_area = Some(rect);
+            self.last_palette_offset = offset;
+            frame.render_widget(Paragraph::new(window).block(block), rect);
+        } else {
+            self.last_palette_area = None;
+        }
+
+        if let Some(proposal) = &self.refine_preview {
+            let mut lines: Vec<Line> = Vec::new();
+            for op in &proposal.ops {
+                let action = match op.action.as_str() {
+                    "create" => "+",
+                    "update" => "~",
+                    "delete" => "−",
+                    _ => "?",
+                };
+                let target = if op.id.is_empty() {
+                    "new".to_string()
+                } else {
+                    op.id.clone()
+                };
+                let text = if op.text.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", op.text)
+                };
+                let reason = if op.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", op.reason)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{action} {} {target}", op.kind),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::styled(
+                        format!("{text}{reason}"),
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "enter apply · esc dismiss — the base prompt never changes, only this harness layer",
+                Style::default().fg(self.theme.dim),
+            )));
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" refine — {} op(s) ", proposal.ops.len()))
+                .title_style(Style::default().fg(self.theme.accent))
+                .border_style(Style::default().fg(self.theme.dim));
+            let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(3));
+            let rect = overlay_area(frame.area(), 72, height);
             frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
+
+        if self.sessions_open {
+            let mut lines: Vec<Line> = self
+                .session_metas
+                .iter()
+                .enumerate()
+                .map(|(index, meta)| {
+                    let selected = index == self.sessions_index;
+                    let prefix = if selected { "› " } else { "  " };
+                    let style = if selected {
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.user_message_text)
+                    };
+                    let prompt = if meta.first_prompt.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", meta.first_prompt)
+                    };
+                    let model = if meta.model.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", meta.model)
+                    };
+                    Line::from(Span::styled(
+                        format!(
+                            "{prefix}{} · {} msgs{model}{prompt}",
+                            meta.cwd, meta.messages
+                        ),
+                        style,
+                    ))
+                })
+                .collect();
+            lines.push(Line::from(Span::styled(
+                "enter resume · esc close",
+                Style::default().fg(self.theme.muted),
+            )));
+            // Entries scroll; the "enter resume · esc close" footer stays.
+            let footer_len = 1usize;
+            let entry_count = lines.len().saturating_sub(footer_len);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" sessions — {} ", self.session_metas.len()))
+                .title_style(Style::default().fg(self.theme.accent))
+                .border_style(Style::default().fg(self.theme.dim));
+            let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(3));
+            let visible_rows = height.saturating_sub(2 + footer_len as u16).max(1) as usize;
+            let offset = self
+                .sessions_index
+                .saturating_sub(visible_rows.saturating_sub(1))
+                .min(entry_count.saturating_sub(visible_rows));
+            let end = (offset + visible_rows).min(entry_count);
+            let mut window: Vec<Line> = lines[offset..end].to_vec();
+            window.extend_from_slice(&lines[entry_count..]);
+            let rect = overlay_area(frame.area(), 72, height);
+            frame.render_widget(Paragraph::new(window).block(block), rect);
         }
 
         if self.journal_open {

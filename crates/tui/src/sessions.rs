@@ -8,6 +8,24 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// Write a file atomically and ensure 0600 permissions.
+pub fn atomic_save(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        let mut file = options.open(&tmp)?;
+        file.write_all(content.as_ref())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, path)
+}
+
 const SESSION_VERSION: u64 = 1;
 
 /// Append-only store for one session.
@@ -342,7 +360,7 @@ pub fn save_checkpoints(
     let dir = agent_dir.join("checkpoints");
     std::fs::create_dir_all(&dir)?;
     let text = serde_json::to_string(entries)?;
-    std::fs::write(dir.join(format!("{session_stem}.json")), text)?;
+    atomic_save(&dir.join(format!("{session_stem}.json")), text)?;
     Ok(())
 }
 
@@ -362,21 +380,48 @@ pub fn save_undo(agent_dir: &Path, session_stem: &str, entries: &[UndoEntry]) ->
     let dir = agent_dir.join("undo");
     std::fs::create_dir_all(&dir)?;
     let text = serde_json::to_string(entries)?;
-    std::fs::write(dir.join(format!("{session_stem}.json")), text)?;
+    atomic_save(&dir.join(format!("{session_stem}.json")), text)?;
     Ok(())
 }
 
 /// Apply one undo entry: restore the before-content or delete the file when
 /// it did not exist before. Returns the action performed for messaging.
-pub fn apply_undo(entry: &UndoEntry) -> std::io::Result<&'static str> {
+pub fn apply_undo(entry: &UndoEntry, cwd: &Path) -> std::io::Result<&'static str> {
     let target = std::path::Path::new(&entry.path);
+
+    // Containment check: prevent /undo from writing outside the workspace
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+
+    // To check containment safely without requiring the file to exist yet,
+    // we resolve the parent directory.
+    let parent = target.parent().unwrap_or(std::path::Path::new(""));
+    let canonical_parent = if parent.exists() {
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+    } else {
+        // If parent doesn't exist, we'll try checking prefix directly.
+        // In a real containment we'd create the dir safely or reject it.
+        // For undo, the parent directory must exist because undo replaces files.
+        parent.to_path_buf()
+    };
+
+    if !canonical_parent.starts_with(&canonical_cwd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "undo path escapes workspace boundary",
+        ));
+    }
+
     match &entry.before {
         Some(content) => {
             std::fs::write(target, content)?;
             Ok("restored")
         }
         None => {
-            std::fs::remove_file(target)?;
+            if target.exists() {
+                std::fs::remove_file(target)?;
+            }
             Ok("deleted")
         }
     }
@@ -406,7 +451,7 @@ pub fn save_todos(
         .map(|todo| json!({ "step": todo.step, "text": todo.text, "completed": todo.completed }))
         .collect();
     let path = dir.join(format!("{session_stem}.json"));
-    std::fs::write(
+    atomic_save(
         &path,
         serde_json::to_string_pretty(&json!({ "todos": items }))?,
     )
@@ -481,7 +526,7 @@ mod tests {
             path: path.to_string_lossy().to_string(),
             before: Some("old content".to_string()),
         };
-        assert_eq!(apply_undo(&entry).unwrap(), "restored");
+        assert_eq!(apply_undo(&entry, dir.path()).unwrap(), "restored");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
         // File that did not exist before → deleted.
         let new_path = dir.path().join("new.txt");
@@ -490,8 +535,29 @@ mod tests {
             path: new_path.to_string_lossy().to_string(),
             before: None,
         };
-        assert_eq!(apply_undo(&entry).unwrap(), "deleted");
+        assert_eq!(apply_undo(&entry, dir.path()).unwrap(), "deleted");
         assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn apply_undo_refuses_paths_outside_the_workspace() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        // Absolute path outside the workspace → refused.
+        let entry = UndoEntry {
+            path: victim.to_string_lossy().to_string(),
+            before: Some("evil".to_string()),
+        };
+        assert!(apply_undo(&entry, dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        // A `..`-based relative path that would escape the workspace → refused.
+        let escape = UndoEntry {
+            path: "../victim.txt".to_string(),
+            before: Some("evil".to_string()),
+        };
+        assert!(apply_undo(&escape, dir.path()).is_err());
     }
 
     #[test]
@@ -585,6 +651,63 @@ mod tests {
         let dir = tempdir().unwrap();
         let loaded = resume(dir.path(), dir.path()).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_metadata_across_cwds() {
+        let dir = tempdir().unwrap();
+        // Two cwd dirs, one session file each (with a header + a user msg +
+        // an assistant msg with a model).
+        for cwd in ["--_tmp_proj_a--", "--_tmp_proj_b--"] {
+            let cwd_dir = dir.path().join("sessions").join(cwd);
+            std::fs::create_dir_all(&cwd_dir).unwrap();
+            let path = cwd_dir.join("2026-08-11T05-09-02.438Z-abc123.jsonl");
+            let body = format!(
+                "{}\n{}\n{}\n",
+                json!({"type": "session", "version": 1}),
+                json!({"type": "message", "kind": "user", "content": "explain this repo"}),
+                json!({"type": "message", "kind": "assistant", "model": "deepseek-chat", "content": "ok"}),
+            );
+            std::fs::write(&path, body).unwrap();
+        }
+        let metas = list_sessions(dir.path());
+        assert_eq!(metas.len(), 2);
+        for meta in &metas {
+            assert!(
+                meta.cwd.starts_with("/tmp/proj"),
+                "cwd decoded: {}",
+                meta.cwd
+            );
+            assert_eq!(meta.messages, 2);
+            assert_eq!(meta.first_prompt, "explain this repo");
+            assert_eq!(meta.model, "deepseek-chat");
+            assert!(meta.stem.starts_with("2026-08-11T05-09-02.438Z-"));
+        }
+        // Sorted newest-first.
+        assert!(metas[0].updated >= metas[1].updated);
+    }
+
+    #[test]
+    fn session_store_at_path_appends_to_existing_file() {
+        let dir = tempdir().unwrap();
+        let cwd_dir = dir.path().join("sessions").join("--_tmp_proj--");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let path = cwd_dir.join("2026-08-11T05-09-02.438Z-abc.jsonl");
+        std::fs::write(
+            &path,
+            json!({"type": "session", "version": 1}).to_string() + "\n",
+        )
+        .unwrap();
+        let mut store = SessionStore::at_path(&path).unwrap();
+        store
+            .append(&SessionMessage::User {
+                content: "hi".to_string(),
+                images: Vec::new(),
+            })
+            .unwrap();
+        let loaded = load_session_file(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(store.path(), path.as_path());
     }
 }
 
@@ -692,4 +815,134 @@ pub fn save_collapsed_sections(agent_dir: &Path, sections: &[String]) {
         &path,
         serde_json::to_string_pretty(&value).unwrap_or_default(),
     );
+}
+
+/// Metadata for one stored session, for the `/sessions` picker.
+#[derive(Debug, Clone)]
+pub struct SessionMeta {
+    /// Session file stem — the key for the todos/undo/checkpoint ledgers.
+    pub stem: String,
+    /// Full path to the session `.jsonl`.
+    pub path: PathBuf,
+    /// Human-readable cwd the session ran in (from the directory name).
+    pub cwd: String,
+    /// Timestamp from the filename (`2026-08-11T05-09-02.438Z-…`), newest
+    /// first.
+    pub updated: String,
+    /// Number of message entries (excluding the header line).
+    pub messages: usize,
+    /// First user prompt, truncated for display.
+    pub first_prompt: String,
+    /// Model of the last assistant message, when known.
+    pub model: String,
+}
+
+/// List every stored session across all cwd directories, newest first.
+/// Reads only the first + last lines of each file — cheap even with
+/// hundreds of sessions.
+pub fn list_sessions(agent_dir: &Path) -> Vec<SessionMeta> {
+    let root = agent_dir.join("sessions");
+    let mut metas = Vec::new();
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        return metas;
+    };
+    for dir in dirs.flatten() {
+        let dir_path = dir.path();
+        let dir_name = dir.file_name().to_string_lossy().to_string();
+        let cwd = dir_name
+            .strip_prefix("--")
+            .and_then(|name| name.strip_suffix("--"))
+            .unwrap_or(&dir_name)
+            .replace('_', "/");
+        let Ok(files) = std::fs::read_dir(&dir_path) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                continue;
+            }
+            let Some(_file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let file_stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            // Filename is `<ISO timestamp with dashes>-<32-hex uuid>`; the
+            // uuid is the LAST dash-separated component, so take everything
+            // before it as the sortable timestamp.
+            let updated = file_stem
+                .rfind('-')
+                .map(|dash| file_stem[..dash].to_string())
+                .unwrap_or_else(|| file_stem.clone());
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut messages = 0usize;
+            let mut first_prompt = String::new();
+            let mut model = String::new();
+            for (index, line) in text.lines().enumerate() {
+                if index == 0 {
+                    continue; // session header
+                }
+                messages += 1;
+                if let Ok(value) = serde_json::from_str::<Value>(line) {
+                    if first_prompt.is_empty() && value.get("kind") == Some(&json!("user")) {
+                        first_prompt = value
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect();
+                    }
+                    if value.get("kind") == Some(&json!("assistant"))
+                        && let Some(m) = value.get("model").and_then(Value::as_str)
+                    {
+                        model = m.to_string();
+                    }
+                }
+            }
+            metas.push(SessionMeta {
+                stem: file_stem,
+                path,
+                cwd: cwd.clone(),
+                updated,
+                messages,
+                first_prompt,
+                model,
+            });
+        }
+    }
+    metas.sort_by(|a, b| b.updated.cmp(&a.updated));
+    metas
+}
+
+impl SessionStore {
+    /// Open an existing session file for appending (the `/sessions` resume
+    /// path re-points the store at the resumed session so follow-ups stay in
+    /// that session's transcript + ledger).
+    pub fn at_path(path: &Path) -> Result<SessionStore> {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("cannot open session file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(SessionStore {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+}
+
+/// Load every message entry from a session file (the `/sessions` resume
+/// path).
+pub fn load_session_file(path: &Path) -> Result<Vec<SessionMessage>> {
+    load_entries(path)
 }

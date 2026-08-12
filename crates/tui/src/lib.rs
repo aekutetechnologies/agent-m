@@ -2,10 +2,12 @@
 
 pub mod app;
 pub mod editor;
+pub mod harness;
 pub mod keybindings;
 pub mod markdown;
 pub mod plan;
 pub mod prefs;
+pub mod refine;
 pub mod sessions;
 pub mod theme;
 pub mod transcript;

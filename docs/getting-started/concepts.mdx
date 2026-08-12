@@ -1,0 +1,126 @@
+---
+title: Concepts & glossary
+---
+
+# Concepts, in plain words
+
+Every term in this documentation, explained like you're new here. Terms are
+listed roughly in the order you'll meet them.
+
+## The core idea
+
+**AI coding agent** — a program that can *read your code, edit files, run
+commands, and ask you questions*, all driven by an AI model. "Agent" is the
+fancy word for "it takes actions, not just answers".
+
+## The pieces
+
+**Model** — the brain. A large language model is a program trained on vast
+amounts of text; it predicts the next word, which is how it "thinks". agent-m
+can talk to several different models.
+
+**Provider** — the company (or service) that runs the model for you: DeepSeek,
+OpenAI, Anthropic, or a local one like Ollama. You configure which provider +
+which model agent-m uses (see [Providers](/extending/providers)).
+
+**API key** — a secret password that proves you're allowed to use a provider.
+It lives in `~/.agent-m/agent/auth.json` (or an environment variable) and is
+**never** stored in the chat logs. Keep it secret.
+
+**Base URL / endpoint** — the web address where the provider's model lives
+(e.g. `https://api.deepseek.com`). Some providers are "OpenAI-compatible",
+meaning they speak the same language, so one adapter works for all of them.
+
+## Talking to the model
+
+**Tokens** — the units the model counts. Roughly: 1 token ≈ ¾ of an English
+word. Everything you and the model say costs tokens; you usually pay per
+million tokens.
+
+**Context window** — how many tokens the model can "keep in mind" at once
+(think: short-term memory). agent-m shows `context: 12% of 1.0M` so you can
+see how full the memory is.
+
+**Prompt** — the text you send the model. agent-m builds your prompt
+automatically: your message + your project's rules + the history.
+
+**System prompt** — the invisible instructions at the top that tell the model
+how to behave ("you are a coding agent; be concise"). You can extend it with
+`AGENTS.md` files (see below).
+
+**Prefix cache / cache hit** — providers remember the *beginning* of your
+conversation between turns, so repeating it costs much less. agent-m keeps
+that prefix byte-identical to maximize the savings — you'll see `cache read`
+in the sidebar.
+
+**Streaming** — the answer arriving word-by-word instead of all at once (what
+you see when the reply "types itself").
+
+## Doing things
+
+**Tool** — an action agent-m can take: `read` (open a file), `bash` (run a
+command), `edit`/`write` (change files), `grep`/`search` (find things),
+`web_fetch` (read a URL). The model *asks* for a tool; agent-m checks
+permission first.
+
+**Tool call** — the model saying "please run `read` on `src/app.rs`". You'll
+see these as blocks in the chat.
+
+**Permission gate / approval** — the safety check before a tool runs. Low-risk
+actions (reading) run automatically; risky ones (running commands, editing
+files) ask you first. See [Risk tiers](/trust/risk-tiers).
+
+**Autonomy level** — how much agent-m does without asking (0 = just watch,
+4 = do almost everything except the most dangerous). See
+[Autonomy](/trust/autonomy).
+
+## Remembering & organizing
+
+**Session** — one conversation, saved as a file on disk. agent-m
+auto-resumes your latest session when you start it in the same folder, and
+`/sessions` lets you list old ones and jump back in.
+
+**Transcript** — the full record of a session (your messages, agent-m's
+replies, the tool calls, the approvals).
+
+**Worktree** — a separate copy of your project's files, on its own branch.
+`agent-m --worktree name` starts a session in a fresh worktree, so two
+sessions can work on the same project without bumping into each other.
+
+**Checkpoint** — a snapshot of the project's git state you can roll back to
+(`/checkpoint` + `/restore`).
+
+**Undo** — rolling back the last file change agent-m made (`/undo`). agent-m
+snapshots every file before it edits it, so undo is reliable.
+
+## Project rules
+
+**AGENTS.md / CLAUDE.md / .cursorrules** — files in your repo that tell
+agents how to work ("never edit generated files", "tests live in t/"). agent-m
+reads all of them, nearest to the folder wins.
+
+**Slash command** — a shortcut that starts with `/`, e.g. `/help`, `/sessions`,
+`/undo`. Type `/` to see the full searchable list.
+
+**Refinement (/refine)** — the harness proposing improvements to its own
+memories/notes/skills after seeing how a session went; you review and apply
+them (see [Self-improvement](/trust/self-improvement)).
+
+## Safety & limits
+
+**Risk tier** — how dangerous an action is (Low/Medium/High/Critical); it
+decides whether agent-m just does it, warns you, or insists on asking.
+
+**Print mode** — running agent-m without a terminal UI (`agent-m -p "…"`),
+e.g. in scripts. Tools are disabled unless you pass `--yes`.
+
+**Prompt injection** — hidden instructions buried in file contents that try to
+trick the model. agent-m treats tool output as data, but the honest rule is:
+**only use it on code you trust** (see [Boundaries](/security/boundaries)).
+
+## A one-line cheat sheet
+
+> Model = brain · Provider = who runs it · Tokens = the currency · Context
+> window = short-term memory · Tool = an action · Permission = the ask-before
+> doing · Session = a saved conversation · Worktree = a parallel copy ·
+> Checkpoint = a rollback point · Undo = take that back.

@@ -50,6 +50,10 @@ pub enum AppAction {
     ScrollDown,
     ScrollTop,
     ScrollBottom,
+    /// Yank the last code block in the transcript to clipboard (alt+c).
+    YankLastCodeBlock,
+    /// Toggle the transcript search modal (ctrl+f).
+    Search,
 }
 
 /// A single resolved key press.
@@ -106,6 +110,7 @@ pub fn resolve_key(key: KeyEvent, context: KeyContext) -> Option<Action> {
                 Some(Action::App(AppAction::Clear))
             }
         }
+        KeyCode::Char('c') if alt => Some(Action::App(AppAction::YankLastCodeBlock)),
         KeyCode::Char('d') if ctrl => Some(Action::App(AppAction::Exit)),
         KeyCode::Char('j') if ctrl => Some(Action::Editor(EditorAction::Newline)),
         KeyCode::Char('l') if ctrl => Some(Action::App(AppAction::ModelSelect)),
@@ -116,9 +121,9 @@ pub fn resolve_key(key: KeyEvent, context: KeyContext) -> Option<Action> {
         KeyCode::Char('p') if ctrl && shift => Some(Action::App(AppAction::ModelCycleBackward)),
         KeyCode::Char('p') if ctrl => Some(Action::App(AppAction::ModelCycleForward)),
         KeyCode::Char('t') if ctrl => Some(Action::App(AppAction::ToggleCacheNotices)),
+        KeyCode::Char('f') if ctrl => Some(Action::App(AppAction::Search)),
         KeyCode::Char('r') if ctrl => Some(Action::App(AppAction::ToggleThinking)),
         KeyCode::Char('b') if ctrl => Some(Action::Editor(EditorAction::MoveLeft)),
-        KeyCode::Char('f') if ctrl => Some(Action::Editor(EditorAction::MoveRight)),
         KeyCode::Char('a') if ctrl => Some(Action::Editor(EditorAction::LineStart)),
         KeyCode::Char('e') if ctrl => Some(Action::Editor(EditorAction::LineEnd)),
         KeyCode::Char('w') if ctrl => Some(Action::Editor(EditorAction::KillWordBackward)),

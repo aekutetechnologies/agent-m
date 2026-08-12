@@ -10,7 +10,54 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use ratatui::style::Color;
+use std::sync::OnceLock;
+
 use crate::theme::Theme;
+
+static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+
+fn highlight_code<'a>(code: &str, lang: &str, theme: &Theme) -> Option<Vec<Vec<Span<'a>>>> {
+    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
+    let ts = THEME_SET.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+
+    // Choose a theme that roughly matches our dark/light terminal
+    // We could make this dynamic based on `theme` later.
+    let syn_theme = &ts.themes["base16-ocean.dark"];
+
+    let syntax = ss.find_syntax_by_token(lang)?;
+    let mut h = syntect::easy::HighlightLines::new(syntax, syn_theme);
+
+    let mut result = Vec::new();
+    for line in syntect::util::LinesWithEndings::from(code) {
+        let ranges: Vec<(syntect::highlighting::Style, &str)> = h.highlight_line(line, ss).ok()?;
+        let mut spans = Vec::new();
+        for (style, text) in ranges {
+            // Map syntect color to ratatui color
+            let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+            let mut span_style = Style::default().fg(fg).bg(theme.md_code_bg);
+            if style
+                .font_style
+                .contains(syntect::highlighting::FontStyle::BOLD)
+            {
+                span_style = span_style.add_modifier(Modifier::BOLD);
+            }
+            if style
+                .font_style
+                .contains(syntect::highlighting::FontStyle::ITALIC)
+            {
+                span_style = span_style.add_modifier(Modifier::ITALIC);
+            }
+            spans.push(Span::styled(
+                text.trim_end_matches(&['\r', '\n'][..]).to_string(),
+                span_style,
+            ));
+        }
+        result.push(spans);
+    }
+    Some(result)
+}
 
 /// Render markdown to styled lines (one per source line/block). `width` is
 /// the terminal column width, used for full-width rules and table separators.
@@ -25,6 +72,7 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<Line<'stati
     let mut current_style = Style::default();
     let mut in_code_block = false;
     let mut code_block_text = String::new();
+    let mut code_block_lang = String::new();
     // Ordered lists carry their start number (`Some(n)`); unordered are `None`.
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut in_blockquote = false;
@@ -71,21 +119,38 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<Line<'stati
                 flush(&mut current, &mut lines, in_blockquote);
                 in_code_block = true;
                 code_block_text.clear();
-                if let CodeBlockKind::Fenced(lang) = kind
-                    && !lang.is_empty()
-                {
+                code_block_lang.clear();
+                if let CodeBlockKind::Fenced(lang) = kind {
+                    code_block_lang = lang.to_string();
+                }
+                if !code_block_lang.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        format!(" {lang} "),
+                        format!(" {} ", code_block_lang),
                         Style::default().fg(theme.dim),
                     )));
                 }
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
-                let style = Style::default().fg(theme.md_code).bg(theme.md_code_bg);
-                for raw_line in code_block_text.lines() {
-                    lines.push(Line::from(Span::styled(raw_line.to_string(), style)));
+
+                // fallback style
+                let fallback_style = Style::default().fg(theme.md_code).bg(theme.md_code_bg);
+
+                let maybe_spans = highlight_code(&code_block_text, &code_block_lang, theme);
+
+                if let Some(highlighted_lines) = maybe_spans {
+                    for line_spans in highlighted_lines {
+                        lines.push(Line::from(line_spans));
+                    }
+                } else {
+                    for raw_line in code_block_text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            raw_line.to_string(),
+                            fallback_style,
+                        )));
+                    }
                 }
+
                 lines.push(Line::default());
             }
             Event::Text(text) => {
@@ -263,9 +328,8 @@ mod tests {
         let theme = Theme::dark();
         let lines = render_markdown("```rust\nfn main() {}\n```\n", &theme, 80);
         assert!(lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("fn main()"))
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.contains("fn main()")
         }));
     }
 

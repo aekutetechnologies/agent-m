@@ -85,14 +85,11 @@ impl AskGate for UnavailableAskGate {
     }
 }
 
-/// Shared read-dedup cache: maps (path, offset, limit) → mtime at last read.
+/// Shared read-dedup cache: maps (path, offset, limit) → content hash at last read.
 /// When the file hasn't changed, the read tool returns a stub instead of
 /// re-reading, saving tokens on repeated reads of the same range.
-pub type ReadCache = Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<(PathBuf, usize, Option<usize>), std::time::SystemTime>,
-    >,
->;
+pub type ReadCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<(PathBuf, usize, Option<usize>), u64>>>;
 
 /// Context passed to a tool execution.
 #[derive(Clone)]

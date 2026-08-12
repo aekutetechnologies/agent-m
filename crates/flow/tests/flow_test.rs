@@ -166,6 +166,7 @@ fn options() -> AgentOptions {
     AgentOptions {
         model: "fake".to_string(),
         system_prompt: "You are a test agent.".to_string(),
+        harness_block: None,
         tools: vec![],
         max_turns: 5,
         cwd: PathBuf::from("."),

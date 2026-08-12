@@ -57,8 +57,10 @@ env → `auth.json` → `settings.json` via the named env var.
 running agent. `/provider <id>` switches directly.
 
 **CLI** — `--provider <id>` selects a configured provider (or `deepseek`),
-`--api-key` overrides the key, `--list-models` shows every configured
-provider's model plus the built-in DeepSeek pair.
+`--list-models` shows every configured
+provider's model plus the built-in DeepSeek pair. Keys come from the
+environment or `~/.agent-m/agent/auth.json` — never from a CLI flag (argv is
+visible in `ps`).
 
 ## Features
 
@@ -285,6 +287,15 @@ and the harness *enforces* (risk tiers, autonomy levels).
 | 10 | Uncertainty | ✅ `<uncertainty>` note shown in the decision block |
 | 11 | Preference learning | ✅ Learns `!command` families + `/undo` → `preferences.json` → static prompt block |
 | 12 | Autonomy levels | ✅ `--level 0-4` / `/level`: observe · suggest · assisted · trusted · autonomous |
+
+**Self-improvement (`/refine`)**: on top of the preference learner, a
+Continual-Harness layer (`~/.agent-m/harness.json`) holds memories, prompt
+notes, and skills that the model proposes via `/refine` (or automatically after
+three consecutive tool failures / three `/undo`s). The base system prompt is
+immutable — only the harness block between it and the trust suffix changes
+(one prefix-cache miss at apply, then byte-stable). Every proposal is reviewed
+before applying; every op is audited and reversible via
+`/harness rollback <op-id>`. `/harness` lists the current state.
 
 **Risk tiers** (harness-assigned): reads/searches → Low; workspace writes and
 ordinary commands → Medium; outside-cwd / `.git` / force-git / `find -exec` →

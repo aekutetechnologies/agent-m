@@ -1,0 +1,77 @@
+---
+title: Sessions & worktrees
+---
+
+# Sessions & worktrees
+
+Two features for working across time (sessions) and across parallel work
+(worktrees). Plain-language versions of the terms live in
+[Concepts & glossary](/getting-started/concepts).
+
+## Sessions — pick up where you left off
+
+Every conversation is a **session**: a file on disk under
+`~/.agent-m/agent/sessions/<cwd>/` containing your messages, agent-m's
+replies, the tool calls, and the approvals.
+
+**Auto-resume**: start agent-m in the same folder and it continues your
+latest session automatically — the sidebar shows its state and `/journal`
+shows its timeline.
+
+**`/sessions` — the session manager**: type `/sessions` (or `/` and pick it
+from the command palette) to see every past session, newest first:
+
+```
+┌────────────── sessions — 2 ──────────────┐
+│ › /tmp/proj/a · 2 msgs · deepseek-chat — explain proj a │
+│   /tmp/proj/b · 1 msgs — old proj b      │
+│   enter resume · esc close               │
+└──────────────────────────────────────────┘
+```
+
+- **↑/↓** move, **Enter** resumes the selected session: the transcript
+  reloads and new messages keep appending to *that* session's file (its
+  todos, undo history, and checkpoints come along).
+- **Esc** closes. The picker reads only the first/last line of each file, so
+  it stays instant even with hundreds of sessions.
+
+Why it matters: leave a task half-done in one folder, work somewhere else,
+then `/sessions` → Enter and the context (and the undo/checkpoint safety net)
+is back — no copy-pasting between chats.
+
+## Worktrees — run parallel sessions safely
+
+A **worktree** is a separate copy of your project on its own branch. Start a
+session in one and it can edit, run tests, and create branches without
+touching your main checkout — two sessions working the same repo never
+collide.
+
+**From the command line** (inside a git repo):
+
+```bash
+agent-m --worktree fix-auth        # named
+agent-m --worktree                 # auto-named from the repo slug
+```
+
+agent-m runs `git worktree add -b agent-m/<name>-<timestamp>` and starts the
+session inside the fresh checkout under `~/.agent-m/worktrees/`. A notice
+prints the path.
+
+**Inside the TUI**:
+
+- `/worktree` — shows the current worktree and the full list (`git worktree
+  list`).
+- `/worktree detach` — removes the session's worktree (refuses the main
+  checkout, so your primary branch is always safe).
+
+Worktrees pair naturally with the safety net: `/checkpoint` snapshots git
+state before mutating tools run, and `/restore <n|sha>` rolls back — so even
+in a parallel session, nothing is irreversible (see
+[Trust principles](/trust/principles)).
+
+### Notes
+
+- `--worktree` requires a git repository and fails with a clear message
+  otherwise.
+- The worktree's session lives under the same `~/.agent-m/` data dir, so
+  `/sessions` lists worktree sessions alongside main-checkout sessions.

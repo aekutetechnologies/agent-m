@@ -44,6 +44,27 @@ pub enum TranscriptItem {
 }
 
 impl TranscriptItem {
+    pub fn matches(&self, query: &str) -> bool {
+        match self {
+            TranscriptItem::User { content } => content.to_lowercase().contains(query),
+            TranscriptItem::Assistant { parts, .. } => parts.iter().any(|part| match part {
+                ContentPart::Text { text } => text.to_lowercase().contains(query),
+                ContentPart::Thinking { thinking } => thinking.to_lowercase().contains(query),
+                _ => false,
+            }),
+            TranscriptItem::ToolExecution { name, result, .. } => {
+                name.to_lowercase().contains(query)
+                    || result
+                        .as_ref()
+                        .is_some_and(|r| r.content.to_lowercase().contains(query))
+            }
+            TranscriptItem::Plan { todos } => todos
+                .iter()
+                .any(|todo| todo.text.to_lowercase().contains(query)),
+            TranscriptItem::Notice { message } => message.to_lowercase().contains(query),
+        }
+    }
+
     /// Render the item to styled lines. Paragraphs are wrapped by ratatui at
     /// draw time; use [`TranscriptItem::height`] for layout. `stale` marks an
     /// item from a completed, no-longer-current turn: tool output and

@@ -66,19 +66,7 @@ impl Tool for ReadTool {
             )));
         }
 
-        // Read dedup: if the file hasn't changed since the last read of this
-        // range, return a stub to avoid duplicating tokens in context.
-        let cache_key = (path.clone(), offset, limit);
-        let mtime = metadata.modified().ok();
-        if let Some(mtime) = mtime {
-            let cache = context.read_cache.lock().unwrap();
-            if cache.get(&cache_key).is_some_and(|cached| *cached == mtime) {
-                return Ok(ToolOutcome::success(
-                    "(file unchanged since last read — use read again with offset/limit to re-fetch)".to_string(),
-                ));
-            }
-        }
-
+        // We must read the contents to hash it.
         let contents = tokio::time::timeout(READ_TIMEOUT, tokio::fs::read_to_string(&path))
             .await
             .map_err(|_| {
@@ -99,6 +87,27 @@ impl Tool for ReadTool {
         });
         let selected = lines[start..end].join("\n");
 
+        // Read dedup: if the file hasn't changed since the last read of this
+        // range, return a stub to avoid duplicating tokens in context.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        selected.hash(&mut hasher);
+        let content_hash = hasher.finish();
+
+        let cache_key = (path.clone(), offset, limit);
+        {
+            let mut cache = context.read_cache.lock().unwrap();
+            if cache
+                .get(&cache_key)
+                .is_some_and(|cached| *cached == content_hash)
+            {
+                return Ok(ToolOutcome::success(
+                    "(file unchanged since last read — use read again with offset/limit to re-fetch)".to_string(),
+                ));
+            }
+            cache.insert(cache_key, content_hash);
+        }
+
         let (kept, truncation_notice) = crate::truncate::truncate_output(&selected);
         let mut result = kept;
         if let Some(notice) = truncation_notice {
@@ -112,11 +121,6 @@ impl Tool for ReadTool {
         }
         if result.is_empty() {
             result = "(empty file or no lines in range)".to_string();
-        }
-
-        // Update read cache with current mtime.
-        if let Some(mtime) = mtime {
-            context.read_cache.lock().unwrap().insert(cache_key, mtime);
         }
 
         Ok(ToolOutcome::success(result))

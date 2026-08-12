@@ -45,10 +45,6 @@ struct Cli {
     #[arg(long)]
     provider: Option<String>,
 
-    /// API key override (otherwise DEEPSEEK_API_KEY env → auth.json → settings.json).
-    #[arg(long = "api-key")]
-    api_key: Option<String>,
-
     /// Auto-approve tool calls (no interactive confirmation).
     #[arg(long)]
     yes: bool,
@@ -110,6 +106,13 @@ struct Cli {
     /// Serve a stdio JSON-RPC prompt/respond loop (headless embedding).
     #[arg(long = "serve")]
     serve: bool,
+
+    /// Run this session in a fresh git worktree (`--worktree NAME`), so
+    /// parallel sessions can work the same repo without stepping on each
+    /// other (Xirp-style). Creates `agent-m/<name>-<ts>` + a checkout under
+    /// `~/.agent-m/worktrees/` and starts the agent there.
+    #[arg(long = "worktree", num_args = 0..=1, default_missing_value = "")]
+    worktree: Option<String>,
 
     /// Max agent turns per message (default 20). Raise for long tasks.
     #[arg(long = "max-turns", default_value_t = 20)]
@@ -283,6 +286,22 @@ async fn main() -> Result<()> {
 
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     let agent_dir = cli.session_dir.clone().unwrap_or_else(default_agent_dir);
+    // `--worktree`: isolate this session in a fresh git worktree and start
+    // the agent there (parallel sessions on one repo, Xirp-style).
+    let cwd = if let Some(name) = &cli.worktree {
+        let worktree = agent_m_agent::create_worktree(
+            &cwd,
+            &agent_dir,
+            Some(name.as_str()).filter(|n| !n.is_empty()),
+        )
+        .map_err(|error| anyhow::anyhow!("cannot create worktree: {error}"))?;
+        std::env::set_current_dir(&worktree)
+            .with_context(|| format!("cannot cd into {}", worktree.display()))?;
+        eprintln!("worktree: {}", worktree.display());
+        worktree
+    } else {
+        cwd
+    };
     if let Some(PluginsGroup::Plugins { command }) = &cli.plugins {
         let result = match command {
             PluginsCommand::Install { source, rev } => {
@@ -315,19 +334,16 @@ async fn main() -> Result<()> {
     let provider: Arc<dyn Provider> =
         if let Some(config) = configured.iter().find(|config| config.id == provider_id) {
             Arc::from(agent_m_ai::provider_from_config(
-                config,
-                cli.api_key.clone(),
+                config, None, // Removed CLI --api-key
                 &agent_dir,
             ))
         } else if provider_id == "deepseek" {
             // Built-in fallback (zero-config behavior unchanged).
-            let api_key = cli.api_key.clone().or_else(|| {
-                resolve_api_key(
-                    &format!("{}_API_KEY", provider_id.to_uppercase()),
-                    &provider_id,
-                    &agent_dir,
-                )
-            });
+            let api_key = resolve_api_key(
+                &format!("{}_API_KEY", provider_id.to_uppercase()),
+                &provider_id,
+                &agent_dir,
+            );
             Arc::new(OpenAiCompatibleProvider::deepseek(api_key))
         } else {
             let available = configured
@@ -479,6 +495,7 @@ async fn main() -> Result<()> {
     let agent_options = AgentOptions {
         model: model.clone(),
         system_prompt,
+        harness_block: None,
         tools,
         max_turns: cli.max_turns,
         cwd: cwd.clone(),
@@ -882,6 +899,7 @@ fn event_to_json(event: &agent_m_agent::AgentEvent) -> serde_json::Value {
         }
         E::TurnEnd { .. } => serde_json::json!({}),
         E::AgentEnd { .. } => serde_json::json!({}),
+        E::RefineResult { .. } => serde_json::json!({}),
     };
     serde_json::json!({ "event": event_name(event), "data": value })
 }
@@ -899,6 +917,7 @@ fn event_name(event: &agent_m_agent::AgentEvent) -> &'static str {
         E::Notice { .. } => "notice",
         E::Compacted { .. } => "compacted",
         E::FlowStep { .. } => "flow_step",
+        E::RefineResult { .. } => "refine_result",
         E::TurnEnd { .. } => "turn_end",
         E::AgentEnd { .. } => "agent_end",
     }

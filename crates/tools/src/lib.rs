@@ -18,6 +18,7 @@ mod search;
 mod truncate;
 mod web;
 mod write;
+mod outline;
 
 pub use ask::AskTool;
 pub use bash::BashTool;
@@ -32,6 +33,7 @@ pub use search::SearchTool;
 pub use truncate::{MAX_BYTES, MAX_LINES};
 pub use web::{WebFetchTool, WebSearchTool};
 pub use write::WriteTool;
+pub use outline::ViewOutlineTool;
 
 use agent_m_agent::Tool;
 use std::sync::Arc;
@@ -50,6 +52,7 @@ pub fn all_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SearchTool),
         Arc::new(WebFetchTool),
         Arc::new(WebSearchTool),
+        Arc::new(ViewOutlineTool),
     ]
 }
 
@@ -70,5 +73,6 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SearchTool),
         Arc::new(WebFetchTool),
         Arc::new(WebSearchTool),
+        Arc::new(ViewOutlineTool),
     ]
 }

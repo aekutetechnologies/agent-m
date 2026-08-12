@@ -18,7 +18,6 @@ there is no interactive approval in print mode.
 | `-p`, `--print` | Print mode: stream the reply to stdout |
 | `--model <MODEL>` | Model id (e.g. `deepseek-chat`, `deepseek-reasoner`) |
 | `--provider <PROVIDER>` | Provider id (default `deepseek`) |
-| `--api-key <API_KEY>` | API key override (otherwise env → `auth.json` → `settings.json`) |
 | `--yes` | Auto-approve tool calls (also enables tools in print mode) |
 | `--no-tools` | Disable all tools |
 | `--tools <TOOLS>` | Active tool set (comma-separated) |
@@ -32,6 +31,7 @@ there is no interactive approval in print mode.
 | `--compact-threshold <F>` | Auto-compact fraction of the context window (default `0.5`) |
 | `--flow <PATH>` | Run a YAML flow in print mode |
 | `--stream-json` | Print mode: emit machine-readable JSON event lines (`agent_start`, `message_*`, `tool_execution_*`, …) instead of plain text |
+| `--worktree [NAME]` | Run this session in a fresh git worktree (branch `agent-m/<name>-<ts>`, checkout under `~/.agent-m/worktrees/`) so parallel sessions don't collide — see [Sessions & worktrees](/usage/sessions-worktrees) |
 | `--serve` | Headless stdio server: LSP-framed JSON-RPC (`prompt`, `exit`) streaming agent events — see [Headless](/extending/headless) |
 | `--level <0-4>` | Autonomy level: 0 observe · 1 suggest · 2 assisted · 3 trusted (default) · 4 autonomous |
 | `--allow-path <PATH>` | Extra directory the file tools may access (repeatable) |

@@ -26,6 +26,9 @@
       "group": "Getting Started",
       "pages": [
         "overview",
+        "getting-started/what-is-agent-m",
+        "getting-started/install",
+        "getting-started/concepts",
         "getting-started/quickstart"
       ]
     },
@@ -34,7 +37,8 @@
       "pages": [
         "cli/reference",
         "ui/keybindings",
-        "ui/sidebar"
+        "ui/sidebar",
+        "usage/sessions-worktrees"
       ]
     },
     {
@@ -43,6 +47,7 @@
         "trust/principles",
         "trust/risk-tiers",
         "trust/autonomy",
+        "trust/self-improvement",
         "security/boundaries"
       ]
     },

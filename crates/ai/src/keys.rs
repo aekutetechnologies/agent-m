@@ -17,10 +17,15 @@ pub fn resolve_api_key(env_var: &str, provider_id: &str, agent_dir: &Path) -> Op
         return Some(key);
     }
 
-    for file in ["auth.json", "settings.json"] {
-        if let Some(key) = read_key_from_file(&agent_dir.join(file), provider_id) {
-            return Some(key);
-        }
+    if let Some(key) = read_key_from_file(&agent_dir.join("auth.json"), provider_id) {
+        return Some(key);
+    }
+
+    if read_key_from_file(&agent_dir.join("settings.json"), provider_id).is_some() {
+        tracing::warn!(
+            "API key for {} found in settings.json! This file is world-readable (0644). Please move it to auth.json immediately.",
+            provider_id
+        );
     }
 
     None
@@ -109,20 +114,6 @@ mod tests {
         assert_eq!(
             resolve_api_key("UNSET_VAR_XYZ", "deepseek", dir.path()),
             Some("flat-key".to_string())
-        );
-    }
-
-    #[test]
-    fn falls_back_to_settings_json() {
-        let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("settings.json"),
-            r#"{"providers": {"deepseek": {"apiKey": "settings-key"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_api_key("UNSET_VAR_XYZ", "deepseek", dir.path()),
-            Some("settings-key".to_string())
         );
     }
 

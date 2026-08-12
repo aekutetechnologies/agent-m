@@ -37,7 +37,7 @@ pub fn load(agent_dir: &Path) -> Preferences {
 
 fn save(agent_dir: &Path, prefs: &Preferences) {
     if let Ok(text) = serde_json::to_string(prefs) {
-        let _ = std::fs::write(preferences_path(agent_dir), text);
+        let _ = crate::sessions::atomic_save(&preferences_path(agent_dir), text);
     }
 }
 

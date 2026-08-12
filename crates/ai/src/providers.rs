@@ -119,7 +119,26 @@ pub fn save_provider_configs(
         .unwrap_or_else(|| serde_json::json!({}));
     root["providers"] = serde_json::to_value(providers).unwrap_or(serde_json::json!([]));
     let pretty = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, format!("{pretty}\n"))
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = path.with_extension(format!("tmp-{nanos}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(format!("{pretty}\n").as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, path)
 }
 
 #[cfg(test)]

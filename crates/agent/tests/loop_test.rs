@@ -150,6 +150,7 @@ fn options() -> AgentOptions {
     AgentOptions {
         model: "fake".to_string(),
         system_prompt: "You are a test agent.".to_string(),
+        harness_block: None,
         tools: vec![Arc::new(EchoTool)],
         max_turns: 5,
         cwd: PathBuf::from("."),
@@ -175,6 +176,7 @@ fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AgentEnd { .. } => "agent_end",
         AgentEvent::Notice { .. } => "notice",
         AgentEvent::FlowStep { .. } => "flow_step",
+        AgentEvent::RefineResult { .. } => "refine_result",
     }
 }
 
@@ -491,6 +493,7 @@ async fn plan_mode_hides_mutating_tools() {
         AgentOptions {
             model: "fake".to_string(),
             system_prompt: "You are a test agent.".to_string(),
+            harness_block: None,
             // The full registered set, as the CLI now provides: read-only
             // tools (which plan mode keeps) plus mutating ones (which it
             // hides).
@@ -657,6 +660,7 @@ async fn ask_tool_returns_user_answer_and_continues() {
         AgentOptions {
             model: "fake".to_string(),
             system_prompt: "You are a test agent.".to_string(),
+            harness_block: None,
             tools: vec![Arc::new(AskStub)],
             max_turns: 4,
             cwd: PathBuf::from("."),
@@ -704,6 +708,7 @@ async fn compaction_replaces_older_messages_with_summary() {
         AgentOptions {
             model: "fake".to_string(),
             system_prompt: "You are a test agent.".to_string(),
+            harness_block: None,
             tools: vec![Arc::new(EchoTool)],
             max_turns: 5,
             cwd: PathBuf::from("."),

@@ -148,23 +148,12 @@ impl Tool for WebFetchTool {
 /// blocked by name; DNS-rebinding protection for arbitrary hostnames is a
 /// documented limit.
 fn url_allowed(url: &str) -> Result<(), &'static str> {
-    let Some((_, rest)) = url.split_once("://") else {
-        return Err("not an absolute URL");
-    };
-    let host_port = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    if host_port.is_empty() {
-        return Err("no host");
-    }
-    let host = host_port.to_lowercase();
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid URL")?;
+    // host_str keeps the brackets on IPv6 literals (`[::1]`), which would
+    // dodge the literal-IP checks — strip them first.
+    let host = parsed.host_str().ok_or("no host")?.to_lowercase();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.strip_suffix('.').unwrap_or(host);
     if host == "localhost"
         || host.ends_with(".localhost")
         || host == "metadata.google.internal"
@@ -424,6 +413,26 @@ mod tests {
         assert!(url_allowed("http://metadata.google.internal/").is_err());
         assert!(url_allowed("https://example.com/path").is_ok());
         assert!(url_allowed("https://example.com:443/x").is_ok());
+        // Regression: bracketed IPv6 literals and trailing dots must not
+        // dodge the loopback/private checks (the old host parsing mangled
+        // `[::1]` into `[` and missed `localhost.`).
+        assert!(
+            url_allowed("http://[::1]:8080/").is_err(),
+            "bracketed loopback IPv6"
+        );
+        assert!(url_allowed("http://[0:0:0:0:0:0:0:1]/").is_err());
+        assert!(
+            url_allowed("http://localhost./x").is_err(),
+            "trailing-dot localhost"
+        );
+        assert!(
+            url_allowed("http://127.0.0.1./x").is_err(),
+            "trailing-dot IP"
+        );
+        assert!(
+            url_allowed("http://metadata.google.internal./").is_err(),
+            "trailing-dot metadata hostname"
+        );
         assert!(
             url_allowed("file:///etc/passwd").is_err(),
             "no scheme-relative"

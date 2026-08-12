@@ -79,4 +79,13 @@ picker with a notice. The variant resets when you switch models.
 - `/level <0-4>` — set the autonomy level live (persisted to `settings.json`).
 - `/sidebar` — toggle the right-side status sidebar (or `/sidebar
   <context|timing|flow|todos>` to collapse one section).
+- `/sessions` — list past sessions and resume one (see
+  [Sessions & worktrees](/usage/sessions-worktrees)).
+- `/worktree` — show the current git worktree + all worktrees; `/worktree
+  detach` removes the session's worktree.
+- `/refine [focus]` — plan a harness improvement (memories/notes/skills) from
+  the session; Enter applies, Esc dismisses (see
+  [Self-improvement](/trust/self-improvement)).
+- `/harness` — show the harness state; `/harness rollback <op-id>` reverts an
+  op.
 - `!command` — runs bash directly, without the model (e.g. `!git status`).

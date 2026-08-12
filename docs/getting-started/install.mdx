@@ -1,0 +1,107 @@
+---
+title: Install & first chat
+---
+
+# Install & first chat (5 minutes)
+
+This guide assumes **no terminal experience**. Every command below is copy-paste
+friendly — paste it, press **Enter**, wait.
+
+## Step 1 — Install
+
+You need three things already on your computer (most Macs have them):
+
+- **A terminal app** (macOS: "Terminal" or "iTerm").
+- **Rust's toolchain** — run this and follow the prompts:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+- **A code editor** (VS Code, Zed, or anything you like) — not strictly
+  required for this guide.
+
+Now build and install agent-m (this takes a few minutes the first time):
+
+```bash
+git clone https://github.com/your-org/agent-m.git   # or wherever you have it
+cd agent-m
+cargo build --release
+```
+
+## Step 2 — Give it an AI to talk to
+
+agent-m itself has no brain — you connect it to one. The easiest option is
+**DeepSeek** (cheap and works out of the box):
+
+1. Go to <https://platform.deepseek.com> and create an API key (it looks like
+   `sk-...`).
+2. Tell agent-m about it:
+
+```bash
+mkdir -p ~/.agent-m/agent
+echo '{"deepseek": "sk-YOUR-KEY-HERE"}' > ~/.agent-m/agent/auth.json
+```
+
+Don't have a DeepSeek account? See [Providers](/extending/providers) for
+OpenAI, Anthropic, or a local model (Ollama) — the steps are the same, you
+just put the key in a different place.
+
+## Step 3 — Your first chat
+
+Open a terminal **inside a project folder** (any folder with code) and run:
+
+```bash
+agent-m
+```
+
+You'll see a screen like this:
+
+```
+┌─────────────┐   ┌──────────────────────────┐
+│  your chat  │   │  ◔ ▾ context             │
+│             │   │     model: deepseek-chat │
+│  ❯ type here │   │     tokens in: 0        │
+└─────────────┘   └──────────────────────────┘
+```
+
+Type a question and press **Enter**, for example:
+
+```
+what is this project about?
+```
+
+You'll see, in order:
+
+1. **agent-m starts working** — the status line narrates what it's doing
+   (`Reading src/app.rs…`, `Running cargo test…`).
+2. **A live, streaming answer** — the model's reply appears word by word.
+3. **A request to approve a tool** — the first time it wants to read/run
+   something it may ask you to press a key to allow it (this is the safety
+   gate — always read what it wants to do).
+4. **The final reply** with a small "decision" note (its confidence, what it
+   expected to happen).
+
+## Step 4 — The 4 things to know to not feel lost
+
+| You see this | It means | You do |
+|---|---|---|
+| `❯` at the bottom | The input box — type here | Type + **Enter** |
+| `Reading …` / `Running …` | It's working | Wait |
+| A box asking **allow / deny** | It wants to run a command or change a file | Read it, press the shown key |
+| `ctrl+c` (empty input) | Nothing typed | Exits cleanly |
+
+**Never panic about making a mess**: every `write`/`edit` is snapshotted, so
+`/undo` rolls it back, and `/checkpoint`/`/restore` snapshot the whole git
+state (see [Trust](/trust/principles)).
+
+## Troubleshooting
+
+- **`command not found: agent-m`** — the install path isn't in your PATH. Run
+  `~/.cargo/bin/agent-m` instead, or add `~/.cargo/bin` to your PATH.
+- **`no API key for provider 'deepseek'`** — Step 2's `auth.json` didn't land.
+  Re-run the `echo` command, then start agent-m again.
+- **It's slow on the first message** — the first request warms up the
+  provider's cache; follow-ups are usually faster.
+- Anything else — see [Trust](/trust/principles) for how agent-m keeps you
+  safe, or open an issue.

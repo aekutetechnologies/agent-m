@@ -14,6 +14,7 @@ mod context;
 mod message;
 mod risk;
 mod tool;
+mod worktree;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, InterruptHandle, Mode};
 pub use checkpoint::{create_checkpoint, is_git_repo, restore_checkpoint};
@@ -26,3 +27,4 @@ pub use tool::{
     ReadOnlyAutoApproveGate, SelectiveAskGate, TierGate, Tool, ToolCallInfo, ToolContext,
     ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
 };
+pub use worktree::{create_worktree, list_worktrees, remove_worktree};

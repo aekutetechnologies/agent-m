@@ -36,11 +36,12 @@ impl Mode {
 /// extension): the model must produce a numbered `Plan:` list and may not
 /// mutate anything. The available tools are named explicitly so the model
 /// does not invent `bash` calls or try to read directories.
-const PLAN_MODE_BLOCK: &str = "\n\nYou are in PLAN MODE. You may only read, search, and ask questions — you cannot modify files or run state-changing commands. Available tools: `ls` (list a directory — use this instead of reading a directory), `read` (read one file), `grep` (search file contents), `find` (locate files), `ask` (ask the user a question). There is no `bash` tool in plan mode. Explore the codebase, then create a detailed numbered plan under a heading `Plan:`, one item per line (`1. step`). Each step must be a concrete, verifiable action. Do not execute the plan yet.";
+const PLAN_MODE_BLOCK: &str = "\n\nYou are in PLAN MODE. You may only read, search, and ask questions — you cannot modify files or run state-changing commands. Available tools: `ls` (list a directory — use this instead of reading a directory), `read` (read one file), `view_outline` (fast AST outline of a file), `grep` (search file contents), `find` (locate files), `ask` (ask the user a question). There is no `bash` tool in plan mode. Explore the codebase, then create a detailed numbered plan under a heading `Plan:`, one item per line (`1. step`). Each step must be a concrete, verifiable action. Do not execute the plan yet.";
 
 /// The tools a plan-mode agent may call (read-only + ask).
 pub(crate) const PLAN_TOOLS: &[&str] = &[
     "read",
+    "view_outline",
     "grep",
     "find",
     "ls",
@@ -105,6 +106,9 @@ pub struct AgentOptions {
     pub model: String,
     /// Fixed system prompt. Assembled once and byte-stable for the session.
     pub system_prompt: String,
+    /// Continual-Harness block (memories/notes/skills), injected between the
+    /// base prompt and the trust suffix. Rebuilt only on refine/rollback.
+    pub harness_block: Option<String>,
     /// The tools the model may call (already allow/deny filtered).
     pub tools: Vec<Arc<dyn Tool>>,
     /// Safety cap on the number of model turns (including tool-call turns).
@@ -152,6 +156,11 @@ pub enum AgentEvent {
     ToolExecutionEnd {
         tool_call_id: String,
         outcome: ToolOutcome,
+    },
+    /// The background refinement planner finished. The proposal is JSON
+    /// (the agent crate does not depend on the tui crate's types).
+    RefineResult {
+        proposal_json: String,
     },
     TurnEnd {
         message: SessionMessage,
@@ -279,6 +288,11 @@ impl Agent {
     /// The system prompt for the current mode (byte-stable within a mode).
     fn current_system_prompt(&self) -> String {
         let mut prompt = self.raw_system_prompt();
+        if let Some(harness) = &self.options.harness_block
+            && !harness.is_empty()
+        {
+            prompt.push_str(harness);
+        }
         prompt.push_str(TRUST_BLOCK);
         prompt
     }
@@ -325,6 +339,18 @@ impl Agent {
 
     pub fn set_variant(&mut self, variant: Option<String>) {
         self.options.variant = variant;
+    }
+
+    /// Replace the Continual-Harness prompt block (memories/notes/skills).
+    /// The base prompt + trust suffix stay immutable; the harness layer sits
+    /// between them, so one prefix-cache miss happens at apply, then the
+    /// prompt is byte-stable again.
+    pub fn set_harness_block(&mut self, block: String) {
+        self.options.harness_block = if block.trim().is_empty() {
+            None
+        } else {
+            Some(block)
+        };
     }
 
     pub fn variant(&self) -> Option<&str> {
