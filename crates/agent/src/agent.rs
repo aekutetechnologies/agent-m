@@ -361,6 +361,16 @@ impl Agent {
         &self.options.model
     }
 
+    pub fn options(&self) -> &AgentOptions {
+        &self.options
+    }
+
+    pub fn options_mut(&mut self) -> &mut AgentOptions {
+        &mut self.options
+    }
+
+
+
     pub fn subscribe(&mut self, listener: impl Fn(&AgentEvent) + Send + Sync + 'static) {
         self.listeners.push(Arc::new(listener));
     }

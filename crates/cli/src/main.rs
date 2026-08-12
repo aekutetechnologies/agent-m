@@ -16,9 +16,23 @@ use agent_m_tools::{all_tools, default_tools};
 const TOOL_BUDGET: usize = 80;
 /// Startup context cap (chars) for the injected AGENTS.md/system prompt.
 const STARTUP_CONTEXT_MAX_CHARS: usize = 50_000;
-use agent_m_tui::{App, AppInputs, Theme, UiMode};
-
+#[allow(dead_code)]
+mod harness;
+#[allow(dead_code)]
+mod plan;
+#[allow(dead_code)]
+mod prefs;
+#[allow(dead_code)]
+mod refine;
+#[allow(dead_code)]
+mod sessions;
 mod plugins;
+mod repl;
+mod commands;
+mod gate;
+mod progress;
+mod daemon;
+mod attach;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::io::{IsTerminal, Write};
@@ -40,6 +54,22 @@ struct Cli {
     /// Model id, e.g. `deepseek-chat` or `deepseek-reasoner`.
     #[arg(long)]
     model: Option<String>,
+
+    /// Reasoning effort variant (e.g. `default`, `low`, `high`, `max`).
+    #[arg(long)]
+    variant: Option<String>,
+
+    /// Run as a background daemon session with the given session ID.
+    #[arg(long)]
+    daemon: Option<String>,
+
+    /// Attach to an active daemon session.
+    #[arg(long)]
+    attach: Option<String>,
+
+    /// List active background daemon sessions.
+    #[arg(long = "list-daemons")]
+    list_daemons: bool,
 
     /// Provider id (default: deepseek).
     #[arg(long)]
@@ -181,6 +211,7 @@ fn load_settings(agent_dir: &Path) -> serde_json::Value {
         .unwrap_or(serde_json::json!({}))
 }
 
+#[allow(dead_code)]
 fn resolve_level(cli: &Cli, settings: &serde_json::Value) -> agent_m_agent::AutonomyLevel {
     let number = cli
         .level
@@ -214,39 +245,7 @@ fn resolve_model(cli: &Cli, settings: &serde_json::Value, provider: &dyn Provide
         .unwrap_or_else(|| "deepseek-chat".to_string())
 }
 
-fn resolve_theme(cli: &Cli, settings: &serde_json::Value) -> Result<Theme> {
-    let choice = cli.theme.clone().or_else(|| {
-        settings
-            .get("theme")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    });
-    let theme = match choice.as_deref() {
-        None => Theme::default_for_terminal(),
-        Some("dark") => Theme::dark(),
-        Some("light") => Theme::light(),
-        Some(path) => {
-            let contents = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read theme file {path}"))?;
-            agent_m_tui::theme::parse_theme(&contents)
-                .map_err(|error| anyhow::anyhow!("invalid theme {path}: {error}"))?
-        }
-    };
-    Ok(theme.downgrade_for_terminal())
-}
 
-fn resolve_ui_mode(cli: &Cli, settings: &serde_json::Value) -> UiMode {
-    let choice = cli.ui_mode.clone().or_else(|| {
-        settings
-            .get("uiMode")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    });
-    match choice.as_deref().and_then(UiMode::parse) {
-        Some(mode) => mode,
-        None => UiMode::Fullscreen,
-    }
-}
 
 fn build_tools(cli: &Cli) -> Vec<Arc<dyn Tool>> {
     if cli.no_tools {
@@ -481,7 +480,7 @@ async fn main() -> Result<()> {
     let context_files = agent_m_agent::discover_instructions(&cwd);
     // check.md principle 11: reflect learned preferences back to the model as
     // a static block (rebuilt only when preferences change — byte-stable).
-    let preference_block = agent_m_tui::prefs::prompt_block(&agent_m_tui::prefs::load(&agent_dir));
+    let preference_block = String::new(); // TODO: Reintegrate prefs
     let system_prompt = format!(
         "{base_prompt}{}{preference_block}",
         agent_m_agent::render_instructions(&context_files)
@@ -510,7 +509,7 @@ async fn main() -> Result<()> {
             .iter()
             .find(|m| m.id == model)
             .and_then(|m| m.context_window),
-        variant: None,
+        variant: cli.variant.clone(),
         output_dir: Some(agent_dir.join("tool_outputs")),
     };
 
@@ -538,31 +537,47 @@ async fn main() -> Result<()> {
         return run_print(provider, agent_options, gate, messages, cli.stream_json).await;
     }
 
-    let theme = resolve_theme(&cli, &settings)?;
-    let ui_mode = resolve_ui_mode(&cli, &settings);
-    let show_cache_notices = settings
-        .get("showCacheMissNotices")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    if cli.resume {
-        eprintln!("resuming most recent session (agent-m sessions are auto-resumed)");
+    if cli.list_daemons {
+        let dir = crate::daemon::get_sockets_dir(&agent_dir)?;
+        println!("Active daemon sockets in {}:", dir.display());
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.ends_with(".sock") {
+                    println!("  - {}", name_str.trim_end_matches(".sock"));
+                }
+            }
+        }
+        return Ok(());
     }
 
-    App::run(AppInputs {
-        provider: provider.clone(),
+    if let Some(session_id) = &cli.attach {
+        return crate::attach::run_attach(session_id, &agent_dir).await;
+    }
+
+    if let Some(session_id) = &cli.daemon {
+        let gate = Arc::new(crate::gate::CliPromptGate::new(risk.clone(), cli.yes));
+        return crate::daemon::run_daemon(
+            session_id.clone(),
+            provider,
+            agent_options,
+            gate,
+            agent_dir,
+            cwd,
+        )
+        .await;
+    }
+
+    let gate = Arc::new(crate::gate::CliPromptGate::new(risk.clone(), cli.yes));
+
+    crate::repl::run_repl(
+        provider.clone(),
         agent_options,
-        theme,
-        ui_mode,
-        show_cache_notices,
-        models: provider.models().to_vec(),
-        context_files,
-        approve_tools: cli.yes,
-        compact_threshold: cli.compact_threshold,
-        level: resolve_level(&cli, &settings),
+        gate,
         agent_dir,
         cwd,
-    })
+    )
     .await
 }
 
@@ -754,12 +769,20 @@ async fn run_print(
         }
         return Ok(());
     }
-    agent.subscribe(|event| match event {
+    let stream_filter = Arc::new(std::sync::Mutex::new(crate::repl::StreamFilter::default()));
+    let filter_listener = stream_filter.clone();
+
+    agent.subscribe(move |event| match event {
         agent_m_agent::AgentEvent::MessageUpdate {
             delta: agent_m_ai::StreamEvent::TextDelta { delta },
         } => {
-            print!("{delta}");
-            let _ = std::io::stdout().flush();
+            if let Ok(mut sf) = filter_listener.lock() {
+                let to_print = sf.push(delta);
+                if !to_print.is_empty() {
+                    print!("{to_print}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
         }
         agent_m_agent::AgentEvent::ToolExecutionStart {
             name, arguments, ..
@@ -781,15 +804,35 @@ async fn run_print(
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
         if !input.trim().is_empty() {
+            if let Ok(mut sf) = stream_filter.lock() {
+                *sf = crate::repl::StreamFilter::default();
+            }
             agent.prompt(input.trim().to_string()).await?;
+            if let Ok(mut sf) = stream_filter.lock() {
+                let rest = sf.finish();
+                if !rest.is_empty() {
+                    print!("{rest}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
         }
     } else {
         for (message, images) in messages {
+            if let Ok(mut sf) = stream_filter.lock() {
+                *sf = crate::repl::StreamFilter::default();
+            }
             let result = if images.is_empty() {
                 agent.prompt(message).await
             } else {
                 agent.prompt_with_images(message, images).await
             };
+            if let Ok(mut sf) = stream_filter.lock() {
+                let rest = sf.finish();
+                if !rest.is_empty() {
+                    print!("{rest}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
             result?;
         }
     }
@@ -821,7 +864,18 @@ fn init_tracing() -> OtelGuard {
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agent_m=info,warn"));
-    let fmt = tracing_subscriber::fmt::layer().with_target(false);
+    
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agent-m")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "agent.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(non_blocking);
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok()
         && let Ok(provider) = build_otlp_provider()
@@ -833,17 +887,21 @@ fn init_tracing() -> OtelGuard {
             .with(fmt)
             .with(otel_layer)
             .try_init();
-        return OtelGuard(Some(provider));
+        return OtelGuard(Some(provider), Some(guard));
     }
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt)
         .try_init();
-    OtelGuard(None)
+    OtelGuard(None, Some(guard))
 }
 
-/// Flushes the OTLP batch exporter on drop, covering every exit path.
-struct OtelGuard(Option<opentelemetry_sdk::trace::TracerProvider>);
+/// Flushes the OTLP batch exporter and tracing appender on drop.
+#[allow(dead_code)]
+struct OtelGuard(
+    Option<opentelemetry_sdk::trace::TracerProvider>,
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+);
 impl Drop for OtelGuard {
     fn drop(&mut self) {
         if let Some(provider) = self.0.take() {

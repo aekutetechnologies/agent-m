@@ -16,7 +16,6 @@ agent-m-mcp = { path = "../mcp" }
 agent-m-plugin-loader = { path = "../plugin-loader" }
 agent-m-ai = { path = "../ai" }
 agent-m-tools = { path = "../tools" }
-agent-m-tui = { path = "../tui" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
@@ -30,6 +29,14 @@ opentelemetry-otlp = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = "0.2.5"
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { version = "1", features = ["v7"] }
+futures-util = "0.3"
+rustyline = "14"
+termimad = "0.30"
+indicatif = "0.17"
 
 [dev-dependencies]
 tempfile = { workspace = true }

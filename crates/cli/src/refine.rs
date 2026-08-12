@@ -305,8 +305,7 @@ mod tests {
         async fn stream_chat(
             &self,
             _request: ChatRequest,
-        ) -> Result<futures_util::stream::BoxStream<'static, StreamEvent>, agent_m_ai::AiError>
-        {
+        ) -> Result<futures_util::stream::BoxStream<'static, StreamEvent>, agent_m_ai::AiError> {
             let events = vec![StreamEvent::TextDelta {
                 delta: self.reply.to_string(),
             }];
