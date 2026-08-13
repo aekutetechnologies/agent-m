@@ -53,6 +53,29 @@ pub fn load_servers(agent_dir: &Path) -> McpServers {
     servers
 }
 
+/// Create a starter mcp.json template when launching agent-m for the first time.
+pub fn ensure_default_mcp(agent_dir: &Path) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(agent_dir);
+    let path = agent_dir.join("mcp.json");
+    if path.exists() {
+        return Ok(());
+    }
+    let template = serde_json::json!({
+        "mcpServers": {
+            "filesystem": {
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@modelcontextprotocol/server-filesystem",
+                    "."
+                ]
+            }
+        }
+    });
+    let pretty = serde_json::to_string_pretty(&template)?;
+    std::fs::write(&path, format!("{pretty}\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

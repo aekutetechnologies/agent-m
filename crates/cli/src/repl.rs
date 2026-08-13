@@ -119,7 +119,7 @@ const COMMANDS: &[&str] = &[
     "/exit", "/quit", "/sessions", "/undo", "/model", "/variant",
     "/mode", "/usage", "/level", "/harness", "/refine", "/todos",
     "/worktree", "/journal", "/checkpoint", "/restore", "/flows",
-    "/compact", "/tool-output", "/tools", "/color", "/provider", "/help",
+    "/compact", "/tool-output", "/tools", "/color", "/provider", "/tasks", "/help",
 ];
 
 struct CommandHelper;

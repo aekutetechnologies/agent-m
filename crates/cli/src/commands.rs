@@ -135,53 +135,120 @@ pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> C
                 };
                 CommandResult::Handled(format!("Current mode: {}", mode))
             } else {
+                let settings_config = agent_m_ai::load_settings_config(ctx.agent_dir);
                 match args[0].to_lowercase().as_str() {
                     "plan" => {
                         ctx.agent.set_mode(Mode::Plan);
+                        let mut msg = String::from("Switched to plan mode.");
+                        if let Some((prov_id, model_opt)) = agent_m_ai::resolve_task_route(&settings_config, "plan") {
+                            if let Some(config) = settings_config.providers.iter().find(|c| c.id == prov_id) {
+                                let new_provider: Arc<dyn Provider> = Arc::from(agent_m_ai::provider_from_config(config, None, ctx.agent_dir));
+                                ctx.provider = new_provider.clone();
+                                let target_model = model_opt.unwrap_or(config.model.clone());
+                                ctx.agent.set_model(&target_model);
+                                msg.push_str(&format!(" (Routed to {}/{})", prov_id, target_model));
+                            }
+                        }
                         CommandResult::Handled(section::render_box(
                             "mode",
-                            &["Read-only · no file writes".to_string()],
+                            &[msg, "Read-only · no file writes".to_string()],
                             section::SectionKind::Notice,
                             section::terminal_width(),
                         ))
                     }
                     "build" => {
                         ctx.agent.set_mode(Mode::Build);
+                        let mut msg = String::from("Switched to build mode.");
+                        if let Some((prov_id, model_opt)) = agent_m_ai::resolve_task_route(&settings_config, "build") {
+                            if let Some(config) = settings_config.providers.iter().find(|c| c.id == prov_id) {
+                                let new_provider: Arc<dyn Provider> = Arc::from(agent_m_ai::provider_from_config(config, None, ctx.agent_dir));
+                                ctx.provider = new_provider.clone();
+                                let target_model = model_opt.unwrap_or(config.model.clone());
+                                ctx.agent.set_model(&target_model);
+                                msg.push_str(&format!(" (Routed to {}/{})", prov_id, target_model));
+                            }
+                        }
                         CommandResult::Handled(section::render_box(
                             "mode",
-                            &["Writes enabled · tools active".to_string()],
+                            &[msg, "Full workspace write capability enabled".to_string()],
                             section::SectionKind::Notice,
                             section::terminal_width(),
                         ))
                     }
                     other => CommandResult::Handled(format!(
-                        "Unknown mode `{}`. Use 'plan' or 'build'.",
+                        "Unknown mode `{}`. Available: plan, build",
                         other
                     )),
                 }
             }
         }
+        "/tasks" => {
+            let settings_config = agent_m_ai::load_settings_config(ctx.agent_dir);
+            if args.is_empty() {
+                let mut out = String::from("Task Model Routes:\n");
+                let roles = ["build", "plan", "compact", "subagent", "refine"];
+                for role in &roles {
+                    let route = settings_config.tasks.get(*role).cloned().unwrap_or_else(|| {
+                        if let Some((p, m)) = agent_m_ai::resolve_task_route(&settings_config, role) {
+                            format!("{} (default)", m.map(|model| format!("{p}/{model}")).unwrap_or(p))
+                        } else {
+                            "unconfigured".to_string()
+                        }
+                    });
+                    out.push_str(&format!("  - {:<10} -> {}\n", role, route));
+                }
+                out.push_str("\nUsage:\n  /tasks set <role> <provider/model>\n  /tasks clear <role>");
+                CommandResult::Handled(out)
+            } else if args[0] == "set" && args.len() >= 3 {
+                let role = args[1];
+                let route = args[2];
+                if let Err(e) = agent_m_ai::set_task_route(ctx.agent_dir, role, Some(route)) {
+                    CommandResult::Handled(format!("Failed to save task route: {e}"))
+                } else {
+                    CommandResult::Handled(format!("Task route saved: {role} -> {route}"))
+                }
+            } else if args[0] == "clear" && args.len() >= 2 {
+                let role = args[1];
+                if let Err(e) = agent_m_ai::set_task_route(ctx.agent_dir, role, None) {
+                    CommandResult::Handled(format!("Failed to clear task route: {e}"))
+                } else {
+                    CommandResult::Handled(format!("Task route cleared for `{role}`"))
+                }
+            } else {
+                CommandResult::Handled(
+                    "Usage:\n  /tasks\n  /tasks set <role> <provider/model>\n  /tasks clear <role>".to_string()
+                )
+            }
+        }
         "/usage" => {
             let (last_input, context_window) = ctx.agent.context_usage();
             let cache_stats = ctx.agent.cache_stats();
+            let pct = if context_window.unwrap_or(0) > 0 {
+                (last_input as f64 / context_window.unwrap_or(1) as f64 * 100.0) as usize
+            } else {
+                0
+            };
             CommandResult::Handled(format!(
-                "Telemetry Usage:\n  - Last Input Tokens: {}\n  - Context Limit: {}\n  - Cache Hit Tokens: {}\n  - Cache Miss Tokens: {}\n  - Total Requests: {}",
+                "Context Window: {} / {} tokens ({}%)\nCache Stats: {} hits, {} misses, {} requests",
                 last_input,
-                context_window
-                    .map(|w| w.to_string())
-                    .unwrap_or_else(|| "unspecified".to_string()),
+                context_window.map(|w| w.to_string()).unwrap_or_else(|| "unspecified".to_string()),
+                pct,
                 cache_stats.hit_tokens,
                 cache_stats.miss_tokens,
-                cache_stats.requests,
+                cache_stats.requests
             ))
         }
         "/level" => {
-            CommandResult::Handled("Autonomy level is set via CLI startup flags.".to_string())
+            if args.is_empty() {
+                CommandResult::Handled(format!("Autonomy level: {:?}", ctx.agent.mode()))
+            } else {
+                CommandResult::Handled("Set autonomy level via --level flag".to_string())
+            }
         }
         "/harness" => {
             let harness = crate::harness::load(ctx.agent_dir);
             if harness.entries.is_empty() {
-                CommandResult::Handled("No active harness notes.".to_string())
+                CommandResult::Handled("Harness memory empty.".to_string())
             } else {
                 let mut out = String::from("Harness Notes:\n");
                 for entry in &harness.entries {
@@ -199,10 +266,22 @@ pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> C
             let harness = crate::harness::load(ctx.agent_dir);
             let harness_state = crate::refine::render_harness_state(&harness);
             let trajectory = crate::refine::collect_trajectory(ctx.agent_dir, ctx.cwd, 20);
-            let model = ctx.agent.model().to_string();
+            let settings_config = agent_m_ai::load_settings_config(ctx.agent_dir);
+            let (refine_provider, refine_model) = if let Some((prov_id, m_opt)) = agent_m_ai::resolve_task_route(&settings_config, "refine") {
+                if let Some(config) = settings_config.providers.iter().find(|c| c.id == prov_id) {
+                    let prov: Arc<dyn Provider> = Arc::from(agent_m_ai::provider_from_config(config, None, ctx.agent_dir));
+                    let model = m_opt.unwrap_or(config.model.clone());
+                    (prov, model)
+                } else {
+                    (ctx.provider.clone(), ctx.agent.model().to_string())
+                }
+            } else {
+                (ctx.provider.clone(), ctx.agent.model().to_string())
+            };
+
             match crate::refine::propose_refinement(
-                ctx.provider.as_ref(),
-                &model,
+                refine_provider.as_ref(),
+                &refine_model,
                 &trajectory,
                 &harness_state,
                 focus.as_deref(),

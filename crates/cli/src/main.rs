@@ -8,7 +8,7 @@ use agent_m_agent::{
     Agent, AgentOptions, AlwaysAllowGate, DangerousCommandGate, DenyAllGate, PermissionGate,
     RiskPolicy, SessionMessage, Tool,
 };
-use agent_m_ai::{OpenAiCompatibleProvider, Provider, resolve_api_key};
+use agent_m_ai::Provider;
 use agent_m_tools::{all_tools, default_tools};
 
 /// ECC recommendation: keep the active tool set under this budget so tool
@@ -228,24 +228,26 @@ fn resolve_level(cli: &Cli, settings: &serde_json::Value) -> agent_m_agent::Auto
     agent_m_agent::AutonomyLevel::from_number(number).unwrap_or_default()
 }
 
-fn resolve_model(cli: &Cli, settings: &serde_json::Value, provider: &dyn Provider) -> String {
+fn resolve_model(
+    cli: &Cli,
+    settings_config: &agent_m_ai::SettingsConfig,
+    provider: &dyn Provider,
+    task_model: Option<String>,
+) -> String {
     if let Some(model) = &cli.model {
         return model.clone();
     }
-    if let Some(model) = settings
-        .get("defaultModel")
-        .and_then(serde_json::Value::as_str)
-    {
-        return model.to_string();
+    if let Some(model) = task_model {
+        return model;
     }
-    // Default to the selected provider's primary model (its configured
-    // `model`), not a hardcoded fallback — otherwise `--provider openai`
-    // would silently talk to deepseek-chat.
+    if let Some(model) = &settings_config.default_model {
+        return model.clone();
+    }
     provider
         .models()
         .first()
         .map(|spec| spec.id.clone())
-        .unwrap_or_else(|| "deepseek-chat".to_string())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 
@@ -329,44 +331,65 @@ async fn main() -> Result<()> {
     }
     agent_m_tools::set_allowed_paths(allowed);
 
-    let configured = agent_m_ai::load_provider_configs(&agent_dir);
-    let provider_id = cli
+    let _ = agent_m_ai::ensure_default_settings(&agent_dir);
+    let _ = agent_m_mcp::ensure_default_mcp(&agent_dir);
+    let settings_config = agent_m_ai::load_settings_config(&agent_dir);
+    if settings_config.providers.is_empty() && cli.provider.is_none() {
+        anyhow::bail!(
+            "No LLM providers are configured in ~/.agent-m/agent/settings.json.\n\
+             Please configure your providers in settings.json, for example:\n\
+             {{\n  \
+               \"defaultProvider\": \"openai\",\n  \
+               \"defaultModel\": \"gpt-4o-mini\",\n  \
+               \"providers\": [\n    \
+                 {{\n      \
+                   \"id\": \"openai\",\n      \
+                   \"baseUrl\": \"https://api.openai.com/v1\",\n      \
+                   \"model\": \"gpt-4o-mini\"\n    \
+                 }}\n  \
+               ]\n\
+             }}"
+        );
+    }
+
+    let (task_provider, task_model) = if cli.provider.is_none() && cli.model.is_none() {
+        if let Some((p, m)) = agent_m_ai::resolve_task_route(&settings_config, "build") {
+            (Some(p), m)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let target_provider_id = cli
         .provider
         .clone()
-        .unwrap_or_else(|| "deepseek".to_string());
-    let provider: Arc<dyn Provider> =
-        if let Some(config) = configured.iter().find(|config| config.id == provider_id) {
-            Arc::from(agent_m_ai::provider_from_config(
-                config, None, // Removed CLI --api-key
-                &agent_dir,
-            ))
-        } else if provider_id == "deepseek" {
-            // Built-in fallback (zero-config behavior unchanged).
-            let api_key = resolve_api_key(
-                &format!("{}_API_KEY", provider_id.to_uppercase()),
-                &provider_id,
-                &agent_dir,
-            );
-            Arc::new(OpenAiCompatibleProvider::deepseek(api_key))
-        } else {
-            let available = configured
-                .iter()
-                .map(|config| config.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let available_list = if available.is_empty() {
-                "deepseek".to_string()
-            } else {
-                format!("{available}, deepseek")
-            };
-            anyhow::bail!(
-                "provider `{provider_id}` is not configured. Configure it in \
-             settings.json `providers`, or use /provider in the TUI. \
-             Available: {available_list}"
-            );
-        };
+        .or(task_provider)
+        .or_else(|| settings_config.default_provider.clone())
+        .or_else(|| settings_config.providers.first().map(|c| c.id.clone()))
+        .unwrap_or_else(|| "default".to_string());
 
-    let model = resolve_model(&cli, &settings, provider.as_ref());
+    let provider: Arc<dyn Provider> = if let Some(config) = settings_config
+        .providers
+        .iter()
+        .find(|c| c.id == target_provider_id)
+    {
+        Arc::from(agent_m_ai::provider_from_config(config, None, &agent_dir))
+    } else {
+        let available = settings_config
+            .providers
+            .iter()
+            .map(|config| config.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "provider `{target_provider_id}` is not configured in settings.json `providers`. \
+             Available: [{available}]"
+        );
+    };
+
+    let model = resolve_model(&cli, &settings_config, provider.as_ref(), task_model);
     let print_mode = cli.print || !std::io::stdin().is_terminal();
     // Print mode cannot ask for confirmation, so tools are disabled unless the
     // user explicitly opts in with --yes. This prevents a piped prompt from
@@ -444,28 +467,17 @@ async fn main() -> Result<()> {
     });
 
     if cli.list_models {
-        // Configured providers first, then the built-in deepseek fallback.
-        let mut seen = std::collections::BTreeSet::new();
-        for config in &configured {
-            seen.insert(config.id.clone());
+        if settings_config.providers.is_empty() {
+            println!("No providers configured in ~/.agent-m/agent/settings.json.");
+            println!("Add a provider config under 'providers' in settings.json to get started.");
+            return Ok(());
+        }
+        for config in &settings_config.providers {
             let provider = agent_m_ai::provider_from_config(config, None, &agent_dir);
             for spec in provider.models() {
                 println!(
                     "{}\t{}\t{}{}",
                     config.id,
-                    spec.id,
-                    spec.name.clone().unwrap_or_default(),
-                    if spec.reasoning { " (reasoning)" } else { "" }
-                );
-            }
-        }
-        if !seen.contains("deepseek") {
-            let fallback = OpenAiCompatibleProvider::deepseek(None);
-            let fallback_id = "deepseek".to_string();
-            for spec in fallback.models() {
-                println!(
-                    "{}\t{}\t{}{}",
-                    fallback_id,
                     spec.id,
                     spec.name.clone().unwrap_or_default(),
                     if spec.reasoning { " (reasoning)" } else { "" }

@@ -28,7 +28,9 @@ pub use models::ModelSpec;
 pub use openai::OpenAiCompatibleProvider;
 pub use provider::{AiError, Provider, ProviderRegistry};
 pub use providers::{
-    Pricing, ProviderConfig, load_provider_configs, provider_from_config, save_provider_configs,
+    Pricing, ProviderConfig, SettingsConfig, ensure_default_auth, ensure_default_settings,
+    load_provider_configs, load_settings_config, parse_task_route, provider_from_config,
+    resolve_task_route, save_provider_configs, set_task_route,
 };
 pub use trust::{Evidence, TrustData, extract_trust_block};
 pub use types::{

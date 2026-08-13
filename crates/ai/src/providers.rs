@@ -82,28 +82,231 @@ impl ProviderConfig {
     }
 }
 
+/// Complete settings configuration from `<agent_dir>/settings.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tasks: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+}
+
+/// Load full settings config from `<agent_dir>/settings.json`. Missing file
+/// or missing key yields default config.
+pub fn load_settings_config(agent_dir: &Path) -> SettingsConfig {
+    let path = agent_dir.join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return SettingsConfig::default();
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return SettingsConfig::default();
+    };
+    let default_provider = root.get("defaultProvider").and_then(|v| v.as_str()).map(ToString::to_string);
+    let default_model = root.get("defaultModel").and_then(|v| v.as_str()).map(ToString::to_string);
+    let mut tasks = std::collections::BTreeMap::new();
+    if let Some(t_obj) = root.get("tasks").and_then(|v| v.as_object()) {
+        for (k, v) in t_obj {
+            if let Some(s) = v.as_str() {
+                tasks.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    let mut providers = Vec::new();
+    if let Some(p_arr) = root.get("providers").and_then(|v| v.as_array()) {
+        for entry in p_arr {
+            if let Ok(config) = serde_json::from_value::<ProviderConfig>(entry.clone()) {
+                if ProviderConfig::is_valid_id(&config.id) && !config.base_url.is_empty() && !config.model.is_empty() {
+                    providers.push(config);
+                }
+            }
+        }
+    }
+    SettingsConfig {
+        default_provider,
+        default_model,
+        tasks,
+        providers,
+    }
+}
+
+/// Create a starter settings.json template when launching agent-m for the first time.
+pub fn ensure_default_settings(agent_dir: &Path) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(agent_dir);
+    let _ = ensure_default_auth(agent_dir);
+    let path = agent_dir.join("settings.json");
+    if path.exists() {
+        return Ok(());
+    }
+    let template = serde_json::json!({
+        "defaultProvider": "deepseek",
+        "defaultModel": "deepseek-chat",
+        "tasks": {
+            "plan": "deepseek/deepseek-reasoner",
+            "build": "deepseek/deepseek-chat",
+            "compact": "deepseek/deepseek-chat",
+            "subagent": "deepseek/deepseek-chat",
+            "refine": "deepseek/deepseek-reasoner"
+        },
+        "providers": [
+            {
+                "id": "deepseek",
+                "name": "DeepSeek API",
+                "baseUrl": "https://api.deepseek.com",
+                "model": "deepseek-chat",
+                "reasoning": false,
+                "supportsImages": false,
+                "contextWindow": 1000000,
+                "pricing": {
+                    "inMiss": 0.27,
+                    "inHit": 0.07,
+                    "out": 1.10
+                },
+                "models": [
+                    "deepseek-chat",
+                    "deepseek-reasoner"
+                ]
+            },
+            {
+                "id": "openai",
+                "name": "OpenAI",
+                "baseUrl": "https://api.openai.com/v1",
+                "model": "gpt-4o-mini",
+                "reasoning": false,
+                "supportsImages": true,
+                "contextWindow": 128000,
+                "pricing": {
+                    "inMiss": 0.15,
+                    "inHit": 0.075,
+                    "out": 0.60
+                },
+                "models": [
+                    "gpt-4o-mini",
+                    "gpt-4o",
+                    "o3-mini"
+                ]
+            },
+            {
+                "id": "anthropic",
+                "name": "Anthropic Claude",
+                "baseUrl": "https://api.anthropic.com/v1",
+                "model": "claude-3-5-sonnet-20241022",
+                "type": "anthropic",
+                "reasoning": true,
+                "supportsImages": true,
+                "contextWindow": 200000,
+                "pricing": {
+                    "inMiss": 3.00,
+                    "inHit": 0.30,
+                    "out": 15.00
+                },
+                "models": [
+                    "claude-3-5-sonnet-20241022",
+                    "claude-3-7-sonnet-20250219",
+                    "claude-3-5-haiku-20241022"
+                ]
+            },
+            {
+                "id": "nvidia",
+                "name": "NVIDIA NIM",
+                "baseUrl": "https://integrate.api.nvidia.com/v1",
+                "model": "meta/llama-3.3-70b-instruct",
+                "reasoning": false,
+                "supportsImages": false,
+                "contextWindow": 128000,
+                "models": [
+                    "meta/llama-3.3-70b-instruct",
+                    "deepseek-ai/deepseek-r1"
+                ]
+            },
+            {
+                "id": "openrouter",
+                "name": "OpenRouter",
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "model": "anthropic/claude-3.5-sonnet",
+                "reasoning": false,
+                "supportsImages": true,
+                "contextWindow": 200000,
+                "models": [
+                    "anthropic/claude-3.5-sonnet",
+                    "deepseek/deepseek-r1",
+                    "google/gemini-2.0-flash-001"
+                ]
+            }
+        ]
+    });
+    let pretty = serde_json::to_string_pretty(&template)?;
+    write_atomic(&path, &pretty)
+}
+
+/// Create a starter auth.json template when launching agent-m for the first time.
+pub fn ensure_default_auth(agent_dir: &Path) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(agent_dir);
+    let path = agent_dir.join("auth.json");
+    if path.exists() {
+        return Ok(());
+    }
+    let template = serde_json::json!({
+        "deepseek": "YOUR_DEEPSEEK_API_KEY_HERE"
+    });
+    let pretty = serde_json::to_string_pretty(&template)?;
+    write_atomic(&path, &pretty)
+}
+
+/// Parse a task route entry string (e.g. `"deepseek/deepseek-reasoner"` or `"deepseek-reasoner"`).
+/// Returns `(provider_id_or_model, optional_model)`.
+pub fn parse_task_route(route: &str) -> (String, Option<String>) {
+    let trimmed = route.trim();
+    if let Some((p, m)) = trimmed.split_once('/') {
+        (p.to_string(), Some(m.to_string()))
+    } else {
+        (trimmed.to_string(), None)
+    }
+}
+
+/// Resolve provider and model for a given task role (e.g. `"plan"`, `"build"`, `"compact"`, `"subagent"`, `"refine"`).
+/// Checks `tasks.<role>`, falling back to `default_provider` / `default_model`.
+pub fn resolve_task_route(config: &SettingsConfig, task: &str) -> Option<(String, Option<String>)> {
+    if let Some(route) = config.tasks.get(task) {
+        let (p, m) = parse_task_route(route);
+        return Some((p, m));
+    }
+    if let Some(ref dp) = config.default_provider {
+        return Some((dp.clone(), config.default_model.clone()));
+    }
+    None
+}
+
+/// Set or remove a task route in `<agent_dir>/settings.json`.
+pub fn set_task_route(agent_dir: &Path, task: &str, route: Option<&str>) -> std::io::Result<()> {
+    let path = agent_dir.join("settings.json");
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    
+    if let Some(r) = route {
+        if root.get("tasks").is_none() || !root["tasks"].is_object() {
+            root["tasks"] = serde_json::json!({});
+        }
+        root["tasks"][task] = serde_json::Value::String(r.to_string());
+    } else if let Some(tasks) = root.get_mut("tasks").and_then(|t| t.as_object_mut()) {
+        tasks.remove(task);
+    }
+    
+    let pretty = serde_json::to_string_pretty(&root)?;
+    write_atomic(&path, &pretty)
+}
+
 /// Load the `providers` array from `<agent_dir>/settings.json`. Missing file
 /// or missing key → empty. Invalid entries are skipped (logged via `None`),
 /// never fatal — a bad entry must not brick the whole config.
 pub fn load_provider_configs(agent_dir: &Path) -> Vec<ProviderConfig> {
-    let Ok(text) = std::fs::read_to_string(agent_dir.join("settings.json")) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    let Some(providers) = value.get("providers").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    providers
-        .iter()
-        .filter_map(|entry| serde_json::from_value::<ProviderConfig>(entry.clone()).ok())
-        .filter(|config| {
-            ProviderConfig::is_valid_id(&config.id)
-                && !config.base_url.is_empty()
-                && !config.model.is_empty()
-        })
-        .collect()
+    load_settings_config(agent_dir).providers
 }
 
 /// Persist the providers array, merging into the existing settings.json and
@@ -119,7 +322,10 @@ pub fn save_provider_configs(
         .unwrap_or_else(|| serde_json::json!({}));
     root["providers"] = serde_json::to_value(providers).unwrap_or(serde_json::json!([]));
     let pretty = serde_json::to_string_pretty(&root)?;
+    write_atomic(&path, &pretty)
+}
 
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -135,7 +341,7 @@ pub fn save_provider_configs(
     {
         use std::io::Write;
         let mut file = options.open(&tmp)?;
-        file.write_all(format!("{pretty}\n").as_bytes())?;
+        file.write_all(format!("{content}\n").as_bytes())?;
         file.sync_all()?;
     }
     std::fs::rename(tmp, path)
