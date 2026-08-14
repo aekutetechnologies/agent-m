@@ -6,7 +6,7 @@ title: CLI reference
 
 `agent-m [OPTIONS] [MESSAGES]... [COMMAND]`
 
-With no arguments on a TTY, the interactive TUI starts. Non-TTY stdin (piped
+With no arguments on a TTY, the interactive REPL starts. Non-TTY stdin (piped
 input) and `-p` select **print mode**, which streams the reply to stdout and
 tool activity to stderr. Print mode disables tools unless `--yes` is passed —
 there is no interactive approval in print mode.
@@ -18,22 +18,26 @@ there is no interactive approval in print mode.
 | `-p`, `--print` | Print mode: stream the reply to stdout |
 | `--model <MODEL>` | Model id (e.g. `deepseek-chat`, `deepseek-reasoner`) |
 | `--provider <PROVIDER>` | Provider id (default `deepseek`) |
-| `--yes` | Auto-approve tool calls (also enables tools in print mode) |
+| `--yes` | Auto-approve Low/Medium tool calls (High/Critical still ask in the REPL; also enables tools in print mode) |
 | `--no-tools` | Disable all tools |
 | `--tools <TOOLS>` | Active tool set (comma-separated) |
 | `--exclude-tools <TOOLS>` | Remove tools from the default set |
-| `--theme <THEME>` | `dark`, `light`, or a JSON theme file |
-| `--ui-mode <UI_MODE>` | `regular` (terminal scrollback) or `fullscreen` (alternate screen) |
 | `--session-dir <SESSION_DIR>` | Override the sessions directory |
 | `--list-models` | List available models and exit |
 | `--system-prompt <SYSTEM_PROMPT>` | Override the base system prompt |
 | `--mode-plan` | Start in plan mode (read-only; the model produces a numbered plan) |
 | `--compact-threshold <F>` | Auto-compact fraction of the context window (default `0.5`) |
 | `--flow <PATH>` | Run a YAML flow in print mode |
+| `--flow-context <KEY=VALUE>` | Seed flow-context values (repeatable), e.g. `--flow-context ticket=PROJ-42`; referenced from flow steps as `${ticket}` — see [Flows](/flows/overview) |
 | `--stream-json` | Print mode: emit machine-readable JSON event lines (`agent_start`, `message_*`, `tool_execution_*`, …) instead of plain text |
-| `--worktree [NAME]` | Run this session in a fresh git worktree (branch `agent-m/<name>-<ts>`, checkout under `~/.agent-m/worktrees/`) so parallel sessions don't collide — see [Sessions & worktrees](/usage/sessions-worktrees) |
+| `--worktree [NAME]` | Run this session in a fresh git worktree (branch `agent-m/<name>-<ts>`, checkout under `~/.agent-m/agent/worktrees/`) so parallel sessions don't collide — see [Sessions & worktrees](/usage/sessions-worktrees) |
 | `--serve` | Headless stdio server: LSP-framed JSON-RPC (`prompt`, `exit`) streaming agent events — see [Headless](/extending/headless) |
-| `--level <0-4>` | Autonomy level: 0 observe · 1 suggest · 2 assisted · 3 trusted (default) · 4 autonomous |
+| `--daemon <SESSION_ID>` | Run as a background daemon session: unix socket under the sessions dir, streams `EVENT` lines, answers `prompt`/`status`/`resume` — see [Sessions & worktrees](/usage/sessions-worktrees) |
+| `--attach <SESSION_ID>` | Attach to a running daemon session (interactive prompt client) |
+| `--list-daemons` | List active daemon sessions and exit |
+| `--slack-channel <CHANNEL>` | Post ask-tool questions, High/Critical approvals, and flow progress to this Slack channel/user — see [Slack](/extending/slack) |
+| `--trust <off\|warn\|ask\|block>` | Enforce the trust protocol: turns that use tools must carry a `<trust>` block with a confidence score and real evidence. `warn` notices gaps (default), `ask` asks before running gapped turns, `block` denies without asking, `off` is display-only — see [Trust principles](/trust/principles#enforcement) |
+| `--level <0-4>` | Startup autonomy level: 0 observe, 1 suggest, 2 assisted (everything asks), 3 trusted (default), 4 autonomous — see [Autonomy](/trust/autonomy); change live with `/level N` |
 | `--allow-path <PATH>` | Extra directory the file tools may access (repeatable) |
 | `-v`, `--version` | Print the version |
 | `-h`, `--help` | Print help |
@@ -50,7 +54,7 @@ Manage out-of-tree plugins:
 
 | Command | Description |
 |---------|-------------|
-| `plugins install <git-url\|local-path>` | Clone/build a cdylib plugin and install it into `~/.agent-m/plugins/<name>/` |
+| `plugins install <git-url\|local-path>` | Clone/build a cdylib plugin and install it into `~/.agent-m/agent/plugins/<name>/` |
 | `plugins list` | List installed plugins and their readiness |
 | `plugins remove <name>` | Uninstall a plugin |
 | `plugins update [name]` | Rebuild/update plugins (all, or one by name) |
@@ -58,6 +62,73 @@ Manage out-of-tree plugins:
 Every agent-m startup loads installed plugins and merges their tools into the
 tool set (permission gating and plan-mode filtering still apply). See
 [Plugins](/plugins/overview).
+
+### pickup
+
+Pick up the next open Jira ticket assigned to you and run a flow against it
+(auto-pickup for the autonomous SDLC loop):
+
+| Flag | Description |
+|------|-------------|
+| `--ticket <KEY>` | Ticket key override, e.g. `PROJ-42` (skips the Jira query) |
+| `--repo <URL\|PATH>` | Repo override; defaults to the `~/.agent-m/agent/repos.json` mapping for the ticket's project key |
+| `--jql <JQL>` | JQL override for the ticket query |
+| `--transition-id <ID>` | Jira transition id for "In Progress" (default `11`) |
+| `--dry-run` | Print what would be picked and run, without doing it |
+| `--flow <PATH>` | Flow to run (default `flows/agentic-dev.yml`) |
+| `--poll [SECONDS]` | Keep running: pick a new ticket every N seconds until Ctrl-C. Bare `--poll` uses the default (300 s) |
+| `--workers <N>` | Run up to N ticket flows in parallel under `--poll` (default `1`; one worktree per ticket). Each ticket runs in its own per-ticket daemon process |
+
+It transitions the ticket to In Progress, creates a worktree branch
+(`agent-m/<ticket>-<ts>`), and runs the flow inside it with `ticket`, `repo`,
+and `worktree=true` seeded (the flow's clone step is skipped and verify runs
+in-place). Under `--workers N` each ticket is a **per-ticket daemon** — an
+independent `agent-m ticket-run` child process with a tailable report. See
+[Auto-pickup](/usage/pickup).
+
+### ticket-run
+
+Run one ticket's full pipeline (transition → worktree → flow → report) in
+its own process — the body of the per-ticket daemons spawned by
+`pickup --poll --workers N`:
+
+| Flag | Description |
+|------|-------------|
+| `--ticket <KEY>` | Ticket key, e.g. `PROJ-42` (required; skips the Jira query) |
+| `--repo <URL\|PATH>` | Repo override; defaults to the `~/.agent-m/agent/repos.json` mapping |
+| `--transition-id <ID>` | Jira transition id for "In Progress" (default `11`) |
+| `--flow <PATH>` | Flow to run (default `flows/agentic-dev.yml`) |
+| `--agent-dir <PATH>` | Agent directory (repos.json, worktrees, reports; default: the standard agent dir) |
+| `--flow-context <K=V>` | Extra flow context (repeatable) |
+
+Appends a JSONL report to `<agent_dir>/tickets/<KEY>.jsonl` as it goes and
+exits `0` on success, `1` if any flow step failed.
+
+### ticket-log
+
+Tail a per-ticket daemon's report:
+
+| Flag | Description |
+|------|-------------|
+| `--follow` | Keep tailing as new lines are appended |
+| `--agent-dir <PATH>` | Agent directory (default: the standard agent dir) |
+
+Prints the ticket's pickup, live step transitions, and final verdict (status,
+fix rounds, PR link) as human-readable lines.
+
+### slack
+
+Connect to Slack as the remote human channel **and** the SDLC orchestrator:
+
+| Flag | Description |
+|------|-------------|
+| `--channel <CHANNEL>` | Channel used for questions/notifications (default: the DM channel) |
+
+The process answers ask-replies (`ask-3 yes`), and a DM of `pick up PROJ-42`
+(or `pickup` for auto-pick) starts a pickup run — In Progress transition,
+worktree branch, flow with Slack oversight, then a summary DM with the PR
+link. Requires `SLACK_APP_TOKEN` + `SLACK_BOT_TOKEN` and an LLM provider.
+See [Slack](/extending/slack).
 
 ## Examples
 
@@ -67,4 +138,8 @@ echo "summarize README" | agent-m
 agent-m --model deepseek-reasoner --mode-plan "design an auth flow"
 agent-m --yes --flow flows/agentic-dev.yml
 agent-m plugins install https://github.com/you/your-agent-plugin
+agent-m slack                                  # DM "pick up PROJ-42" to start a flow
+agent-m pickup --poll 300                      # unattended loop: ticket every 5 min
+agent-m pickup --poll --workers 4              # per-ticket daemons: drain a backlog
+agent-m ticket-log PROJ-42 --follow            # watch one ticket's daemon live
 ```

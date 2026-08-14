@@ -16,6 +16,7 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    read_only: bool,
     client: Arc<tokio::sync::Mutex<McpClient>>,
 }
 
@@ -29,8 +30,15 @@ impl McpTool {
                 def.description.trim()
             ),
             parameters: def.input_schema,
+            read_only: def.read_only,
             client,
         }
+    }
+
+    /// True when the server advertised `annotations.readOnlyHint` — advisory,
+    /// used to auto-approve read-like calls (not a security boundary).
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Human label without the server prefix (for the tool registry).
@@ -75,18 +83,31 @@ impl Tool for McpTool {
 }
 
 /// Build `Tool` adapters for every tool of a connected server. Returns the
-/// tools and a handle that keeps the shared client alive.
+/// tools, the qualified names (`server__tool`) the server advertised as
+/// read-only (`annotations.readOnlyHint`), and a handle that keeps the shared
+/// client alive.
 pub async fn connect_tools(
     server: &str,
     mut client: McpClient,
-) -> Result<(Vec<Arc<dyn Tool>>, Arc<tokio::sync::Mutex<McpClient>>), String> {
+) -> Result<
+    (
+        Vec<Arc<dyn Tool>>,
+        Vec<String>,
+        Arc<tokio::sync::Mutex<McpClient>>,
+    ),
+    String,
+> {
     let defs = client.list_tools().await.map_err(|e| e.to_string())?;
     let shared = Arc::new(tokio::sync::Mutex::new(client));
-    let tools = defs
-        .into_iter()
-        .map(|def| Arc::new(McpTool::new(server, shared.clone(), def)) as Arc<dyn Tool>)
-        .collect::<Vec<_>>();
-    Ok((tools, shared))
+    let mut read_only = Vec::new();
+    let mut tools = Vec::with_capacity(defs.len());
+    for def in defs {
+        if def.read_only {
+            read_only.push(format!("{server}__{}", def.name));
+        }
+        tools.push(Arc::new(McpTool::new(server, shared.clone(), def)) as Arc<dyn Tool>);
+    }
+    Ok((tools, read_only, shared))
 }
 
 /// Convenience: the agent-side `tool_spec` for an MCP tool (used by tests and

@@ -1,0 +1,370 @@
+---
+title: Templates
+---
+
+# Templates
+
+Copy-paste starting points: **config files** (keys, providers, MCP servers),
+**flow YAML** (pipelines), and **a plugin** (your first out-of-tree tool).
+Every template below is the actual shape the code reads — verified against
+`crates/ai/src/providers.rs`, `crates/ai/src/keys.rs`,
+`crates/mcp/src/registry.rs`, and `plugins/fixture/`.
+
+All config lives under `~/.agent-m/agent/` (the **agent dir**; override with
+`AGENT_M_DIR`).
+
+## Config templates
+
+### `auth.json` — your API keys
+
+The only file that should hold keys. `0600` permissions (owner read/write
+only). Two accepted shapes plus a tolerant dotenv-style fallback:
+
+```json
+{ "deepseek": "sk-...", "openai": "sk-..." }
+```
+
+```json
+{ "providers": {
+  "deepseek": { "apiKey": "sk-..." },
+  "anthropic": { "apiKey": "sk-ant-..." }
+}}
+```
+
+```text
+# dotenv-style lines also work (both spellings map to the provider id):
+DEEPSEEK_API_KEY=sk-...
+openai=sk-...
+```
+
+Resolution order: `auth.json` → `settings.json` (same shapes; putting keys in
+`settings.json` works but prints a warning — that file is world-readable).
+**Environment variables are not consulted** — `DEEPSEEK_API_KEY=…` in your
+shell does nothing; the key must be in a file. The file is auto-created with
+`{ "deepseek": "YOUR_DEEPSEEK_API_KEY_HERE" }` on first launch.
+
+### `settings.json` — providers, tasks, defaults
+
+Auto-created on first launch with a full starter template. The complete
+shape (this is exactly what the code writes):
+
+```json
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-chat",
+  "tasks": {
+    "plan": "deepseek/deepseek-reasoner",
+    "build": "deepseek/deepseek-chat",
+    "compact": "deepseek/deepseek-chat",
+    "subagent": "deepseek/deepseek-chat",
+    "refine": "deepseek/deepseek-reasoner"
+  },
+  "providers": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek API",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-chat",
+      "reasoning": false,
+      "supportsImages": false,
+      "contextWindow": 1000000,
+      "pricing": { "inMiss": 0.27, "inHit": 0.07, "out": 1.10 },
+      "models": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "reasoning": false,
+      "supportsImages": true,
+      "contextWindow": 128000,
+      "pricing": { "inMiss": 0.15, "inHit": 0.075, "out": 0.60 },
+      "models": ["gpt-4o-mini", "gpt-4o", "o3-mini"]
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic Claude",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "model": "claude-3-5-sonnet-20241022",
+      "type": "anthropic",
+      "reasoning": true,
+      "supportsImages": true,
+      "contextWindow": 200000,
+      "models": ["claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"]
+    },
+    {
+      "id": "nvidia",
+      "name": "NVIDIA NIM",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "model": "meta/llama-3.3-70b-instruct",
+      "reasoning": false,
+      "supportsImages": false,
+      "contextWindow": 128000,
+      "models": ["meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-r1"]
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "anthropic/claude-3.5-sonnet",
+      "reasoning": false,
+      "supportsImages": true,
+      "contextWindow": 200000,
+      "models": ["anthropic/claude-3.5-sonnet", "deepseek/deepseek-r1", "google/gemini-2.0-flash-001"]
+    }
+  ],
+  "allowedPaths": ["/tmp"],
+  "level": 3
+}
+```
+
+Field cheat-sheet: `defaultProvider`/`defaultModel` pick the defaults;
+`tasks.<role>` routes roles (`plan`/`build`/`compact`/`subagent`/`refine`) to
+`provider/model` pairs; each `providers[]` entry needs `id`, `baseUrl`,
+`model` (plus `type: "anthropic"` for the native Anthropic adapter);
+`allowedPaths` adds extra roots for the file tools; `level` sets the startup
+autonomy level (see [Autonomy](/trust/autonomy)). The minimal viable
+settings.json is:
+
+```json
+{ "defaultProvider": "openai", "defaultModel": "gpt-4o-mini",
+  "providers": [ { "id": "openai", "baseUrl": "https://api.openai.com/v1", "model": "gpt-4o-mini" } ] }
+```
+
+### `mcp.json` — MCP servers
+
+MCP servers (stdio or Streamable HTTP) are declared under `mcpServers`.
+`mcp.json` is preferred over the `mcpServers` key in `settings.json` (it is
+read first). Auto-created on first launch, wiring whatever cargo-installed
+servers it finds:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "" },
+      "readOnlyTools": ["get-*", "search-*", "list-*"]
+    },
+    "filesystem": {
+      "command": "rust-mcp-filesystem",
+      "args": ["."],
+      "readOnlyTools": ["read-*", "list-*"]
+    },
+    "jira": {
+      "command": "jira-mcp-rs",
+      "args": [],
+      "env": { "JIRA_BASE_URL": "", "JIRA_EMAIL": "", "JIRA_API_TOKEN": "" },
+      "readOnlyTools": ["get-*", "search-*"]
+    },
+    "postgres": {
+      "command": "mcp-postgres",
+      "args": [],
+      "env": { "DATABASE_URL": "" }
+    }
+  }
+}
+```
+
+A remote server instead of a local command:
+
+```json
+{ "mcpServers": { "remote": { "url": "https://mcp.example.com/mcp" } } }
+```
+
+Exposed tools are named `server__tool` and gated **Critical** by default
+(always ask) unless you add `readOnlyTools` globs. See
+[MCP servers](/extending/mcp).
+
+### `repos.json` — the ticket→repo map (pickup)
+
+Maps a Jira project key (the prefix before the first `-`) to a git URL or
+local path. Used by `agent-m pickup`:
+
+```json
+{ "PROJ": "https://github.com/acme/app.git", "INFRA": "/local/checkout/infra" }
+```
+
+## Flow templates
+
+A flow is a YAML list of steps. Steps run in order; a failed step aborts
+the flow unless the step type says otherwise. Full syntax:
+[Flows](/flows/overview).
+
+### Minimal 3-step flow
+
+```yaml
+name: demo
+description: fetch a ticket, plan, ship
+steps:
+  - type: tool
+    name: ticket
+    tool: jira-search
+    arguments: { query: "${ticket}" }
+  - type: prompt
+    name: plan
+    mode: plan
+    message: "Summarize the key decisions for ${ticket}"
+  - type: tool
+    name: pr
+    tool: github-create-pr
+    arguments: { title: "${ticket}", body: "Closes ${ticket}\n\n${steps.plan.output}" }
+```
+
+Run it:
+
+```bash
+agent-m --flow my-flow.yml --yes \
+  --flow-context ticket=PROJ-42 --flow-context repo=acme/app
+```
+
+### Verify + error budget (test-fix-ship)
+
+```yaml
+name: test-fix-ship
+error_budget: 5            # TOTAL fix rounds across all verify steps
+
+steps:
+  - type: verify
+    name: verify
+    command: "cd work && cargo test"
+    max_fix_rounds: 3      # per-step cap (default 3)
+  - type: tool
+    name: pr
+    tool: github-create-pr
+    arguments: { title: "${ticket}", body: "Closes ${ticket}" }
+```
+
+On red, the failure output is handed to a fix agent ("Fix rounds remaining:
+N"); when the budget is exhausted the step stops-and-reports and the flow
+aborts — the PR step never runs on a failing build.
+
+### Structured analysis (`delegate`)
+
+A `delegate` step runs a fresh sub-agent that **must reply with JSON**; the
+parsed object lands at `${steps.<name>.output.json}`, so later steps read
+real fields:
+
+```yaml
+name: triage
+steps:
+  - type: delegate
+    name: analysis
+    prompt: "Map the entrypoints and rate the risk of this change."
+    schema:
+      type: object
+      required: [risk, entrypoints]
+      properties:
+        risk: { type: string }
+        entrypoints: { type: array, items: { type: string } }
+    max_turns: 6
+  - type: tool
+    name: report
+    tool: bash
+    arguments: { command: "echo Risk: ${steps.analysis.output.json.risk}" }
+```
+
+`on_invalid: continue` (default `stop`) keeps the flow when the sub-agent
+fails to produce valid JSON.
+
+### Worktree-mode branch (pickup-ready)
+
+Pickup runs flows inside a git worktree with `worktree=true` seeded. Branch
+on it so the same flow works standalone and under pickup:
+
+```yaml
+steps:
+  - type: condition
+    name: workspace
+    if: "${worktree} == true"
+    then:
+      - type: tool
+        name: clone
+        tool: bash
+        arguments: { command: "echo 'worktree checkout: ${cwd}'" }
+    else:
+      - type: tool
+        name: clone
+        tool: bash
+        arguments: { command: "git clone ${repo} work" }
+```
+
+Both branches keep the same step name (`clone`) so downstream
+`${steps.clone.output.content}` resolves either way.
+
+## Plugin scaffold
+
+A plugin is a **separate repo** exposing a `cdylib` with one exported
+symbol. Copy this shape (it mirrors `plugins/fixture/` in-tree).
+
+### `Cargo.toml`
+
+```toml
+[package]
+name = "agent-m-plugin-myplugin"
+version = "0.1.0"
+edition = "2021"
+description = "My agent-m plugin"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-m-plugin-sdk = { git = "https://github.com/aekutetechnologies/agent-m" }
+serde_json = "1"
+# reqwest = { version = "0.12", features = ["blocking"] }  # only if you hit an API
+```
+
+### `src/lib.rs` — the whole contract
+
+```rust
+use agent_m_plugin_sdk::PluginEntry;
+use agent_m_plugin_sdk::tools::{ToolDef, entry};
+use std::sync::OnceLock;
+
+fn my_tool(arguments: &str, cwd: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("bad arguments: {e}"))?;
+    let query = value.get("query").and_then(serde_json::Value::as_str).unwrap_or("");
+    Ok(format!("searched {query} in {cwd}"))
+}
+
+static DEFS: &[ToolDef] = &[
+    ToolDef {
+        name: "my-search",
+        description: "Search my service",
+        parameters: r#"{"type":"object","properties":{"query":{"type":"string"}}}"#,
+        execute: my_tool,
+    },
+];
+
+struct EntryHolder(*const PluginEntry);
+// SAFETY: the entry points into leaked, immutable plugin state.
+unsafe impl Send for EntryHolder {}
+unsafe impl Sync for EntryHolder {}
+
+static ENTRY: OnceLock<EntryHolder> = OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agent_m_plugin_entry() -> *const PluginEntry {
+    ENTRY
+        .get_or_init(|| EntryHolder(Box::leak(Box::new(entry("myplugin", "0.1.0", DEFS)))))
+        .0
+}
+```
+
+### Install & verify
+
+```bash
+agent-m plugins install https://github.com/you/agent-m-plugin-myplugin
+agent-m plugins list          # shows readiness
+agent-m                       # banner: "plugin loaded: …"
+```
+
+A `plugin.json` manifest in the plugin root
+(`{ "name": "myplugin", "entry": "target/release/libagent_m_plugin_myplugin.dylib" }`)
+lets the installer find the artifact; without it, the installer falls back
+to any `.dylib`/`.so`/`.dll` under `target/release`. Plugin tools default to
+**Critical** risk (always ask) — see [Plugins](/plugins/overview).

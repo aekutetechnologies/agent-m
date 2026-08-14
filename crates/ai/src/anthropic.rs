@@ -36,6 +36,7 @@ pub struct AnthropicProvider {
     base_url: String,
     api_key: Option<String>,
     models: Vec<ModelSpec>,
+    extra_body: Option<serde_json::Value>,
     http: reqwest::Client,
 }
 
@@ -46,6 +47,7 @@ impl AnthropicProvider {
         base_url: impl Into<String>,
         api_key: Option<String>,
         models: Vec<ModelSpec>,
+        extra_body: Option<serde_json::Value>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -53,6 +55,7 @@ impl AnthropicProvider {
             base_url: base_url.into(),
             api_key,
             models,
+            extra_body,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
@@ -96,7 +99,17 @@ impl Provider for AnthropicProvider {
             })?;
 
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
-        let body = build_request_body(&request);
+        let mut body = build_request_body(&request);
+
+        if let Some(extra) = &self.extra_body {
+            if let Some(obj) = extra.as_object() {
+                if let Some(body_obj) = body.as_object_mut() {
+                    for (k, v) in obj {
+                        body_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
 
         let response = self
             .http
@@ -170,14 +183,15 @@ fn serialize_tool(tool: &ToolSpec) -> Value {
     })
 }
 
-/// Serialize messages into the Anthropic `messages` array. The last few user
-/// messages get `cache_control` markers.
+/// Serialize messages into the Anthropic `messages` array. The last few
+/// cacheable-boundary messages (user turns and tool results — the token-mass
+/// carriers in an agent loop) get `cache_control` markers.
 fn serialize_messages(messages: &[LlmMessage]) -> Value {
-    // Find the indices of the last N user messages to mark for caching.
+    // Find the indices of the last N user/tool-result messages to mark.
     let user_indices: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, LlmMessage::User { .. }))
+        .filter(|(_, m)| matches!(m, LlmMessage::User { .. } | LlmMessage::Tool { .. }))
         .map(|(i, _)| i)
         .collect();
     let cache_mark: Vec<usize> = user_indices
@@ -274,13 +288,20 @@ fn wire_message(message: &LlmMessage, cache_mark: bool) -> Value {
             name: _,
             content,
         } => {
+            // Tool results carry most of the token mass in an agent loop;
+            // Anthropic allows breakpoints on tool_result blocks, so mark
+            // the trailing ones to keep the growing tail cacheable.
+            let mut block = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": content,
+            });
+            if cache_mark {
+                block["cache_control"] = json!({ "type": "ephemeral" });
+            }
             json!({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_call_id,
-                    "content": content,
-                }],
+                "content": [block],
             })
         }
     }

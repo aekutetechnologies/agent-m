@@ -20,14 +20,18 @@ use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
 
 /// A provider that plays back scripted responses, one per stream_chat call.
+/// Also records every request's system prompt (parent + sub-agents) so
+/// tests can assert on what the model was told.
 struct FakeLlm {
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,
+    systems: Mutex<Vec<String>>,
 }
 
 impl FakeLlm {
     fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
+            systems: Mutex::new(Vec::new()),
         }
     }
 
@@ -103,8 +107,9 @@ impl Provider for FakeLlm {
     }
     async fn stream_chat(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
     ) -> Result<BoxStream<'static, StreamEvent>, AiError> {
+        self.systems.lock().unwrap().push(request.system.clone());
         let events = self
             .responses
             .lock()
@@ -159,6 +164,9 @@ fn options() -> AgentOptions {
         context_window: None,
         variant: None,
         output_dir: None,
+        trust: agent_m_agent::TrustPolicy::default(),
+        risk_policy: None,
+        delegate_depth: 0,
     }
 }
 
@@ -510,6 +518,9 @@ async fn plan_mode_hides_mutating_tools() {
             context_window: None,
             variant: None,
             output_dir: None,
+            trust: agent_m_agent::TrustPolicy::default(),
+            risk_policy: None,
+            delegate_depth: 0,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -669,6 +680,9 @@ async fn ask_tool_returns_user_answer_and_continues() {
             context_window: None,
             variant: None,
             output_dir: None,
+            trust: agent_m_agent::TrustPolicy::default(),
+            risk_policy: None,
+            delegate_depth: 0,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -717,6 +731,9 @@ async fn compaction_replaces_older_messages_with_summary() {
             context_window: Some(64_000),
             variant: None,
             output_dir: None,
+            trust: agent_m_agent::TrustPolicy::default(),
+            risk_policy: None,
+            delegate_depth: 0,
         },
         Arc::new(AlwaysAllowGate),
     );
@@ -1065,4 +1082,539 @@ async fn level_gate_maps_tiers_per_autonomy_level() {
         1,
         "autonomous still asks for critical"
     );
+}
+
+/// P2 hook: a tool-using turn with no `<trust>` block is denied in Block
+/// mode — the tool never executes, the model sees error results, and the
+/// loop continues so it can repair the block.
+#[tokio::test]
+async fn trust_policy_blocks_tool_call_without_trust_block() {
+    let mut agent = Agent::new(
+        Arc::new(FakeLlm::new(vec![
+            FakeLlm::tool_response("bash", json!({ "command": "ls" })),
+            FakeLlm::text_response("ok", 8),
+        ])),
+        AgentOptions {
+            model: "fake".to_string(),
+            system_prompt: "You are a test agent.".to_string(),
+            harness_block: None,
+            tools: vec![Arc::new(BashStub)],
+            max_turns: 4,
+            cwd: PathBuf::from("."),
+            mode: agent_m_agent::Mode::Build,
+            ask_gate: None,
+            context_window: None,
+            variant: None,
+            output_dir: None,
+            trust: agent_m_agent::TrustPolicy {
+                mode: agent_m_agent::TrustMode::Block,
+                confidence_threshold: 50,
+            },
+            risk_policy: None,
+            delegate_depth: 0,
+        },
+        Arc::new(AlwaysAllowGate),
+    );
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    agent.subscribe(move |event| capture.lock().unwrap().push(event.clone()));
+
+    agent.prompt("do the thing".to_string()).await.expect("prompt");
+
+    let events = events.lock().unwrap();
+    let notices: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Notice { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.iter().any(|n| n.contains("trust gap")),
+        "expected a trust-gap notice, got: {notices:?}"
+    );
+    // The tool never executed: no ToolExecutionEnd with the stub's success.
+    let executed = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ToolExecutionEnd { outcome, .. } if !outcome.is_error
+        )
+    });
+    assert!(!executed, "tool must not run when the turn lacks a <trust> block");
+    // The model saw a clear denial it can adapt to.
+    let messages = agent.messages();
+    let denied: Vec<_> = messages
+        .iter()
+        .filter(|m| {
+            matches!(m, SessionMessage::ToolResult { name, is_error, content, .. }
+                if name == "bash" && *is_error && content.contains("trust policy denied"))
+        })
+        .collect();
+    assert!(!denied.is_empty(), "no denied tool result in messages: {messages:?}");
+}
+
+/// P2/P4 hook: Ask mode consults the human; "no" denies the turn's tool
+/// calls even though the gate itself would allow them.
+#[tokio::test]
+async fn trust_policy_ask_mode_consults_human() {
+    use agent_m_agent::ClosureAskGate;
+    let mut agent = Agent::new(
+        Arc::new(FakeLlm::new(vec![
+            FakeLlm::tool_response("bash", json!({ "command": "ls" })),
+            FakeLlm::text_response("ok", 8),
+        ])),
+        AgentOptions {
+            model: "fake".to_string(),
+            system_prompt: "You are a test agent.".to_string(),
+            harness_block: None,
+            tools: vec![Arc::new(BashStub)],
+            max_turns: 4,
+            cwd: PathBuf::from("."),
+            mode: agent_m_agent::Mode::Build,
+            ask_gate: Some(Arc::new(ClosureAskGate::new(|_q, _o, _m| {
+                Box::pin(async { Ok("no".to_string()) })
+            }))),
+            context_window: None,
+            variant: None,
+            output_dir: None,
+            trust: agent_m_agent::TrustPolicy {
+                mode: agent_m_agent::TrustMode::Ask,
+                confidence_threshold: 50,
+            },
+            risk_policy: None,
+            delegate_depth: 0,
+        },
+        Arc::new(AlwaysAllowGate),
+    );
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    agent.subscribe(move |event| capture.lock().unwrap().push(event.clone()));
+
+    agent.prompt("do the thing".to_string()).await.expect("prompt");
+
+    let events = events.lock().unwrap();
+    // Denied: the tool never ran successfully.
+    let executed = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ToolExecutionEnd { outcome, .. } if !outcome.is_error
+        )
+    });
+    assert!(!executed, "human said no: the tool must not run");
+    let messages = agent.messages();
+    let denied: Vec<_> = messages
+        .iter()
+        .filter(|m| {
+            matches!(m, SessionMessage::ToolResult { is_error, content, .. }
+                if *is_error && content.contains("trust policy denied"))
+        })
+        .collect();
+    assert!(!denied.is_empty(), "no denied tool result: {messages:?}");
+}
+
+// ---------------------------------------------------------------------------
+// delegate (sub-agents) + parallel tool calls
+// ---------------------------------------------------------------------------
+
+/// A tool that reports the ToolContext cwd it was invoked under — used to
+/// prove the sub-agent's cwd scoping.
+struct CwdTool;
+
+#[async_trait]
+impl Tool for CwdTool {
+    fn name(&self) -> &str {
+        "cwd"
+    }
+    fn description(&self) -> String {
+        "report the working directory".to_string()
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+    async fn execute(
+        &self,
+        _arguments: Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome::success(format!(
+            "cwd is {}",
+            context.cwd.display()
+        )))
+    }
+}
+
+/// A tool that must never execute when scoped out of a sub-agent.
+struct BoomTool {
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl Tool for BoomTool {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn description(&self) -> String {
+        "explodes (never scoped into sub-agents)".to_string()
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+    async fn execute(
+        &self,
+        _arguments: Value,
+        _context: &ToolContext,
+    ) -> Result<ToolOutcome, ToolError> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(ToolOutcome::error("boom: should never run"))
+    }
+}
+
+/// An echo that only completes once BOTH participants arrive — proves two
+/// sub-agents ran in the same turn concurrently (a serial runner deadlocks
+/// at the rendezvous and the test times out).
+struct BarrierEchoTool {
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait]
+impl Tool for BarrierEchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> String {
+        "echoes its text argument".to_string()
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"]
+        })
+    }
+    async fn execute(
+        &self,
+        _arguments: Value,
+        _context: &ToolContext,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.barrier.wait().await;
+        Ok(ToolOutcome::success("echoed"))
+    }
+}
+
+impl FakeLlm {
+    /// One response carrying several tool calls (index 0..n), so a single
+    /// turn can issue parallel delegates.
+    fn tool_response_multi(calls: &[(&str, Value)]) -> Vec<StreamEvent> {
+        let mut events = vec![StreamEvent::Start];
+        for (index, (name, arguments)) in calls.iter().enumerate() {
+            events.push(StreamEvent::ToolCallDelta {
+                index,
+                id: format!("call_{index}"),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            });
+        }
+        events.push(StreamEvent::Done {
+            message: AssistantMessage {
+                content: calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, arguments))| ContentPart::ToolCall {
+                        id: format!("call_{index}"),
+                        name: name.to_string(),
+                        arguments: arguments.clone(),
+                    })
+                    .collect(),
+                usage: None,
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                model: "fake".to_string(),
+                trust: Default::default(),
+            },
+        });
+        events
+    }
+}
+
+/// The content of the most recent `delegate` tool result in the agent's
+/// history (the sub-agent's final answer, or an error message).
+fn delegate_outcome(agent: &Agent) -> Option<String> {
+    agent.messages().iter().rev().find_map(|message| match message {
+        SessionMessage::ToolResult { name, content, .. } if name == "delegate" => {
+            Some(content.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Like `delegate_outcome`, but also reports the error flag (needed by the
+/// `format=json` tests).
+fn delegate_outcome_full(agent: &Agent) -> Option<(String, bool)> {
+    agent.messages().iter().rev().find_map(|message| match message {
+        SessionMessage::ToolResult {
+            name,
+            content,
+            is_error,
+            ..
+        } if name == "delegate" => Some((content.clone(), *is_error)),
+        _ => None,
+    })
+}
+
+/// delegate: a fresh sub-agent (own context, own turn budget) runs the task
+/// and its final answer comes back as the tool outcome.
+#[tokio::test]
+async fn delegate_runs_sub_agent_and_returns_answer() {
+    // Shared provider deque: parent turn 1 issues a delegate call; the
+    // sub-agent echoes then answers; the parent answers last.
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response("delegate", json!({ "prompt": "explore the repo" })),
+        FakeLlm::tool_response("echo", json!({ "text": "inner" })),
+        FakeLlm::text_response("sub answer: saw echoed: inner", 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let outcome = delegate_outcome(&agent).expect("delegate tool result");
+    assert!(
+        outcome.contains("saw echoed: inner"),
+        "sub-agent must run its own tools and report back, got: {outcome}"
+    );
+}
+
+/// delegate scoping: `cwd` redirects the sub-agent's tools, and `tools`
+/// restricts the sub-agent to an explicit subset.
+#[tokio::test]
+async fn delegate_scopes_cwd_and_tools() {
+    let boom_calls = Arc::new(Mutex::new(0usize));
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response(
+            "delegate",
+            json!({
+                "prompt": "where are we?",
+                "cwd": "/delegated/work",
+                "tools": ["cwd"]
+            }),
+        ),
+        FakeLlm::tool_response("cwd", json!({})),
+        FakeLlm::text_response("the cwd tool said cwd is /delegated/work", 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(
+        fake,
+        AgentOptions {
+            tools: vec![
+                Arc::new(CwdTool),
+                Arc::new(BoomTool {
+                    calls: boom_calls.clone(),
+                }),
+            ],
+            ..options()
+        },
+        Arc::new(AlwaysAllowGate),
+    );
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let outcome = delegate_outcome(&agent).expect("delegate tool result");
+    assert!(
+        outcome.contains("/delegated/work"),
+        "sub-agent must run in the delegated cwd, got: {outcome}"
+    );
+    assert_eq!(
+        *boom_calls.lock().unwrap(),
+        0,
+        "tools outside the allowed subset must never execute"
+    );
+}
+
+/// delegate requires a `prompt`; a missing one is a clear tool error.
+#[tokio::test]
+async fn delegate_requires_prompt_argument() {
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response("delegate", json!({})),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let outcome = delegate_outcome(&agent).expect("delegate tool result");
+    assert!(
+        outcome.contains("delegate: missing `prompt` argument"),
+        "got: {outcome}"
+    );
+}
+
+/// Sub-agents never see the `delegate` tool: a nested delegate call is an
+/// error inside the sub-agent, never a third agent.
+#[tokio::test]
+async fn sub_agent_never_sees_delegate_tool() {
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response("delegate", json!({ "prompt": "subtask" })),
+        // The sub-agent tries to delegate again — it must be denied, not recurse.
+        FakeLlm::tool_response("delegate", json!({ "prompt": "nested" })),
+        FakeLlm::text_response("sub final answer", 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let outcome = delegate_outcome(&agent).expect("delegate tool result");
+    assert!(
+        outcome.contains("sub final answer"),
+        "the top-level delegate must still return the sub-agent's answer, got: {outcome}"
+    );
+    // The nested attempt consumed exactly the next response (an error the
+    // sub-agent saw), never a grandchild's answer — assert the sub-agent
+    // ended normally after exactly one more provider call.
+    assert!(
+        !outcome.contains("nested"),
+        "the nested delegate must not have produced an answer: {outcome}"
+    );
+}
+
+/// Multiple delegates in one turn run concurrently — parallel repo
+/// exploration. Two sub-agents rendezvous on a shared barrier inside their
+/// echo tool; a serial runner would deadlock and the timeout fires.
+#[tokio::test]
+async fn parallel_delegates_in_one_turn_run_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response_multi(&[
+            ("delegate", json!({ "prompt": "explore A" })),
+            ("delegate", json!({ "prompt": "explore B" })),
+        ]),
+        // Sub-agent responses (order across the two sub-agents is free, but
+        // both tool calls precede both answers in the FIFO deque).
+        FakeLlm::tool_response("echo", json!({ "text": "a" })),
+        FakeLlm::tool_response("echo", json!({ "text": "b" })),
+        FakeLlm::text_response("answer A", 8),
+        FakeLlm::text_response("answer B", 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(
+        fake,
+        AgentOptions {
+            tools: vec![Arc::new(BarrierEchoTool {
+                barrier: barrier.clone(),
+            })],
+            ..options()
+        },
+        Arc::new(AlwaysAllowGate),
+    );
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.prompt("explore in parallel".to_string()),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "two delegates in one turn must run concurrently (barrier rendezvous)"
+    );
+    let delegate_results: Vec<&SessionMessage> = agent
+        .messages()
+        .iter()
+        .filter(|m| matches!(m, SessionMessage::ToolResult { name, .. } if name == "delegate"))
+        .collect();
+    assert_eq!(
+        delegate_results.len(),
+        2,
+        "one turn with two delegates must record two outcomes"
+    );
+}
+
+/// delegate with format=json: the sub-agent's JSON answer comes back parsed
+/// and pretty-printed, so the parent sees structured findings it can act on.
+#[tokio::test]
+async fn delegate_json_format_returns_parsed_json() {
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response(
+            "delegate",
+            json!({ "prompt": "find entrypoints", "format": "json" }),
+        ),
+        // Sub-agent: tool plumbing, then a JSON-only final reply.
+        FakeLlm::tool_response("echo", json!({ "text": "x" })),
+        FakeLlm::text_response(r#"{"files":["src/main.rs"],"risk":"low"}"#, 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let (content, is_error) = delegate_outcome_full(&agent).expect("delegate tool result");
+    assert!(!is_error, "json delegate must succeed, got error: {content}");
+    let parsed: Value = serde_json::from_str(&content).expect("outcome must be valid JSON");
+    assert_eq!(
+        parsed,
+        json!({ "files": ["src/main.rs"], "risk": "low" }),
+        "structured findings must round-trip"
+    );
+}
+
+/// delegate with format=json but a non-JSON reply: a clear error comes back
+/// (the parent can retry or re-delegate), never a silent garbage outcome.
+#[tokio::test]
+async fn delegate_json_format_errors_on_invalid_json() {
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response(
+            "delegate",
+            json!({ "prompt": "summarize", "format": "json" }),
+        ),
+        FakeLlm::text_response("I explored things but here is no json", 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake, options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let (content, is_error) = delegate_outcome_full(&agent).expect("delegate tool result");
+    assert!(is_error, "non-JSON reply must error, got: {content}");
+    assert!(
+        content.contains("did not produce valid JSON"),
+        "clear error expected, got: {content}"
+    );
+}
+
+/// format=json with a schema: the schema is embedded in the sub-agent's
+/// system prompt, so the sub-agent is told the expected answer shape.
+#[tokio::test]
+async fn delegate_json_schema_hints_sub_agent_prompt() {
+    let fake = Arc::new(FakeLlm::new(vec![
+        FakeLlm::tool_response(
+            "delegate",
+            json!({
+                "prompt": "find entrypoints",
+                "format": "json",
+                "schema": {
+                    "type": "object",
+                    "properties": { "files": { "type": "array" } }
+                }
+            }),
+        ),
+        FakeLlm::tool_response("echo", json!({ "text": "x" })),
+        FakeLlm::text_response(r#"{"files":["src/main.rs"]}"#, 8),
+        FakeLlm::text_response("parent done", 8),
+    ]));
+    let mut agent = Agent::new(fake.clone(), options(), Arc::new(AlwaysAllowGate));
+    agent.prompt("go".to_string()).await.expect("prompt");
+
+    let systems = fake.systems.lock().unwrap();
+    let sub_system = systems
+        .iter()
+        .find(|system| system.contains("Return ONLY a single JSON object"))
+        .expect("the sub-agent must be told to reply with JSON");
+    assert!(
+        sub_system.contains("files") && sub_system.contains("array"),
+        "the schema must be embedded in the sub-agent's prompt, got: {sub_system}"
+    );
+    // And the JSON answer still round-trips.
+    let (content, is_error) = delegate_outcome_full(&agent).expect("delegate tool result");
+    assert!(!is_error, "schema-hinted delegate must succeed: {content}");
 }

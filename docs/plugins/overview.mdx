@@ -18,7 +18,7 @@ agent-m plugins update [name]                   # rebuild/update (all or one)
 ```
 
 Every agent-m startup loads installed plugins from
-`~/.agent-m/plugins/<name>/` and merges their tools into the tool set —
+`~/.agent-m/agent/plugins/<name>/` and merges their tools into the tool set —
 permission gating and plan-mode filtering apply exactly as for built-in tools.
 Opaque plugin tools (those not explicitly trusted at install) are classified
 **Critical** by `RiskPolicy`: the harness cannot inspect what they do, so they
@@ -47,9 +47,10 @@ The repo ships four example plugins under `plugins/`:
 
 | Plugin | Tools | Config |
 |--------|-------|--------|
-| `fixture` | `greet`, `sum` | none — a minimal end-to-end example |
+| `fixture` | `fixture-hello`, `fixture-sum` | none — a minimal end-to-end example |
 | `jira` | `jira-search`, `jira-comment`, `jira-transition` | `JIRA_URL`, `JIRA_TOKEN` |
 | `github` | `github-repo-info`, `github-create-pr` | `GITHUB_TOKEN` |
+| `bitbucket` | `bitbucket-search`, `bitbucket-comment`, `bitbucket-transition`, `bitbucket-create-pr` | `BITBUCKET_BASE`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` |
 | `test-runner` | `run-tests` | project-local test command |
 
 The `agentic-dev.yml` flow (see [Flows](/flows/overview)) calls the jira and

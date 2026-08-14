@@ -1,0 +1,130 @@
+---
+title: Checks & verification
+---
+
+# Checks & verification
+
+"How do I know agent-m actually works?" This page is the answer. Every
+command below runs from the **repo root** (`/path/to/agent-m`) and prints
+nothing but errors when everything is fine.
+
+## The three commands, in order
+
+### 1. Format — `cargo fmt`
+
+```bash
+cargo fmt --all -- --check
+```
+
+Checks that every Rust file is formatted the way `rustfmt` wants. No output =
+formatted. Add `--check` is the "am I clean?" mode; run plain
+`cargo fmt` to fix files in place.
+
+### 2. Lint — `cargo clippy`
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Clippy is Rust's linter. `-D warnings` upgrades **every warning into an
+error**, so a single `unused variable` fails the check — the project's bar is
+zero warnings. `--all-targets` also lints tests and example binaries, not
+just library code.
+
+### 3. Test — `cargo test`
+
+```bash
+cargo test --workspace
+```
+
+Runs the full test suite: unit tests inside each crate, plus integration
+tests (`crates/*/tests/`). The summary lines look like:
+
+```
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+## The one-shot: `./check.sh`
+
+The repo ships a script that runs all three in sequence (fmt → clippy →
+test) and stops at the first failure:
+
+```bash
+./check.sh
+```
+
+Silent success = everything passed. This is the same gate CI would run, and
+it's the fastest way to sanity-check a change.
+
+## Docs check: `./scripts/docs-check.sh`
+
+The Mintlify site in `docs/` is validated structurally — broken nav or dead
+links fail the build, so this script is the docs gate:
+
+```bash
+./scripts/docs-check.sh
+# …
+# docs-check PASSED     ← exit 0
+```
+
+It checks, in order:
+
+| # | Check | What it catches |
+|---|-------|-----------------|
+| 1 | `mint.json` is valid JSON | typos, trailing commas, unquoted keys |
+| 2 | Every `navigation` path resolves to `docs/<path>.mdx` (or `.md`) | a page referenced in the nav that was never created or was renamed |
+| 3 | Every internal markdown link (a backticked `](some/path)` target) resolves to a real page | dead links, renamed files |
+| 4 | Code fences are balanced (a triple-backtick count that must be even per file) | an unclosed code block that would swallow the rest of the page |
+| 5 | No placeholder pages (full scope only) | unfinished pages shipped by accident |
+
+`--scaffold` mode skips check 5 (used while pages are still being written).
+If a check fails you'll see `FAIL: …` lines and the script exits 1 with
+`docs-check FAILED`.
+
+## Trust audit: `TRUST_AUDIT.md`
+
+`TRUST_AUDIT.md` at the repo root is the **trust scorecard**: agent-m vs. the
+twelve trust principles from `check.md`, re-audited by reading code (not
+docs). Current verdicts (2026-08-13 pass 2):
+
+| Verdict | Principles |
+|---------|-----------|
+| ✅ **Yes (7)** | 2 Explain decisions, 4 Confidence, 5 Risk permissions, 6 Meaningful interruptions, 9 Evidence, 12 Autonomy + evidence-backed partial 11 |
+| 🟡 **Partial (5)** | 1 Transparency, 3 Plan-before-execution, 7 Audit trail, 8 Reversibility (undo yes, checkpoints no), 10 Uncertainty, 11 Preference learning |
+| ❌ **Absent (0)** | — |
+
+It also lists **disconnected infrastructure** — code that exists but nothing
+calls yet (`/checkpoint`, `/restore`, `!command` preference learning,
+`TierGate`, `/sessions` resume-from-list, `/refine` apply). If you change
+trust-relevant code, update this file: the docs (this site) intentionally
+defer to it for honest status.
+
+## Smoke tests
+
+Beyond the Rust test suite, the repo has a few quick end-to-end checks:
+
+```bash
+python3 scripts/pty-smoke.py      # boots the REPL under a pseudo-TTY,
+                                  # waits for the banner + "thinking…"
+bash scripts/tmux-smoke.sh        # same idea via tmux (C-c exits)
+```
+
+And a CLI smoke is just running the binary and reading its help:
+
+```bash
+cargo build -p agent-m-cli
+./target/debug/agent-m --help              # every flag/subcommand listed
+./target/debug/agent-m --list-models       # providers + models resolve
+./target/debug/agent-m pickup --dry-run    # validates the flow YAML parses
+                                          # and prints the plan (needs JIRA_URL)
+```
+
+## The 30-second verification recipe
+
+After any change, in order:
+
+1. `./check.sh` — silent = fmt + clippy + all tests green.
+2. `./scripts/docs-check.sh` — must end `docs-check PASSED`.
+3. Smoke the CLI paths you touched (`--help` / `--dry-run` / a fake-data run).
+
+That's the whole gate. If all three pass, the change is safe to commit.

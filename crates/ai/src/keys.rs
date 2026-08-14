@@ -5,27 +5,23 @@ use std::path::Path;
 
 /// Resolve an API key for `provider_id`, checking in order:
 ///
-/// 1. the environment variable `env_var` (e.g. `DEEPSEEK_API_KEY`),
-/// 2. `<agent_dir>/auth.json` — both the nested shape
+/// 1. `<agent_dir>/auth.json` — both the nested shape
 ///    `{"providers": {"deepseek": {"apiKey": "..."}}}` and the flat shape
 ///    `{"deepseek": "..."}`,
-/// 3. `<agent_dir>/settings.json`, same two shapes.
-pub fn resolve_api_key(env_var: &str, provider_id: &str, agent_dir: &Path) -> Option<String> {
-    if let Ok(key) = std::env::var(env_var)
-        && !key.is_empty()
-    {
-        return Some(key);
-    }
-
+/// 2. `<agent_dir>/settings.json`, same two shapes.
+///
+/// Environment variables are intentionally not checked — use auth.json.
+pub fn resolve_api_key(_env_var: &str, provider_id: &str, agent_dir: &Path) -> Option<String> {
     if let Some(key) = read_key_from_file(&agent_dir.join("auth.json"), provider_id) {
         return Some(key);
     }
 
-    if read_key_from_file(&agent_dir.join("settings.json"), provider_id).is_some() {
+    if let Some(key) = read_key_from_file(&agent_dir.join("settings.json"), provider_id) {
         tracing::warn!(
             "API key for {} found in settings.json! This file is world-readable (0644). Please move it to auth.json immediately.",
             provider_id
         );
+        return Some(key);
     }
 
     None
@@ -118,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn env_var_wins() {
+    fn auth_json_wins_over_env_var() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("auth.json"),
@@ -126,9 +122,10 @@ mod tests {
         )
         .unwrap();
         unsafe { std::env::set_var("AGENT_M_TEST_ENV_KEY", "env-key") };
+        // env var is ignored; auth.json is the source of truth
         assert_eq!(
             resolve_api_key("AGENT_M_TEST_ENV_KEY", "deepseek", dir.path()),
-            Some("env-key".to_string())
+            Some("file-key".to_string())
         );
     }
 

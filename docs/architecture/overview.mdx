@@ -9,24 +9,69 @@ A cargo workspace of focused crates, mirroring pi's layered design:
 ```
 crates/ai      model-agnostic provider layer, byte-stable serializer, cache stats
 crates/agent   agent loop (pi event ordering), session messages, tool trait, permission gate
-crates/tools   built-in tools (bash, read, write, edit, grep, find, ls, search)
+crates/tools   built-in tools (bash, read, write, edit, grep, find, ls, search, web)
 crates/flow    YAML flow engine (prompt/ask/tool/condition/phase/verify steps, ${ref}s)
-crates/tui     pi-style terminal UI (transcript, editor, markdown, themes, sessions)
-crates/cli     the agent-m binary (args, config, print mode, interactive mode)
+crates/cli     the agent-m binary (args, config, print mode, interactive REPL)
+crates/mcp     MCP client (stdio + Streamable HTTP)
 crates/plugin-sdk     C-ABI contract for out-of-tree plugin tools
 crates/plugin-loader  libloading-based plugin host (loads, validates, wraps tools)
 ```
 
 Plus the example plugins under `plugins/` (`fixture`, `jira`, `github`,
-`test-runner`).
+`bitbucket`, `test-runner`).
+
+## System view
+
+```mermaid
+flowchart LR
+    CLI["agent-m CLI<br/>(crates/cli)"] --> AGENT["Agent loop<br/>(crates/agent)"]
+    AGENT --> AI["Provider layer<br/>(crates/ai)"]
+    AGENT --> TOOLS["Built-in tools<br/>(crates/tools)"]
+    AGENT --> MCP["MCP client<br/>(crates/mcp)"]
+    AGENT --> FLOW["Flow engine<br/>(crates/flow)"]
+    AGENT --> LOADER["Plugin host<br/>(crates/plugin-loader)"]
+    LOADER --> PLUGINS["Out-of-tree plugins<br/>(plugin-sdk C-ABI)"]
+    AI --> P1["OpenAI-compatible"]
+    AI --> P2["Anthropic native"]
+    MCP --> S1["stdio servers"]
+    MCP --> S2["Streamable HTTP"]
+    AGENT --> PERM["Permission gate<br/>(LevelGate + RiskPolicy)"]
+    PERM --> ALLOWED["auto (Low/Medium)"]
+    PERM --> ASK["ask human (High/Critical)"]
+```
 
 ## The agent loop
 
 The agent emits events in pi's ordering — `agent_start → turn_start →
 message_start/update/end → tool_execution_* → toolResult → turn_end →
-agent_end` — so the TUI, print mode, and flows all render the same stream.
+agent_end` — so the REPL, print mode, and flows all render the same stream.
 Errors fold into `StreamEvent::Error` / `StopReason::error|aborted`; they are
 never thrown across the stream boundary.
+
+```mermaid
+sequenceDiagram
+    participant App as REPL / print mode / flow
+    participant Agent as Agent (crates/agent)
+    participant Prov as Provider (crates/ai)
+    participant Tool as Tool runner
+
+    App->>Agent: run(options)
+    Agent->>Agent: agent_start
+    loop each turn
+        Agent->>Agent: turn_start
+        Agent->>Prov: model request
+        Prov-->>Agent: message_start / message_update / message_end
+        alt tool call requested
+            Agent->>Agent: tool_execution_start
+            Agent->>Tool: execute(name, args)
+            Tool-->>Agent: toolResult (ok or error)
+            Agent->>Agent: tool_execution_end
+        end
+        Agent->>Agent: turn_end
+    end
+    Agent-->>App: agent_end
+    App->>App: render same stream everywhere
+```
 
 ## Byte-stable prefix caching
 
@@ -42,8 +87,8 @@ of recomputing the prefix:
   in place.
 
 Cache hit/miss tokens (`prompt_cache_hit_tokens` /
-`prompt_cache_miss_tokens`) are parsed into `CacheStats` and shown in the TUI
-status line (`/cache` or `ctrl+t` toggles the notices).
+`prompt_cache_miss_tokens`) are parsed into `CacheStats` and shown by
+`/usage` in the REPL.
 
 ## Sessions and memory
 
@@ -54,8 +99,10 @@ status line (`/cache` or `ctrl+t` toggles the notices).
   stays in context — pi's cross-session memory model. `--compact-threshold`
   (default 0.5) compacts at turn boundaries, not mid-implementation.
 - The plan file (`~/.agent-m/agent/tasks/<session>.json`) is a second durable
-  memory; `preferences.json` (learned `!command` families, `/undo` signals) is
-  a third, and it feeds a static system-prompt block (trust principle 11).
+  memory. `preferences.json` is a third (`!command` families, `/undo`
+  signals): `/undo` usage is recorded and reflected back as a "Known
+  preferences" prompt block; the `!command` signal has no code path yet
+  (see `TRUST_AUDIT.md`).
 
 ## Providers
 
@@ -63,4 +110,5 @@ The provider layer is model-agnostic: any OpenAI-compatible chat-completions
 endpoint works via `OpenAiCompatibleProvider` (configurable base URL + model).
 DeepSeek is configured out of the box — `deepseek-chat` (default) and
 `deepseek-reasoner` (thinking deltas) — and the key resolves from
-`DEEPSEEK_API_KEY` env → `auth.json` → `settings.json`.
+`~/.agent-m/agent/auth.json` → `~/.agent-m/agent/settings.json` (provider-key
+env vars are not read).

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Drive the agent-m TUI through a real pty (tmux-equivalent harness).
+"""Drive the agent-m REPL through a real pty (tmux-equivalent harness).
 
 Verifies, end to end, against the real provider when DEEPSEEK_API_KEY is set:
-  1. startup renders the dock (footer hints),
-  2. a typed prompt starts a turn (status transitions Working -> Ready),
+  1. startup renders the REPL banner,
+  2. a typed prompt starts a turn (the `thinking...` indicator appears and a
+     reply panel renders),
   3. the model's reply is persisted to the session log (two real turns),
   4. turn 2 is served from DeepSeek's prefix cache (cacheReadTokens > 0),
   5. ctrl+d exits cleanly.
@@ -101,8 +102,8 @@ def main():
         print("build missing; run: cargo build -p agent-m-cli")
         return 1
 
-    # Enable the cache-stats status line so the byte-stable prefix caching can
-    # be observed live (DeepSeek reports prompt_cache_hit_tokens).
+    # Enable cache-miss notices so the byte-stable prefix caching can be
+    # observed live (DeepSeek reports prompt_cache_hit_tokens).
     agent_dir = os.path.join(SMOKE_DIR, "agent")
     os.makedirs(agent_dir, exist_ok=True)
     settings = os.path.join(agent_dir, "settings.json")
@@ -115,7 +116,7 @@ def main():
         os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + os.environ.get("PATH", "")
         # Keep all agent data inside the workspace (sandbox-safe).
         os.environ["AGENT_M_DIR"] = SMOKE_DIR
-        os.execv(BUILD, [BUILD, "--ui-mode", "regular"] + sys.argv[1:])
+        os.execv(BUILD, [BUILD] + sys.argv[1:])
 
     # Give the pty a real terminal size (default is 0x0, which renders nothing).
     import fcntl
@@ -126,57 +127,57 @@ def main():
     failures = []
     skipped = False
 
-    startup = wait_for(fd, "enter send", timeout=10)
-    if "enter send" in strip_ansi(startup):
-        print("PASS startup: footer keybinding hints rendered")
+    startup = wait_for(fd, "agent-m REPL mode", timeout=10)
+    if "agent-m REPL mode" in strip_ansi(startup):
+        print("PASS startup: REPL banner rendered")
     else:
         print("FAIL startup; captured:")
         print(strip_ansi(startup)[-800:])
         failures.append("startup")
 
     def settle(initial_text, timeout=90):
-        """After 'Working' is seen, wait until the status leaves the Working
-        state. Returns the idle marker ('messages' — the idle status line
-        renders `model · N messages`) on a completed turn, or the error marker
-        ('no API key' / 'provider error') when the run ended without a reply.
-        Search is position-based: a marker only counts if it appears *after*
-        the current turn's 'Working' in the byte stream, so a previous turn's
-        idle line never satisfies this turn."""
+        """After 'thinking...' is seen, wait until the turn finishes (the next
+        `agent-m (…` prompt appears). Returns 'ok' when the next prompt is
+        seen, or 'no key' / 'provider error' when the run ended without a
+        reply. Search is position-based: a marker only counts if it appears
+        *after* the current turn's 'thinking...' in the byte stream."""
         text = initial_text
         end = time.time() + timeout
         while time.time() < end:
             text += strip_ansi(read_all(fd, 0.3).decode(errors="replace"))
-            working_at = text.rfind("Working")
-            for marker in ("no API key", "provider error", "messages"):
+            thinking_at = text.rfind("thinking...")
+            for marker in ("no API key", "provider error"):
                 marker_at = text.rfind(marker)
-                if marker_at != -1 and marker_at > working_at:
+                if marker_at != -1 and marker_at > thinking_at:
                     return marker
+            prompt_at = text.rfind("agent-m (")
+            if prompt_at != -1 and prompt_at > thinking_at:
+                return "ok"
         return None
 
     def turn(text, timeout=90):
-        """Submit one prompt; require Working -> settle. Returns
+        """Submit one prompt; require thinking... -> settle. Returns
         (streamed_ok: bool, output: str)."""
         try:
             os.write(fd, text.encode() + b"\r")
         except OSError:
             pass
-        # "Working" only renders while a turn is in flight (submit_text sets
-        # streaming before the provider is contacted, so it appears even when
-        # the key is missing). The reply/error frames arrive within the same
-        # read windows, so the already-captured text is searched too.
-        output = wait_for(fd, "Working", timeout=timeout)
+        # "thinking..." only renders while a turn is in flight, so it appears
+        # even when the key is missing. The reply/error frames arrive within
+        # the same read windows, so the already-captured text is searched too.
+        output = wait_for(fd, "thinking...", timeout=timeout)
         stripped = strip_ansi(output)
-        if "Working" not in stripped:
-            print("FAIL no Working status for %r; captured tail:" % text)
+        if "thinking..." not in stripped:
+            print("FAIL no thinking indicator for %r; captured tail:" % text)
             print(stripped[-800:])
             failures.append("turn:" + text)
             return False, stripped
         marker = settle(stripped, timeout)
-        if marker == "messages":
+        if marker == "ok":
             return True, stripped
         if marker in ("no API key", "provider error"):
             return False, stripped
-        print("FAIL turn did not settle for %r (no idle/error); tail:" % text)
+        print("FAIL turn did not settle for %r (no prompt/error); tail:" % text)
         print(stripped[-800:])
         failures.append("settle:" + text)
         return False, stripped
@@ -184,7 +185,7 @@ def main():
     saw_streaming_1, tail1 = turn("Say exactly: smoke test ok")
     saw_streaming_2, tail2 = turn("Say exactly: second reply")
     if saw_streaming_1 and saw_streaming_2:
-        print("PASS both turns streamed (status Working -> Ready)")
+        print("PASS both turns streamed (thinking -> next prompt)")
     elif saw_streaming_1 != saw_streaming_2:
         print("FAIL inconsistent streaming between turns")
         failures.append("streaming-consistency")
@@ -227,9 +228,9 @@ def main():
 
     combined = tail1 + tail2
     if "cache" in combined and "% hit" in combined:
-        print("PASS cache-hit stats surfaced in the status line")
+        print("PASS cache-hit stats surfaced in the session output")
     else:
-        print("INFO cache stats not observed in the status line")
+        print("INFO cache stats not observed in the session output")
 
     try:
         os.write(fd, b"\x04")  # ctrl+d exit (empty editor)

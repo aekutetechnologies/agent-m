@@ -17,9 +17,15 @@ by adding `"type": "anthropic"` to a provider entry in
 ]}
 ```
 
-The key resolves like any other provider (env → `auth.json` → `settings.json`),
-defaulting to the `<ID>_API_KEY` env var — set `ANTHROPIC_API_KEY` (or add an
-`anthropic` entry to `auth.json`).
+The key resolves like any other provider (`auth.json` → `settings.json`),
+so add an `anthropic` entry to `~/.agent-m/agent/auth.json`:
+
+```json
+{ "providers": { "anthropic": { "apiKey": "sk-ant-..." } } }
+```
+
+(`apiKeyEnv: "ANTHROPIC_API_KEY"` is a display-only hint — provider-key
+environment variables are not read; see [Providers](/extending/providers).)
 
 ## Why a native provider
 
@@ -33,30 +39,30 @@ the generic adapter cannot express:
 - SSE events are `content_block_start` / `content_block_delta` /
   `content_block_stop` / `message_delta` (not `choices[].delta`).
 - Thinking arrives as `type: "thinking"` content blocks and maps to
-  `ContentPart::Thinking` (the TUI's thinking toggle).
+  `ContentPart::Thinking` (shown live in the REPL).
 
 ## Prefix caching
 
 The provider marks the system prompt and the last text block of user turns
 with `cache_control: { "type": "ephemeral" }`, so repeated turns hit the
 provider's prefix cache (`cache_read_input_tokens` / `cache_creation_input_tokens`
-are parsed into the session usage and the sidebar's cache-read %). Cache
+are parsed into the session usage and shown by `/usage`). Cache
 creation is billed at 1.25× input on Anthropic's pricing.
 
 ## Models & thinking budgets
 
 See [Models reference](/MODELS) for the full Anthropic model table
 (claude-opus-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5, …),
-context windows, and pricing. For models with a `thinking_toggle`, the
-variant selector (`ctrl+v`) maps to the thinking budget:
+context windows, and pricing.
 
-| Variant | `budget_tokens` |
-|---|---|
-| `low` | 1 024 |
-| `high` | 16 384 |
-| `max` | 64 000 |
-
-`default` sends no `thinking` field (provider default budget).
+**Current wire behavior** (`anthropic.rs`): every request sends a fixed
+`max_tokens: 8192`; thinking is enabled and its blocks map to
+`ContentPart::Thinking` (shown live in the REPL). The `/variant` selector
+(low/high/max) currently maps to `reasoning_effort` on **OpenAI-compatible**
+providers only — it is not wired into the Anthropic provider yet (see
+[MODELS](/MODELS) for the planned thinking-budget tiers). `--variant`/
+`/variant` are safe to pass; they're simply ignored by the native Anthropic
+path today.
 
 ## Notes & limits
 

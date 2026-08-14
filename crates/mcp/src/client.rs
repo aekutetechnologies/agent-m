@@ -151,10 +151,16 @@ impl McpClient {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({ "type": "object" }));
+                let read_only = tool
+                    .get("annotations")
+                    .and_then(|a| a.get("readOnlyHint"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 Some(McpToolDef {
                     name,
                     description,
                     input_schema,
+                    read_only,
                 })
             })
             .collect())
@@ -274,6 +280,9 @@ pub struct McpToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Server's `annotations.readOnlyHint`: advisory read-only marker used to
+    /// auto-approve read-like calls (not a security boundary).
+    pub read_only: bool,
 }
 
 fn extract_text(result: &Value) -> String {

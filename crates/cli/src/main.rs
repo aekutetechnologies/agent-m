@@ -36,10 +36,16 @@ mod section;
 mod daemon;
 mod attach;
 mod ask;
+mod human;
+mod slack;
+mod pickup;
+mod ticket_log;
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are agent-m, a coding agent running in a terminal. \
@@ -78,7 +84,8 @@ struct Cli {
     #[arg(long)]
     provider: Option<String>,
 
-    /// Auto-approve tool calls (no interactive confirmation).
+    /// Auto-approve Low/Medium tool calls; High/Critical always ask in the
+    /// REPL. In print mode this also enables tools (no human to ask).
     #[arg(long)]
     yes: bool,
 
@@ -93,14 +100,6 @@ struct Cli {
     /// Exclude these comma-separated tools.
     #[arg(long = "exclude-tools", value_delimiter = ',')]
     exclude_tools: Vec<String>,
-
-    /// Theme: `dark`, `light`, or a path to a theme JSON file.
-    #[arg(long)]
-    theme: Option<String>,
-
-    /// UI mode: `regular` (scrollback) or `fullscreen` (alternate screen).
-    #[arg(long = "ui-mode")]
-    ui_mode: Option<String>,
 
     /// Resume the most recent session for this directory.
     #[arg(long, short = 'r')]
@@ -132,6 +131,12 @@ struct Cli {
     #[arg(long = "flow")]
     flow: Option<PathBuf>,
 
+    /// Seed flow-context values as KEY=VALUE (repeatable), e.g.
+    /// `--flow-context ticket=PROJ-42 --flow-context repo=acme/app`.
+    /// Referenced from flow steps as `${ticket}`, `${repo}`, …
+    #[arg(long = "flow-context", value_name = "KEY=VALUE")]
+    flow_context: Vec<String>,
+
     /// Stream machine-readable events as JSON lines (print mode).
     #[arg(long = "stream-json")]
     stream_json: bool,
@@ -161,21 +166,105 @@ struct Cli {
     #[arg(long = "allow-path")]
     allow_path: Vec<PathBuf>,
 
-    /// Manage plugins (install/list/remove/update).
+    /// Route asks and High/Critical approvals over Slack (remote human
+    /// channel). Requires SLACK_APP_TOKEN + SLACK_BOT_TOKEN. Also posts flow
+    /// step progress.
+    #[arg(long = "slack-channel")]
+    slack_channel: Option<String>,
+
+    /// Enforce the trust protocol (check.md P2/P4/P9): turns that use tools
+    /// must carry a `<trust>` block with a confidence score and real
+    /// evidence. warn = notice gaps only (default), ask = ask before running
+    /// gapped turns, block = deny without asking, off = display-only.
+    #[arg(long = "trust", default_value = "warn", value_parser = ["off", "warn", "ask", "block"])]
+    trust: String,
+
+    /// Top-level subcommands (plugins, slack).
     #[command(subcommand)]
-    plugins: Option<PluginsGroup>,
+    command: Option<Commands>,
 
     /// Prompt(s). In print mode, multiple prompts run in sequence.
     #[arg()]
     messages: Vec<String>,
 }
 
-/// The `agent-m plugins` group.
+/// Top-level subcommands.
 #[derive(Debug, clap::Subcommand)]
-enum PluginsGroup {
+enum Commands {
+    /// Manage plugins (install/list/remove/update).
     Plugins {
         #[command(subcommand)]
         command: PluginsCommand,
+    },
+    /// Connect to Slack (Socket Mode) as the remote human channel.
+    Slack {
+        /// Channel used for questions/notifications (default: the DM channel).
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Pick up the next assigned open Jira ticket and run the flow against it
+    /// (auto-pickup for the autonomous SDLC loop).
+    Pickup {
+        /// Ticket key override (skips the Jira query), e.g. PROJ-42.
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Repo override (git URL or local path); defaults to the repos.json
+        /// mapping for the ticket's project key.
+        #[arg(long)]
+        repo: Option<String>,
+        /// JQL override for the ticket query.
+        #[arg(long)]
+        jql: Option<String>,
+        /// Jira transition id for "In Progress" (default 11).
+        #[arg(long = "transition-id", default_value = "11")]
+        transition_id: String,
+        /// Print what would be picked and run, without doing it.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Flow to run against the picked ticket.
+        #[arg(long = "flow", default_value = "flows/agentic-dev.yml")]
+        flow: PathBuf,
+        /// Poll for new tickets every N seconds (default 300; run forever
+        /// until Ctrl-C). `--poll` without a value uses the default.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300")]
+        poll: Option<u64>,
+        /// Run up to N ticket flows in parallel (only meaningful with --poll).
+        #[arg(long, default_value = "1")]
+        workers: usize,
+    },
+    /// Run one ticket's full pipeline in its own process (the per-ticket
+    /// daemon). Spawned by `pickup --poll --workers N` for each ticket.
+    TicketRun {
+        /// Ticket key, e.g. PROJ-42 (skips the Jira query).
+        #[arg(long)]
+        ticket: String,
+        /// Repo override (git URL or local path); defaults to the repos.json
+        /// mapping for the ticket's project key.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Jira transition id for "In Progress" (default 11).
+        #[arg(long = "transition-id", default_value = "11")]
+        transition_id: String,
+        /// Flow to run against the ticket.
+        #[arg(long = "flow", default_value = "flows/agentic-dev.yml")]
+        flow: PathBuf,
+        /// Agent directory (repos.json, worktrees, reports, sessions).
+        #[arg(long = "agent-dir")]
+        agent_dir: Option<PathBuf>,
+        /// Extra flow context as KEY=VALUE (repeatable).
+        #[arg(long = "flow-context")]
+        flow_context: Vec<String>,
+    },
+    /// Tail a per-ticket daemon's report (`<agent_dir>/tickets/<KEY>.jsonl`).
+    TicketLog {
+        /// Ticket key, e.g. PROJ-42.
+        ticket: String,
+        /// Keep following the report as new lines are appended.
+        #[arg(long)]
+        follow: bool,
+        /// Agent directory (default: the standard agent dir).
+        #[arg(long = "agent-dir")]
+        agent_dir: Option<PathBuf>,
     },
 }
 
@@ -214,7 +303,6 @@ fn load_settings(agent_dir: &Path) -> serde_json::Value {
         .unwrap_or(serde_json::json!({}))
 }
 
-#[allow(dead_code)]
 fn resolve_level(cli: &Cli, settings: &serde_json::Value) -> agent_m_agent::AutonomyLevel {
     let number = cli
         .level
@@ -283,6 +371,35 @@ fn non_interactive_gate(yes: bool, risk: Arc<RiskPolicy>) -> Arc<dyn PermissionG
     }
 }
 
+/// Which human answers High/Critical approval questions.
+#[derive(Clone)]
+enum HumanAsk {
+    /// The remote Slack channel (--slack-channel).
+    Slack {
+        remote: Arc<crate::slack::RemoteHuman>,
+        channel: String,
+    },
+    /// The terminal gate (ask_human): readline; denies without a TTY.
+    Terminal,
+}
+
+/// Route one permission question to the configured human.
+fn ask_human_permission(
+    human: &HumanAsk,
+    policy: Arc<RiskPolicy>,
+    call: agent_m_agent::ToolCallInfo,
+) -> Pin<Box<dyn Future<Output = agent_m_agent::Permission> + Send>> {
+    match human {
+        HumanAsk::Slack { remote, channel } => crate::slack::ask_slack_permission(
+            remote.clone(),
+            channel.clone(),
+            (*policy).clone(),
+            call,
+        ),
+        HumanAsk::Terminal => crate::gate::ask_human(policy, call),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -307,7 +424,7 @@ async fn main() -> Result<()> {
     } else {
         cwd
     };
-    if let Some(PluginsGroup::Plugins { command }) = &cli.plugins {
+    if let Some(Commands::Plugins { command }) = &cli.command {
         let result = match command {
             PluginsCommand::Install { source, rev } => {
                 plugins::run_install(&agent_dir, source, rev.as_deref())
@@ -442,14 +559,28 @@ async fn main() -> Result<()> {
             };
             match connected {
                 Ok(client) => match agent_m_mcp::connect_tools(&name, client).await {
-                    Ok((mcp_tools, _shared)) => {
+                    Ok((mcp_tools, hinted_read_only, _shared)) => {
                         let count = mcp_tools.len();
                         for tool in mcp_tools {
                             if !cli.exclude_tools.iter().any(|n| n == tool.name())
                                 && (cli.tools.is_empty()
                                     || cli.tools.iter().any(|n| n == tool.name()))
                             {
-                                opaque_tools.push(tool.name().to_string());
+                                // Read-only MCP tools (server readOnlyHint, or
+                                // `readOnlyTools` config override on the bare
+                                // name) skip the opaque/always-ask tier so
+                                // read-like calls auto-approve.
+                                let read_only = hinted_read_only.contains(&tool.name().to_string())
+                                    || agent_m_mcp::matches_patterns(
+                                        tool.name()
+                                            .split("__")
+                                            .last()
+                                            .unwrap_or(tool.name()),
+                                        &config.read_only_tools,
+                                    );
+                                if !read_only {
+                                    opaque_tools.push(tool.name().to_string());
+                                }
                                 tools.push(tool);
                             }
                         }
@@ -496,7 +627,30 @@ async fn main() -> Result<()> {
     let context_files = agent_m_agent::discover_instructions(&cwd);
     // check.md principle 11: reflect learned preferences back to the model as
     // a static block (rebuilt only when preferences change — byte-stable).
-    let preference_block = String::new(); // TODO: Reintegrate prefs
+    let preference_block = crate::prefs::prompt_block(&crate::prefs::load(&agent_dir));
+
+    // Remote human channel (Phase 2): with `--slack-channel` the ask tool,
+    // High/Critical approvals, and flow progress go over Slack instead of
+    // the terminal. The event loop runs on a spawned task for the whole
+    // process.
+    let remote = if let Some(channel) = &cli.slack_channel {
+        let transport: Arc<dyn crate::slack::SlackTransport> = Arc::new(
+            crate::slack::SlackClient::from_env().map_err(anyhow::Error::msg)?,
+        );
+        Some((crate::slack::RemoteHuman::start(transport), channel.clone()))
+    } else {
+        None
+    };
+    // The LevelGate ask closure: remote Slack approval, or the terminal gate.
+    // Shared by the daemon and REPL gates so both honor `--slack-channel`.
+    let human_ask = match &remote {
+        Some((remote, channel)) => HumanAsk::Slack {
+            remote: remote.clone(),
+            channel: channel.clone(),
+        },
+        None => HumanAsk::Terminal,
+    };
+
     let system_prompt = format!(
         "{base_prompt}{}{preference_block}",
         agent_m_agent::render_instructions(&context_files)
@@ -519,7 +673,11 @@ async fn main() -> Result<()> {
         } else {
             agent_m_agent::Mode::Build
         },
-        ask_gate: Some(Arc::new(crate::ask::make_repl_ask_gate())),
+        ask_gate: if let Some((remote, channel)) = &remote {
+            Some(Arc::new(remote.ask_gate(channel)))
+        } else {
+            Some(Arc::new(crate::ask::make_repl_ask_gate()))
+        },
         context_window: provider
             .models()
             .iter()
@@ -527,11 +685,132 @@ async fn main() -> Result<()> {
             .and_then(|m| m.context_window),
         variant: cli.variant.clone(),
         output_dir: Some(agent_dir.join("tool_outputs")),
+        trust: agent_m_agent::TrustPolicy {
+            mode: match cli.trust.as_str() {
+                "off" => agent_m_agent::TrustMode::Off,
+                "ask" => agent_m_agent::TrustMode::Ask,
+                "block" => agent_m_agent::TrustMode::Block,
+                _ => agent_m_agent::TrustMode::Warn,
+            },
+            confidence_threshold: 50,
+        },
+        risk_policy: Some((*risk).clone()),
+        delegate_depth: 0,
     };
+
+    if let Some(Commands::Slack { channel }) = &cli.command {
+        let level = resolve_level(&cli, &settings);
+        return run_slack_mode(
+            provider,
+            agent_options,
+            cwd,
+            cli.yes,
+            risk.clone(),
+            agent_dir.clone(),
+            level,
+            channel.clone(),
+            cli.flow_context.clone(),
+            cli.flow
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("flows/agentic-dev.yml")),
+        )
+        .await;
+    }
+
+    if let Some(Commands::Pickup {
+        ticket,
+        repo,
+        jql,
+        transition_id,
+        dry_run,
+        flow,
+        poll,
+        workers,
+    }) = &cli.command
+    {
+        let level = resolve_level(&cli, &settings);
+        let (remote, channel) = match &remote {
+            Some((r, ch)) => (Some(r.clone()), Some(ch.clone())),
+            None => (None, None),
+        };
+        let context_pairs = cli.flow_context.clone();
+        return run_pickup(
+            provider,
+            agent_options,
+            cwd,
+            cli.yes,
+            risk.clone(),
+            agent_dir.clone(),
+            level,
+            remote,
+            channel,
+            &context_pairs,
+            ticket.as_deref(),
+            repo.as_deref(),
+            jql.as_deref(),
+            transition_id,
+            *dry_run,
+            flow,
+            *poll,
+            *workers,
+        )
+        .await;
+    }
+
+    // Per-ticket daemon: one ticket's whole pipeline (transition → worktree →
+    // flow → report) in an isolated process. The pickup supervisor spawns this
+    // with `--agent-dir`, so a ticket's crash never takes down the queue.
+    if let Some(Commands::TicketRun {
+        ticket,
+        repo,
+        transition_id,
+        flow,
+        agent_dir,
+        flow_context,
+    }) = &cli.command
+    {
+        let agent_dir = agent_dir
+            .clone()
+            .unwrap_or_else(|| cli.session_dir.clone().unwrap_or_else(default_agent_dir));
+        return run_ticket_run(
+            provider,
+            agent_options,
+            cwd,
+            cli.yes,
+            risk.clone(),
+            agent_dir,
+            ticket,
+            repo.as_deref(),
+            transition_id,
+            flow,
+            flow_context,
+        )
+        .await;
+    }
+
+    // Tail a per-ticket daemon's report. Only needs the agent dir, so it can
+    // run even when a provider/tools setup would be impossible (e.g. a plain
+    // status check).
+    if let Some(Commands::TicketLog {
+        ticket,
+        follow,
+        agent_dir,
+    }) = &cli.command
+    {
+        let agent_dir = agent_dir
+            .clone()
+            .unwrap_or_else(|| cli.session_dir.clone().unwrap_or_else(default_agent_dir));
+        return run_ticket_log(&agent_dir, ticket, *follow).await;
+    }
 
     if let Some(flow_path) = &cli.flow {
         let flow_state_dir = agent_dir.join("flows");
-        return run_flow_mode(
+        let level = resolve_level(&cli, &settings);
+        let (remote, channel) = match &remote {
+            Some((r, ch)) => (Some(r.clone()), Some(ch.clone())),
+            None => (None, None),
+        };
+        let run = run_flow_mode(
             provider,
             agent_options,
             flow_path,
@@ -539,20 +818,32 @@ async fn main() -> Result<()> {
             cli.yes,
             risk.clone(),
             flow_state_dir,
+            level,
+            remote,
+            channel,
+            &cli.flow_context,
+            None,
         )
-        .await;
+        .await?;
+        if run
+            .steps
+            .iter()
+            .any(|s| s.status == agent_m_flow::StepStatus::Failed)
+        {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     if cli.serve {
         let gate = non_interactive_gate(cli.yes, risk.clone());
         return serve_loop(provider, agent_options, gate).await;
     }
-    if print_mode {
-        let messages = inline_file_args(&cwd, cli.messages.clone());
-        let gate = non_interactive_gate(cli.yes, risk.clone());
-        return run_print(provider, agent_options, gate, messages, cli.stream_json).await;
-    }
 
+    // Background sessions win over print mode: the daemon runs with stdin
+    // not a TTY, which would otherwise trip the `print_mode` early return
+    // below. `--list-daemons`, `--attach`, and `--daemon` are all
+    // non-interactive and must dispatch before the print-mode check.
     if cli.list_daemons {
         let dir = crate::daemon::get_sockets_dir(&agent_dir)?;
         println!("Active daemon sockets in {}:", dir.display());
@@ -573,7 +864,12 @@ async fn main() -> Result<()> {
     }
 
     if let Some(session_id) = &cli.daemon {
-        let gate = Arc::new(crate::gate::CliPromptGate::new(risk.clone(), cli.yes));
+        let human = human_ask.clone();
+        let gate = Arc::new(agent_m_agent::LevelGate::new(
+            resolve_level(&cli, &settings),
+            (*risk).clone(),
+            move |call| ask_human_permission(&human, risk.clone(), call),
+        ));
         return crate::daemon::run_daemon(
             session_id.clone(),
             provider,
@@ -585,7 +881,20 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    let gate = Arc::new(crate::gate::CliPromptGate::new(risk.clone(), cli.yes));
+    if print_mode {
+        let messages = inline_file_args(&cwd, cli.messages.clone());
+        let gate = non_interactive_gate(cli.yes, risk.clone());
+        return run_print(provider, agent_options, gate, messages, cli.stream_json).await;
+    }
+
+    let human = human_ask.clone();
+    let level_gate = agent_m_agent::LevelGate::new(
+        resolve_level(&cli, &settings),
+        (*risk).clone(),
+        move |call| ask_human_permission(&human, risk.clone(), call),
+    );
+    let level_handle = level_gate.level_handle();
+    let gate: Arc<dyn agent_m_agent::PermissionGate> = Arc::new(level_gate);
 
     crate::repl::run_repl(
         provider.clone(),
@@ -593,6 +902,7 @@ async fn main() -> Result<()> {
         gate,
         agent_dir,
         cwd,
+        Some(level_handle),
     )
     .await
 }
@@ -698,8 +1008,11 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Run a YAML flow in print mode: sequential steps, status lines to stdout,
-/// non-zero exit on failure.
+/// Run a YAML flow in print mode: sequential steps, status lines to stdout.
+/// Returns the full `FlowRun` (callers decide exit status — steps may be
+/// Failed inside a completed run; `Err` only when the flow itself aborts).
+/// With a remote channel, ask steps and approvals go over Slack and step
+/// progress is posted live.
 async fn run_flow_mode(
     provider: Arc<dyn Provider>,
     agent_options: AgentOptions,
@@ -708,28 +1021,90 @@ async fn run_flow_mode(
     yes: bool,
     risk: Arc<RiskPolicy>,
     state_dir: PathBuf,
-) -> anyhow::Result<()> {
+    level: agent_m_agent::AutonomyLevel,
+    remote: Option<Arc<crate::slack::RemoteHuman>>,
+    channel: Option<String>,
+    flow_context: &[String],
+    ticket_log: Option<&std::path::Path>,
+) -> anyhow::Result<agent_m_flow::FlowRun> {
     let flow = agent_m_flow::load_flow(&flow_path.to_path_buf())?;
     let tools = agent_options.tools.clone();
-    let permission = non_interactive_gate(yes, risk);
+    let permission: Arc<dyn PermissionGate> = match &remote {
+        // With a remote human, approvals work: LevelGate auto-approves
+        // Low/Medium and asks over Slack for High/Critical.
+        Some(remote) => {
+            let channel = channel.clone().unwrap_or_default();
+            let closure = remote.permission_closure((*risk).clone(), &channel);
+            Arc::new(agent_m_agent::LevelGate::new(level, (*risk).clone(), closure))
+        }
+        // No human to ask: `--yes` is full trust minus risk hints; without
+        // it nothing runs.
+        None => non_interactive_gate(yes, risk),
+    };
+    let ask_gate: Option<Arc<dyn agent_m_agent::AskGate>> = remote.as_ref().map(|remote| {
+        let gate = remote.ask_gate(&channel.clone().unwrap_or_default());
+        Arc::new(gate) as Arc<dyn agent_m_agent::AskGate>
+    });
+    // Progress sinks: Slack steps when a remote human is attached, and/or the
+    // per-ticket daemon's JSONL report (live `step` lines while the flow runs).
+    let mut progress_sinks: Vec<Arc<dyn Fn(agent_m_flow::FlowProgress) + Send + Sync>> = Vec::new();
+    if let Some(remote) = &remote {
+        progress_sinks.push(crate::slack::slack_progress(
+            remote.transport.clone(),
+            channel.clone().unwrap_or_default(),
+        ));
+    }
+    if let Some(log_path) = ticket_log {
+        let log_path = log_path.to_path_buf();
+        progress_sinks.push(Arc::new(move |progress| {
+            let _ = crate::ticket_log::append(
+                log_path.parent().expect("report path has a dir"),
+                log_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ticket"),
+                &serde_json::json!({
+                    "ts": crate::sessions::now_iso(),
+                    "kind": "step",
+                    "step": progress.step_name,
+                    "status": progress.status.as_str(),
+                }),
+            );
+        }));
+    }
+    let on_progress = if progress_sinks.is_empty() {
+        None
+    } else {
+        Some(Arc::new(move |progress: agent_m_flow::FlowProgress| {
+            for sink in &progress_sinks {
+                sink(progress.clone());
+            }
+        }) as Arc<dyn Fn(agent_m_flow::FlowProgress) + Send + Sync>)
+    };
     let deps = agent_m_flow::FlowDeps {
         provider,
         agent_options,
         tools,
         permission_gate: permission,
-        ask_gate: None, // no interactive UI in print mode
+        ask_gate,
         state_dir: Some(state_dir),
-        on_progress: None,
+        on_progress,
     };
     let mut context = agent_m_flow::FlowContext::new();
     context.set("cwd", serde_json::json!(cwd.to_string_lossy()));
+    for pair in flow_context {
+        let Some((key, value)) = pair.split_once('=') else {
+            anyhow::bail!("--flow-context expects KEY=VALUE, got `{pair}`");
+        };
+        if key.is_empty() {
+            anyhow::bail!("--flow-context key must not be empty in `{pair}`");
+        }
+        context.set(key, serde_json::json!(value));
+    }
     println!("flow: {}", flow.name);
     let run = match agent_m_flow::run_flow(&flow, &mut context, &deps).await {
         Ok(run) => run,
-        Err(error) => {
-            eprintln!("flow failed: {error}");
-            std::process::exit(1);
-        }
+        Err(error) => return Err(anyhow::anyhow!("flow failed: {error}")),
     };
     let mut failed = false;
     for step in &run.steps {
@@ -754,10 +1129,589 @@ async fn run_flow_mode(
         flow.name,
         if failed { "FAILED" } else { "OK" }
     );
+    Ok(run)
+}
+
+/// One picked ticket, plus the flow run that executed against it.
+struct PickupOutcome {
+    ticket: crate::pickup::PickedTicket,
+    run: agent_m_flow::FlowRun,
+}
+
+/// Pick a ticket and run the flow against it in a fresh worktree. Pure-ish:
+/// `dry_run` prints the plan and returns `Ok(None)` before any side effect.
+/// Returns `Ok(Some(outcome))` after a real run (the run may contain failed
+/// steps — the caller decides how to report).
+async fn pick_and_run(
+    provider: Arc<dyn Provider>,
+    agent_options: AgentOptions,
+    cwd: PathBuf,
+    yes: bool,
+    risk: Arc<RiskPolicy>,
+    agent_dir: PathBuf,
+    level: agent_m_agent::AutonomyLevel,
+    remote: Option<Arc<crate::slack::RemoteHuman>>,
+    channel: Option<String>,
+    flow_context: &[String],
+    ticket_override: Option<&str>,
+    repo_override: Option<&str>,
+    jql: Option<&str>,
+    transition_id: &str,
+    dry_run: bool,
+    flow_path: &std::path::Path,
+    ticket_log: Option<&std::path::Path>,
+) -> anyhow::Result<Option<PickupOutcome>> {
+    let flow = agent_m_flow::load_flow(&flow_path.to_path_buf())?;
+    let inputs = crate::pickup::PickInputs {
+        agent_dir: &agent_dir,
+        ticket: ticket_override,
+        repo: repo_override,
+        jql,
+    };
+    let picked = crate::pickup::pick(inputs).await?;
+
+    if dry_run {
+        println!(
+            "pickup (dry-run): {} — {}",
+            picked.key, picked.summary
+        );
+        println!("  repo:       {}", picked.repo);
+        println!(
+            "  worktree:   agent-m/{} in {}/worktrees/",
+            picked.key,
+            agent_dir.display()
+        );
+        println!(
+            "  transition: {} → In Progress (transition {})",
+            picked.key, transition_id
+        );
+        println!("  flow:       {} ({})", flow_path.display(), flow.name);
+        println!("  context:    ticket={} repo={}", picked.key, picked.repo);
+        return Ok(None);
+    }
+
+    println!(
+        "pickup: {} — {}\n  repo:       {}\n  transition: → In Progress ({})",
+        picked.key, picked.summary, picked.repo, transition_id
+    );
+
+    // Per-ticket daemon: record the pickup in the ticket's report before any
+    // side effect, so `ticket-log` shows something immediately.
+    if let Some(log_path) = ticket_log {
+        let _ = crate::ticket_log::append(
+            log_path.parent().expect("report path has a dir"),
+            log_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("ticket"),
+            &serde_json::json!({
+                "ts": crate::sessions::now_iso(),
+                "kind": "pickup",
+                "ticket": picked.key,
+                "summary": picked.summary,
+                "repo": picked.repo,
+            }),
+        );
+    }
+
+    // In Progress first, so the loop never re-picks it.
+    let base = std::env::var("JIRA_URL")
+        .unwrap_or_else(|_| String::from("https://your.atlassian.net"));
+    let token = std::env::var("JIRA_TOKEN").unwrap_or_default();
+    if let Err(error) =
+        crate::pickup::transition_ticket(&base, &token, &picked.key, transition_id).await
+    {
+        eprintln!("warn: could not transition {}: {}", picked.key, error);
+    }
+
+    // Fresh worktree branch, then run the flow inside it. The repo is
+    // seeded from the mapping; the worktree gives us branch isolation.
+    let worktree = agent_m_agent::create_worktree(&cwd, &agent_dir, Some(&picked.key))
+        .map_err(anyhow::Error::msg)?;
+    println!("  worktree:   {}", worktree.display());
+
+    let mut context_pairs = flow_context.to_vec();
+    context_pairs.push(format!("ticket={}", picked.key));
+    context_pairs.push(format!("repo={}", picked.repo));
+    context_pairs.push("worktree=true".to_string());
+    let state_dir = agent_dir.join("flows");
+    let run = run_flow_mode(
+        provider,
+        agent_options,
+        flow_path,
+        worktree,
+        yes,
+        risk,
+        state_dir,
+        level,
+        remote,
+        channel,
+        &context_pairs,
+        ticket_log,
+    )
+    .await?;
+    Ok(Some(PickupOutcome { ticket: picked, run }))
+}
+
+/// `agent-m pickup`: pick the next open assigned ticket, move it to In
+/// Progress, create a worktree branch, and run the flow inside it with
+/// `${ticket}` / `${repo}` seeded. `--dry-run` only prints the plan;
+/// `--poll N` keeps picking until Ctrl-C; `--workers M` runs up to M ticket
+/// flows in parallel under `--poll`.
+async fn run_pickup(
+    provider: Arc<dyn Provider>,
+    agent_options: AgentOptions,
+    cwd: PathBuf,
+    yes: bool,
+    risk: Arc<RiskPolicy>,
+    agent_dir: PathBuf,
+    level: agent_m_agent::AutonomyLevel,
+    remote: Option<Arc<crate::slack::RemoteHuman>>,
+    channel: Option<String>,
+    flow_context: &[String],
+    ticket_override: Option<&str>,
+    repo_override: Option<&str>,
+    jql: Option<&str>,
+    transition_id: &str,
+    dry_run: bool,
+    flow_path: &std::path::Path,
+    poll: Option<u64>,
+    workers: usize,
+) -> anyhow::Result<()> {
+    let poll_interval = poll.unwrap_or(0);
+    let workers = workers.max(1);
+
+    // Parallel path: a poll loop with multiple workers and no explicit
+    // ticket (a single explicit ticket cannot be parallelized). Dry-runs
+    // stay serial — they print the plan once and exit.
+    if poll_interval > 0 && workers > 1 && ticket_override.is_none() && !dry_run {
+        return run_pickup_concurrent(
+            yes,
+            agent_dir,
+            flow_context.to_vec(),
+            jql.map(str::to_string),
+            transition_id.to_string(),
+            flow_path.to_path_buf(),
+            poll_interval,
+            workers,
+        )
+        .await;
+    }
+
+    loop {
+        match pick_and_run(
+            provider.clone(),
+            agent_options.clone(),
+            cwd.clone(),
+            yes,
+            risk.clone(),
+            agent_dir.clone(),
+            level,
+            remote.clone(),
+            channel.clone(),
+            flow_context,
+            ticket_override,
+            repo_override,
+            jql,
+            transition_id,
+            dry_run,
+            flow_path,
+            None,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                let failed = outcome
+                    .run
+                    .steps
+                    .iter()
+                    .any(|s| s.status == agent_m_flow::StepStatus::Failed);
+                if poll_interval == 0 {
+                    if failed {
+                        // The flow already printed its FAILED summary.
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                if failed {
+                    eprintln!("flow failed for {}", outcome.ticket.key);
+                }
+            }
+            Ok(None) => {
+                // Dry-run printed the plan; nothing else to do.
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("pickup failed: {error}");
+                if poll_interval == 0 {
+                    return Err(error);
+                }
+            }
+        }
+
+        eprintln!("pickup: sleeping {poll_interval}s before next pick (Ctrl-C to stop)");
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+    }
+}
+
+/// Parallel `--poll` path (Phase 8 + Phase 10): up to `workers` flows run at
+/// once, one worktree per ticket. A supervisor acquires a worker slot, picks
+/// the next ticket that is not already in flight, and hands it to a spawned
+/// **per-ticket daemon** — an independent `agent-m ticket-run` child process
+/// (Phase 10), so a ticket's crash/panic never takes down the supervisor or
+/// siblings, and its report is tailable with `agent-m ticket-log <KEY>`.
+/// Failures are reported per ticket and the loop keeps going until Ctrl-C.
+/// Double-picking is prevented twice: the default JQL now excludes
+/// `In Progress`, and the in-flight set blocks the window before a worker's
+/// transition lands.
+async fn run_pickup_concurrent(
+    yes: bool,
+    agent_dir: PathBuf,
+    flow_context: Vec<String>,
+    jql: Option<String>,
+    transition_id: String,
+    flow_path: PathBuf,
+    poll_interval: u64,
+    workers: usize,
+) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(workers));
+    let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    loop {
+        // Wait for a free worker slot before querying, so a busy backlog
+        // doesn't hammer Jira with searches.
+        let permit = semaphore.clone().acquire_owned().await;
+        let picked = {
+            let inputs = crate::pickup::PickInputs {
+                agent_dir: &agent_dir,
+                ticket: None,
+                repo: None,
+                jql: jql.as_deref(),
+            };
+            match crate::pickup::pick(inputs).await {
+                Ok(picked) => picked,
+                Err(error) => {
+                    eprintln!("pickup failed: {error}");
+                    drop(permit);
+                    eprintln!(
+                        "pickup: sleeping {poll_interval}s before next pick (Ctrl-C to stop)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+                    continue;
+                }
+            }
+        };
+        {
+            let mut in_flight = in_flight.lock().unwrap();
+            if in_flight.contains(&picked.key) {
+                // Another worker already grabbed it (its In-Progress
+                // transition hadn't landed yet).
+                drop(permit);
+                eprintln!("pickup: {} already in flight, waiting", picked.key);
+                tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+                continue;
+            }
+            in_flight.insert(picked.key.clone());
+        }
+        // Hand this specific ticket to a worker task. Each worker is its own
+        // `agent-m ticket-run` child process (the per-ticket daemon): a
+        // ticket's crash/panic never takes down the supervisor or siblings,
+        // and its report file is tailable with `agent-m ticket-log <KEY>`.
+        let key = picked.key.clone();
+        let repo = picked.repo.clone();
+        tokio::spawn({
+            let in_flight = in_flight.clone();
+            let agent_dir = agent_dir.clone();
+            let flow_context = flow_context.clone();
+            let transition_id = transition_id.clone();
+            let flow_path = flow_path.clone();
+            async move {
+                let mut cmd = tokio::process::Command::new(
+                    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agent-m")),
+                );
+                cmd.arg("ticket-run")
+                    .arg("--ticket")
+                    .arg(&key)
+                    .arg("--repo")
+                    .arg(&repo)
+                    .arg("--flow")
+                    .arg(&flow_path)
+                    .arg("--transition-id")
+                    .arg(&transition_id)
+                    .arg("--agent-dir")
+                    .arg(&agent_dir);
+                if yes {
+                    cmd.arg("--yes");
+                }
+                for pair in &flow_context {
+                    cmd.arg("--flow-context").arg(pair);
+                }
+                let status = cmd.status().await;
+                in_flight.lock().unwrap().remove(&key);
+                drop(permit);
+                match status {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => eprintln!(
+                        "ticket-run for {} exited with {}",
+                        key,
+                        status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_string())
+                    ),
+                    Err(error) => eprintln!("ticket-run for {} failed to start: {error}", key),
+                }
+            }
+        });
+    }
+}
+
+/// The Slack DM-triggered pickup run (Phase 6): pick → transition → worktree
+/// → flow with this channel as the oversight channel (asks, approvals,
+/// progress), then post a summary DM back.
+async fn run_pickup_slack(
+    provider: Arc<dyn Provider>,
+    agent_options: AgentOptions,
+    cwd: PathBuf,
+    yes: bool,
+    risk: Arc<RiskPolicy>,
+    agent_dir: PathBuf,
+    level: agent_m_agent::AutonomyLevel,
+    remote: Arc<crate::slack::RemoteHuman>,
+    channel: String,
+    flow_context: &[String],
+    ticket_override: Option<&str>,
+    repo_override: Option<&str>,
+    jql: Option<&str>,
+    transition_id: &str,
+    flow_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let _ = remote
+        .transport
+        .post_message(&channel, "🔄 picking it up — I'll report back here.")
+        .await;
+    let outcome = pick_and_run(
+        provider,
+        agent_options,
+        cwd,
+        yes,
+        risk,
+        agent_dir,
+        level,
+        Some(remote.clone()),
+        Some(channel.clone()),
+        flow_context,
+        ticket_override,
+        repo_override,
+        jql,
+        transition_id,
+        false,
+        flow_path,
+        None,
+    )
+    .await?
+    .expect("slack pickup never dry-runs");
+    let summary = crate::slack::flow_summary(&outcome.ticket.key, &outcome.run);
+    let _ = remote.transport.post_message(&channel, &summary).await;
+    Ok(())
+}
+
+/// `agent-m ticket-run`: the per-ticket daemon body. Runs one ticket's whole
+/// pipeline (transition → worktree → flow) in an isolated process and appends
+/// a JSONL report to `<agent_dir>/tickets/<KEY>.jsonl` as it goes. Exit code
+/// 0 = flow OK, 1 = any step failed (the supervisor reports it).
+async fn run_ticket_run(
+    provider: Arc<dyn Provider>,
+    agent_options: AgentOptions,
+    cwd: PathBuf,
+    yes: bool,
+    risk: Arc<RiskPolicy>,
+    agent_dir: PathBuf,
+    ticket: &str,
+    repo: Option<&str>,
+    transition_id: &str,
+    flow_path: &std::path::Path,
+    flow_context: &[String],
+) -> anyhow::Result<()> {
+    let report_path = crate::ticket_log::report_path(&agent_dir, ticket);
+    let outcome = pick_and_run(
+        provider,
+        agent_options,
+        cwd,
+        yes,
+        risk,
+        agent_dir.clone(),
+        agent_m_agent::AutonomyLevel::default(),
+        None, // Per-ticket daemons are terminal-driven; Slack oversight stays
+        None, // in-process in `agent-m slack` (channel-based, Phase 6).
+        flow_context,
+        Some(ticket),
+        repo,
+        None, // explicit ticket → no JQL query
+        transition_id,
+        false,
+        flow_path,
+        Some(&report_path),
+    )
+    .await?
+    .expect("ticket-run never dry-runs");
+
+    // Final verdict line, mirroring flow_summary's PR extraction.
+    use agent_m_flow::StepStatus;
+    let failed = outcome
+        .run
+        .steps
+        .iter()
+        .any(|s| s.status == StepStatus::Failed);
+    let pr = outcome
+        .run
+        .steps
+        .iter()
+        .find(|s| s.name == "pr")
+        .and_then(|s| {
+            s.output
+                .as_ref()
+                .and_then(|o| o.get("content"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|content| content.strip_prefix("PR created: ").unwrap_or(content))
+        .filter(|content| content.contains("http"))
+        .unwrap_or_default()
+        .to_string();
+    let _ = crate::ticket_log::append(
+        &agent_dir,
+        ticket,
+        &serde_json::json!({
+            "ts": crate::sessions::now_iso(),
+            "kind": "verdict",
+            "status": if failed { "FAILED" } else { "OK" },
+            "fix_rounds": outcome.run.fix_rounds,
+            "pr": pr,
+        }),
+    );
+
     if failed {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `agent-m ticket-log <KEY>`: print (or `--follow` tail) a per-ticket
+/// daemon's report. Friendly error when the ticket has no report yet.
+async fn run_ticket_log(
+    agent_dir: &std::path::Path,
+    ticket: &str,
+    follow: bool,
+) -> anyhow::Result<()> {
+    let path = crate::ticket_log::report_path(agent_dir, ticket);
+    if !path.exists() {
+        anyhow::bail!(
+            "no ticket report for `{ticket}` at {} (run `agent-m pickup --poll --workers N` \
+             or `agent-m ticket-run --ticket {ticket}` first)",
+            path.display()
+        );
+    }
+    let mut printed = 0usize;
+    loop {
+        match crate::ticket_log::read_lines(agent_dir, ticket) {
+            Ok(lines) => {
+                for line in &lines[printed..] {
+                    println!("{}", crate::ticket_log::render_line(line));
+                }
+                printed = lines.len();
+            }
+            Err(error) => {
+                if follow {
+                    // The report may be transiently unreadable (rotating);
+                    // keep tailing.
+                    eprintln!("ticket-log: {error}");
+                } else {
+                    anyhow::bail!("{error}");
+                }
+            }
+        }
+        if !follow {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// `agent-m slack` (Phase 6 orchestrator): connect Slack and run pickup +
+/// flow on every `pick up [TICKET]` DM, with Slack as the oversight channel
+/// and a summary DM when the flow finishes.
+async fn run_slack_mode(
+    provider: Arc<dyn Provider>,
+    agent_options: AgentOptions,
+    cwd: PathBuf,
+    yes: bool,
+    risk: Arc<RiskPolicy>,
+    agent_dir: PathBuf,
+    level: agent_m_agent::AutonomyLevel,
+    _default_channel: Option<String>,
+    flow_context: Vec<String>,
+    flow_path: PathBuf,
+) -> anyhow::Result<()> {
+    let transport: Arc<dyn crate::slack::SlackTransport> = Arc::new(
+        crate::slack::SlackClient::from_env().map_err(anyhow::Error::msg)?,
+    );
+    let remote = crate::slack::RemoteHuman::new(transport.clone());
+
+    let on_pickup: Arc<dyn Fn(Option<String>, String) + Send + Sync> = Arc::new({
+        let provider = provider.clone();
+        let agent_options = agent_options.clone();
+        let cwd = cwd.clone();
+        let risk = risk.clone();
+        let agent_dir = agent_dir.clone();
+        let flow_context = flow_context.clone();
+        let flow_path = flow_path.clone();
+        let remote = remote.clone();
+        let transport = transport.clone();
+        move |ticket, channel| {
+            let provider = provider.clone();
+            let agent_options = agent_options.clone();
+            let cwd = cwd.clone();
+            let risk = risk.clone();
+            let agent_dir = agent_dir.clone();
+            let flow_context = flow_context.clone();
+            let flow_path = flow_path.clone();
+            let remote = remote.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let result = run_pickup_slack(
+                    provider,
+                    agent_options,
+                    cwd,
+                    yes,
+                    risk,
+                    agent_dir,
+                    level,
+                    remote,
+                    channel.clone(),
+                    &flow_context,
+                    ticket.as_deref(),
+                    None,
+                    None,
+                    "11",
+                    &flow_path,
+                )
+                .await;
+                if let Err(error) = result {
+                    let _ = transport
+                        .post_message(&channel, &format!("❌ pickup failed: {error}"))
+                        .await;
+                }
+            });
+        }
+    });
+    crate::slack::RemoteHuman::start_orchestrator(remote.clone(), on_pickup);
+
+    println!("agent-m slack orchestrator online — DM `pick up [TICKET]` to start a flow (Ctrl-C to stop)");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
 }
 
 async fn run_print(

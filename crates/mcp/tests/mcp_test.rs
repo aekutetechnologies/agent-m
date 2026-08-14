@@ -72,6 +72,28 @@ async fn stdio_handshake_list_and_call() {
 }
 
 #[tokio::test]
+async fn read_only_hint_surfaces_through_connect_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("ro_server.py");
+    std::fs::write(
+        &script,
+        FAKE_SERVER.replace(
+            r#""name": "echo", "description": "Echo the input""#,
+            r#""name": "echo", "description": "Echo the input",
+                 "annotations": {"readOnlyHint": True}"#,
+        ),
+    )
+    .unwrap();
+    let client = McpClient::connect_stdio("python3", &[script.to_string_lossy().to_string()], &[])
+        .await
+        .expect("connect");
+    let (tools, read_only, _shared) = connect_tools("fake", client).await.expect("connect_tools");
+    assert_eq!(read_only, vec!["fake__echo"]);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name(), "fake__echo");
+}
+
+#[tokio::test]
 async fn mcp_tool_adapter_executes_through_the_tool_trait() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fake_server.py");
@@ -81,7 +103,8 @@ async fn mcp_tool_adapter_executes_through_the_tool_trait() {
         .await
         .expect("connect");
 
-    let (tools, _shared) = connect_tools("fake", client).await.expect("connect_tools");
+    let (tools, _read_only, _shared) =
+        connect_tools("fake", client).await.expect("connect_tools");
     assert_eq!(tools.len(), 1);
     let tool = tools[0].clone();
     assert_eq!(tool.name(), "fake__echo");
@@ -171,7 +194,8 @@ async fn mcp_tool_errors_fold_into_outcome() {
     let client = McpClient::connect_stdio("python3", &[script.to_string_lossy().to_string()], &[])
         .await
         .expect("connect");
-    let (tools, _shared) = connect_tools("fake", client).await.expect("connect_tools");
+    let (tools, _read_only, _shared) =
+        connect_tools("fake", client).await.expect("connect_tools");
     let tool = tools[0].clone();
     let outcome = tool
         .execute(json!({ "text": "x" }), &tool_context())

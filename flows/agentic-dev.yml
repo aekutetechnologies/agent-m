@@ -1,14 +1,26 @@
 # agentic-dev — Issue → PR (GSD phase loop)
 #
-# The canonical example flow: Discuss → Plan → Execute → Verify → Ship.
-# References plugin tools (jira-search, github-create-pr) that you install with
-# `agent-m plugins install <repo>`; the rest uses built-in tools.
+# The canonical example flow: Discuss → Plan → Execute → Verify → Ship →
+# Close out (Jira In Review + PR comment).
+# References plugin tools (jira-search, jira-transition, jira-comment,
+# github-create-pr) that you install with `agent-m plugins install <repo>`;
+# the rest uses built-in tools.
 #
-# Run: agent-m --flow flows/agentic-dev.yml --yes
-# Context inputs: ticket, repo (via --flow-context or seeded values).
+# Run: agent-m --flow flows/agentic-dev.yml --yes \
+#        --flow-context ticket=PROJ-42 \
+#        --flow-context repo=acme/app \
+#        --flow-context transitionId=31   # Jira "In Review" transition id
+# Or drive it from `agent-m pickup` (worktree mode): pickup resolves the
+# ticket, creates an `agent-m/<ticket>-<ts>` worktree branch, seeds
+# ticket/repo/worktree=true, and runs the flow inside the checkout — so the
+# "clone" step is skipped (the worktree already is the repo).
+#
+# error_budget caps the TOTAL fix rounds across all verify steps; when it is
+# exhausted the verify step stops-and-reports instead of burning more rounds.
 
 name: agentic-dev
 description: "Ticket → pull request, GSD-style: discuss, plan, execute, verify, ship"
+error_budget: 5
 
 steps:
   # ── Discuss: fetch the ticket and the repo ───────────────────────────────
@@ -17,11 +29,24 @@ steps:
     tool: jira-search
     arguments:
       query: "${ticket}"
-  - type: tool
-    name: clone
-    tool: bash
-    arguments:
-      command: "git clone ${repo} work"
+  # Worktree-aware workspace: `agent-m pickup` runs inside a fresh
+  # `agent-m/<ticket>-<ts>` worktree branch, so the checkout is already
+  # there; standalone `--flow` runs clone the repo into work/.
+  - type: condition
+    name: workspace
+    if: "${worktree} == true"
+    then:
+      - type: tool
+        name: clone
+        tool: bash
+        arguments:
+          command: "echo 'worktree checkout: ${cwd}'"
+    else:
+      - type: tool
+        name: clone
+        tool: bash
+        arguments:
+          command: "git clone ${repo} work"
 
   # ── Plan: research → numbered Plan → human review ────────────────────────
   - type: prompt
@@ -50,10 +75,22 @@ steps:
       Use the edit/write tools. Run the tests when done.
 
   # ── Verify: run the tests, loop fixes up to 3 rounds ─────────────────────
-  - type: verify
-    name: verify
-    command: "cd work && cargo test"
-    max_fix_rounds: 3
+  # The failure output feeds the fix prompt each round; when `max_fix_rounds`
+  # or the flow `error_budget` is exhausted the step fails stop-and-report
+  # (the last failure is in the error) and the flow aborts — no ship.
+  - type: condition
+    name: verify-env
+    if: "${worktree} == true"
+    then:
+      - type: verify
+        name: verify
+        command: "cargo test"
+        max_fix_rounds: 3
+    else:
+      - type: verify
+        name: verify
+        command: "cd work && cargo test"
+        max_fix_rounds: 3
   - type: ask
     name: review-implementation
     question: "Implementation verified: ${steps.verify.output}. Review and ship?"
@@ -65,3 +102,17 @@ steps:
     arguments:
       title: "${ticket}"
       body: "Closes ${ticket}\n\nPlan: ${steps.plan.output}\nVerify: ${steps.verify.output}"
+
+  # ── Close out: move the ticket to In Review, link the PR ─────────────────
+  - type: tool
+    name: transition
+    tool: jira-transition
+    arguments:
+      key: "${ticket}"
+      transitionId: "${transitionId}"
+  - type: tool
+    name: comment
+    tool: jira-comment
+    arguments:
+      key: "${ticket}"
+      body: "PR ready for review: ${steps.pr.output.content}"

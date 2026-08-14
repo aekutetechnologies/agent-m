@@ -73,7 +73,7 @@ what is this project about?
 
 You'll see, in order:
 
-1. **agent-m starts working** — the status line narrates what it's doing
+1. **agent-m starts working** — the REPL narrates what it's doing
    (`Reading src/app.rs…`, `Running cargo test…`).
 2. **A live, streaming answer** — the model's reply appears word by word.
 3. **A request to approve a tool** — the first time it wants to read/run
@@ -91,9 +91,10 @@ You'll see, in order:
 | A box asking **allow / deny** | It wants to run a command or change a file | Read it, press the shown key |
 | `ctrl+c` (empty input) | Nothing typed | Exits cleanly |
 
-**Never panic about making a mess**: every `write`/`edit` is snapshotted, so
-`/undo` rolls it back, and `/checkpoint`/`/restore` snapshot the whole git
-state (see [Trust](/trust/principles)).
+**About rollback, honestly**: `write`/`edit` targets are snapshotted before
+they run, so `/undo` restores them. Git checkpoints are still stubs —
+`/checkpoint` and `/restore` report success without creating one (see
+[Trust](/trust/principles)).
 
 ## Troubleshooting
 

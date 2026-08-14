@@ -47,6 +47,10 @@ pub struct ProviderConfig {
     /// sibling). When absent, well-known ids get a built-in suggestion list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<String>>,
+    /// Optional extra fields to merge into the root JSON object of every
+    /// completion request (e.g. for provider-specific reasoning flags).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 /// USD per 1M tokens.
@@ -363,6 +367,7 @@ mod tests {
             pricing: Pricing::default(),
             api_key_env: None,
             r#type: None,
+            extra_body: None,
         };
         let specs = config_models(&config);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
@@ -389,6 +394,7 @@ mod tests {
             pricing: Pricing::default(),
             api_key_env: None,
             r#type: None,
+            extra_body: None,
         };
         let specs = config_models(&config);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
@@ -411,6 +417,7 @@ mod tests {
             pricing: Pricing::default(),
             api_key_env: None,
             r#type: None,
+            extra_body: None,
         };
         let specs = config_models(&config);
         let first = &specs[0];
@@ -485,6 +492,7 @@ mod tests {
             pricing: Pricing::default(),
             api_key_env: None,
             r#type: None,
+            extra_body: None,
         }];
         save_provider_configs(dir.path(), &configs).unwrap();
         let saved: serde_json::Value = serde_json::from_str(
@@ -602,6 +610,7 @@ pub fn provider_from_config(
             config.base_url.clone(),
             api_key,
             specs,
+            config.extra_body.clone(),
         ));
     }
     // The primary model spec keeps its name; mark it explicitly.
@@ -611,6 +620,7 @@ pub fn provider_from_config(
         config.base_url.clone(),
         api_key,
         specs,
+        config.extra_body.clone(),
     ))
 }
 
@@ -636,6 +646,7 @@ mod factory_tests {
             },
             api_key_env: None,
             r#type: None,
+            extra_body: None,
         }
     }
 

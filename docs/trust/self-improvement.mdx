@@ -7,9 +7,12 @@ title: Self-improvement (/refine)
 agent-m keeps a small, durable layer of **memories, prompt notes, and skills**
 on top of its system prompt — the *harness state*. The model can propose
 improvements to it based on what it actually experienced in a session; you
-review and apply them. This is the "Continual Harness" idea (see
+review them. This is the "Continual Harness" idea (see
 [Prime Agent](https://www.primeintellect.ai/blog/prime-agent)): the harness
 adapts to what the agent learns, instead of being frozen at design time.
+
+> **Status**: `/refine` is **propose-only** today. Applying, rolling back, and
+> background auto-triggering are not yet wired — see `TRUST_AUDIT.md`.
 
 ## The three kinds of entries
 
@@ -19,52 +22,37 @@ adapts to what the agent learns, instead of being frozen at design time.
 | `note` | instructions to follow | `always check the cache before assuming staleness` |
 | `skill` | reusable tactics | `prefer interactive rebase over merge` |
 
-State lives in **`~/.agent-m/harness.json`** alongside `preferences.json` (the
-observed signals — `!command` usage, `/undo` counts — stay separate and are
-never edited by the model).
+State lives in **`~/.agent-m/agent/harness.json`**. Entries are listed by `/harness`.
 
-## How it works
+## How it works today
 
 1. **`/refine [focus]`** — the planner (a one-shot, no-tools call to your
    session's provider) reads the recent session trajectory + the current
    harness state and proposes the *smallest* useful edit: create, update, or
    delete an entry, with a one-line reason. An empty proposal is a valid
    answer — nothing changes.
-2. **Review** — a panel lists every proposed op (`+ create memory …`, `~
-   update skill …`, `− delete note …`). **Enter applies, Esc dismisses.**
-   Nothing is ever applied without your confirmation.
-3. **Apply** — ops are written to `harness.json`, each recorded in the
-   `refine_log` audit trail, and the system-prompt block is rebuilt and pushed
-   to the running agent.
+2. **Review** — the proposal prints as a plain text list (`[create memory]
+   reason: text`). There is no interactive panel and **no apply step yet** —
+   proposals are informational.
 
-**The base system prompt is immutable.** Only the harness block between it and
-the trust suffix changes — one prefix-cache miss at apply, then the prompt is
-byte-stable again (see [Providers](/extending/providers)).
+**The base system prompt is immutable.** The harness block sits between it and
+the trust suffix.
 
-## Automatic refinement
+## Roadmap
 
-The planner also runs **in the background** (never blocking the agent loop)
-when the harness suspects it should learn:
-
-- after **3 consecutive tool failures**, or
-- after **3 `/undo`s** in a session.
-
-The proposal still waits for your review — auto-triggering never auto-applies.
-A notice tells you the proposal is ready.
-
-## Inspect and roll back
-
-- **`/harness`** — lists the current entries and the recent ops.
-- **`/harness rollback <op-id>`** — reverts an op: a `create` removes the
-  entry, an `update` restores the previous text, a `delete` re-creates it.
-  Every rollback is itself recorded.
+The design intends: **apply** ops to `harness.json` after your confirmation,
+record them in a `refine_log` audit trail, rebuild and push the system-prompt
+block to the running agent; **rollback** via `/harness rollback <op-id>`;
+and **background auto-triggering** after 3 consecutive tool failures or
+3 `/undo`s in a session (auto-triggering would never auto-apply). None of this
+is wired yet — see `TRUST_AUDIT.md`.
 
 ## Costs & guardrails
 
-- The planner is an extra LLM call only when you run `/refine` (or an
-  auto-trigger fires) — there is no background cost otherwise.
-- Proposals are capped (5 ops, 300 chars each) and parsed tolerantly:
-  malformed model output degrades to "nothing worth changing", never a crash.
+- The planner is an extra LLM call only when you run `/refine` — there is no
+  background cost otherwise.
+- Proposals are parsed tolerantly: malformed model output degrades to "nothing
+  worth changing", never a crash.
 - Model output is treated as *proposal*, not policy: the harness (risk tiers,
-  approvals, rollback) still enforces safety, and the refinement loop cannot
-  touch the trust layer, permissions, or the base prompt.
+  approvals) still enforces safety, and the refinement loop cannot touch the
+  trust layer, permissions, or the base prompt.

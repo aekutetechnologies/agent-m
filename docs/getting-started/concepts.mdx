@@ -24,8 +24,10 @@ OpenAI, Anthropic, or a local one like Ollama. You configure which provider +
 which model agent-m uses (see [Providers](/extending/providers)).
 
 **API key** — a secret password that proves you're allowed to use a provider.
-It lives in `~/.agent-m/agent/auth.json` (or an environment variable) and is
-**never** stored in the chat logs. Keep it secret.
+It lives in `~/.agent-m/agent/auth.json` and is **never** stored in the chat
+logs. Keep it secret. (Note: provider API keys are read from that file —
+`DEEPSEEK_API_KEY`-style environment variables are deliberately not
+consulted.)
 
 **Base URL / endpoint** — the web address where the provider's model lives
 (e.g. `https://api.deepseek.com`). Some providers are "OpenAI-compatible",
@@ -50,8 +52,8 @@ how to behave ("you are a coding agent; be concise"). You can extend it with
 
 **Prefix cache / cache hit** — providers remember the *beginning* of your
 conversation between turns, so repeating it costs much less. agent-m keeps
-that prefix byte-identical to maximize the savings — you'll see `cache read`
-in the sidebar.
+that prefix byte-identical to maximize the savings — `/usage` reports the
+cache hit/miss tokens.
 
 **Streaming** — the answer arriving word-by-word instead of all at once (what
 you see when the reply "types itself").
@@ -59,8 +61,9 @@ you see when the reply "types itself").
 ## Doing things
 
 **Tool** — an action agent-m can take: `read` (open a file), `bash` (run a
-command), `edit`/`write` (change files), `grep`/`search` (find things),
-`web_fetch` (read a URL). The model *asks* for a tool; agent-m checks
+command), `edit`/`write` (change files), `grep`/`find`/`search` (find
+things), `web_fetch`/`web_search` (the web), `ask` (ask you a question),
+`delegate` (spawn a sub-agent). The model *asks* for a tool; agent-m checks
 permission first.
 
 **Tool call** — the model saying "please run `read` on `src/app.rs`". You'll
@@ -78,7 +81,8 @@ files) ask you first. See [Risk tiers](/trust/risk-tiers).
 
 **Session** — one conversation, saved as a file on disk. agent-m
 auto-resumes your latest session when you start it in the same folder, and
-`/sessions` lets you list old ones and jump back in.
+`/sessions` lists old ones (resuming a specific past session is not yet
+wired in the REPL).
 
 **Transcript** — the full record of a session (your messages, agent-m's
 replies, the tool calls, the approvals).
@@ -87,11 +91,13 @@ replies, the tool calls, the approvals).
 `agent-m --worktree name` starts a session in a fresh worktree, so two
 sessions can work on the same project without bumping into each other.
 
-**Checkpoint** — a snapshot of the project's git state you can roll back to
-(`/checkpoint` + `/restore`).
+**Checkpoint** — a git-based snapshot mechanism exists (`checkpoint.rs`), but
+the `/checkpoint` and `/restore` commands are not yet wired to it — they
+report success without creating a snapshot — see `TRUST_AUDIT.md`.
 
-**Undo** — rolling back the last file change agent-m made (`/undo`). agent-m
-snapshots every file before it edits it, so undo is reliable.
+**Undo** — rolling back the last file change agent-m made (`/undo`).
+`write`/`edit` targets are snapshotted before they run, so `/undo` restores
+them — see `TRUST_AUDIT.md`.
 
 ## Project rules
 
@@ -100,11 +106,12 @@ agents how to work ("never edit generated files", "tests live in t/"). agent-m
 reads all of them, nearest to the folder wins.
 
 **Slash command** — a shortcut that starts with `/`, e.g. `/help`, `/sessions`,
-`/undo`. Type `/` to see the full searchable list.
+`/undo`. Type `/` then press `Tab` for completion.
 
 **Refinement (/refine)** — the harness proposing improvements to its own
-memories/notes/skills after seeing how a session went; you review and apply
-them (see [Self-improvement](/trust/self-improvement)).
+memories/notes/skills after seeing how a session went; proposals print as a
+text list and are **not yet applicable** (see
+[Self-improvement](/trust/self-improvement)).
 
 ## Safety & limits
 

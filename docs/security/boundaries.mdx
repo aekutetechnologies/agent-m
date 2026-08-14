@@ -10,11 +10,11 @@ sandbox. The security model is three layers, in order of strength.
 ## 1. No tool registered (strongest)
 
 If a tool is not registered, the model cannot invoke it. `--no-tools` disables
-everything; `--exclude-tools bash` drops the shell. Plan mode (`/plan` or
+everything; `--exclude-tools bash` drops the shell. Plan mode (`/mode plan` or
 `--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`,
 `search`) plus `ask`, so destructive operations cannot reach the filesystem.
 
-## 2. Human approval (interactive TUI)
+## 2. Human approval (interactive REPL)
 
 A human is present, so the gate is risk-based whether or not you pass `--yes`:
 read-only tools and benign shell commands never prompt; calls that look
@@ -72,13 +72,13 @@ prompts (reads, network, and the host environment remain available).
 
 - **Tool budget** — startup warns if the active tool set exceeds 80 tools.
 - **Context cap** — startup warns if injected context (AGENTS.md + preferences)
-  exceeds 50k characters; `/context` reports tokens vs. the window.
+  exceeds 50k characters.
 - **Strategic compaction** — `--compact-threshold` (default 0.5) compacts at
   turn boundaries once usage passes the fraction, never mid-implementation.
 
 ## Audit and rollback
 
 - Every session entry is timestamped; `/journal` renders the narrated timeline.
-- `write`/`edit` targets are snapshotted before execution; `/undo` restores
-  them, and the ledger persists per session across restarts. The status line
-  shows an `undo: /undo (n)` hint after a mutation.
+- **Undo is wired**: `write`/`edit` targets are snapshotted before execution
+  (`record_undo_snapshot`) and `/undo` restores them. Git checkpoints are
+  **not** — `/checkpoint`/`/restore` are stubs. See `TRUST_AUDIT.md`.

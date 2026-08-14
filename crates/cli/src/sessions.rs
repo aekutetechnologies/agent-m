@@ -436,6 +436,19 @@ pub fn load_undo(agent_dir: &Path, session_stem: &str) -> Vec<UndoEntry> {
         .unwrap_or_default()
 }
 
+/// Snapshot a file before the agent mutates it (check.md principle 8).
+/// Called by the REPL when `write`/`edit` is about to execute, so `/undo`
+/// can restore the pre-edit content. `None` before-content = the file did
+/// not exist, so undo deletes it.
+pub fn record_undo_snapshot(agent_dir: &Path, session_stem: &str, path: &Path) -> Result<()> {
+    let mut entries = load_undo(agent_dir, session_stem);
+    entries.push(UndoEntry {
+        path: path.to_string_lossy().into_owned(),
+        before: std::fs::read_to_string(path).ok(),
+    });
+    save_undo(agent_dir, session_stem, &entries)
+}
+
 /// Persist the current task plan for a session as JSON under
 /// `<agent_dir>/tasks/<session-stem>.json` (survives restarts and compaction).
 pub fn save_todos(
@@ -515,6 +528,19 @@ mod tests {
         assert!(loaded[1].before.is_none(), "None before survives");
         // Missing/corrupt ledger loads empty.
         assert!(load_undo(dir.path(), "missing").is_empty());
+    }
+
+    #[test]
+    fn record_undo_snapshot_captures_before_and_none_for_new_files() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("a.txt");
+        std::fs::write(&existing, "original").unwrap();
+        record_undo_snapshot(dir.path(), "sess", &existing).unwrap();
+        record_undo_snapshot(dir.path(), "sess", &dir.path().join("new.txt")).unwrap();
+        let entries = load_undo(dir.path(), "sess");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].before.as_deref(), Some("original"));
+        assert!(entries[1].before.is_none());
     }
 
     #[test]

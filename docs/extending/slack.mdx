@@ -1,0 +1,149 @@
+---
+title: Slack remote channel
+---
+
+# Slack remote channel
+
+agent-m can connect to Slack as its remote human channel: you can watch a run
+from your phone and answer the agent's questions mid-task — without a public
+endpoint or a tunnel.
+
+Outbound uses the Slack Web API (`chat.postMessage`). Inbound uses
+**Socket Mode**: the process opens an outbound websocket through
+`apps.connections.open`, so nothing needs to listen on a public port.
+
+## Setup
+
+1. Create a Slack app (Socket Mode enabled) at
+   https://api.slack.com/apps — scopes:
+
+   | Scope | Purpose |
+   |-------|---------|
+   | `chat:write` | post questions and progress |
+   | `app_mentions:read` | receive DMs mentioning the app |
+
+2. Enable **Socket Mode** in the app settings and copy the app-level token
+   (`xapp-…`).
+
+3. Install the app to your workspace and copy the bot user OAuth token
+   (`xoxb-…`).
+
+4. Export both tokens:
+
+   ```sh
+   export SLACK_APP_TOKEN=xapp-1-…
+   export SLACK_BOT_TOKEN=xoxb-…
+   ```
+
+## Running the channel
+
+```sh
+agent-m slack
+```
+
+The process connects, listens for DMs, and confirms each message:
+
+```
+you:   agent-m online
+agent: agent-m online. You said: agent-m online
+```
+
+## DM-triggered pickup (the SDLC orchestrator)
+
+Since Phase 6, `agent-m slack` is also the **orchestrator**: DM it a pickup
+trigger and it runs the whole loop — pick the ticket, transition it to
+**In Progress**, create an isolated worktree branch, run the flow with Slack
+as the oversight channel (asks, approvals, and progress all land in that DM
+conversation), and post a summary when it finishes.
+
+```
+you:   pick up PROJ-42
+agent: 🔄 picking it up — I'll report back here.
+       🔄 step 1 `jira-ticket`
+       ❓ Approve the plan? …     ← reply: ask-3 yes
+       …
+       ✅ PROJ-42 — agentic-dev OK
+       ✓ jira-ticket
+       ✓ clone
+       ✓ verify
+       ✓ pr
+       ✓ transition
+       ✓ comment
+       🔗 PR: https://github.com/acme/app/pull/7 (#7)
+```
+
+| DM | What happens |
+|----|--------------|
+| `pick up PROJ-42` | Work the specific ticket |
+| `pickup PROJ-42` | Same as above |
+| `pick up` / `pickup` | Auto-pick your next open assigned ticket (Jira) |
+
+The trigger needs a provider configured in `~/.agent-m/agent/settings.json`
+(the flow runs an LLM), plus the Jira/plugin env the flow steps use. Use the
+`--flow` flag to swap the flow (`agent-m slack --flow flows/agentic-dev.yml`).
+The Slack summary shows every step's verdict, the fix-rounds spent, and the
+PR link from the `pr` step; failures report the step error instead of
+silently giving up.
+
+## Wiring it into a run
+
+Pass `--slack-channel <channel-or-user-id>` to any mode that asks questions
+(the REPL, the daemon, or flow mode). The channel id (e.g. `C05…` or `U05…`)
+is where questions and progress lines are posted. Example with the daemon:
+
+```sh
+agent-m --daemon build1 --slack-channel C05ABC123
+```
+
+With the flag set:
+
+- the **ask tool** posts its question to Slack instead of the terminal;
+- **High/Critical tool approvals** are posted as an approve/deny question:
+  ```
+  ❓ ⚠️  [Security Gate] Tool Execution Requested:
+      Tool: bash
+      Args: {"command":"git push --force origin main"}
+      Risk Level: High
+      Consequence: ...
+  reply with: ask-7 <answer>
+  ```
+  Reply `ask-7 Approve` (or `allow` / `1`) to allow, anything else denies;
+- **flow steps** post their transitions (`🔄` running, `✅` succeeded,
+  `❌` failed, `⏸️` pending/skipped).
+
+Without the flag, the REPL and daemon fall back to the terminal gate.
+
+## Answering questions
+
+When the agent needs a human decision it posts a question with an id:
+
+```
+❓ The plan touches the deploy script. Continue?
+reply with: ask-3 <answer>
+```
+
+Reply to the DM with the id followed by your answer:
+
+```
+ask-3 yes
+```
+
+agent-m resolves the pending question, answers `✅ answered ask-3: yes`, and
+the run continues.
+
+## Progress notifications
+
+`AgentEvent`s are mapped to short Slack lines — tool starts, failures, turn
+completions, and notices. The daemon streams every event as
+`EVENT <json>` on the socket (same shape as `--stream-json`); the flow runner
+posts step transitions through the same channel.
+
+## Design notes
+
+- The channel registry (`HumanChannel`) is transport-agnostic: the REPL, the
+  daemon, the flow runner, and Slack all share one pending-question store.
+  A human who is not at the terminal can answer mid-task.
+- No network in tests: `FakeTransport` records posts and injects inbound
+  events.
+- Socket Mode sends `envelope_id`s that must be acked within 3 seconds; the
+  event loop acks every event before dispatching.

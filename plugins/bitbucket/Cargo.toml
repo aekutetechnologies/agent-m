@@ -1,0 +1,18 @@
+[package]
+name = "agent-m-plugin-bitbucket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bitbucket plugin for agent-m (separate-repo shape): issue search, comment, transition, create PR"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-m-plugin-sdk = { path = "../../crates/plugin-sdk" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }

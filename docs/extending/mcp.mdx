@@ -46,10 +46,25 @@ The `--tools` / `--exclude-tools` filters apply to MCP tools like any other.
 
 ## Safety
 
-MCP tools are **opaque** by default: `RiskPolicy` classifies them
-**Critical**, so every call requires your approval — even under `--yes` and
-at autonomy level 4. Tool *output* is trusted as the server reports it; only
-run servers you control.
+MCP tools are **opaque** unless marked read-only: `RiskPolicy` classifies them
+**Critical**, so by default every call requires your approval — even under
+`--yes` and at autonomy level 4. Two ways to mark a tool read-only so read-like
+calls auto-approve (they then drop to the default `Medium` tier):
+
+- **`annotations.readOnlyHint`** — if the server advertises it in `tools/list`,
+  agent-m respects it automatically.
+- **`readOnlyTools`** — a per-server list of patterns (exact name or `*`
+  wildcard) matched against the *bare* tool name (the part after `server__`), for
+  servers that don't advertise the hint. Example:
+
+```json
+"filesystem": { "command": "rust-mcp-filesystem", "args": ["."],
+                "readOnlyTools": ["read_*", "list_*"] }
+```
+
+Read-only marking is **advisory**, not a security boundary — a server that
+mislabels a mutating tool isn't contained by it. Tool *output* is trusted as the
+server reports it; only run servers you control. Writes still prompt as Critical.
 
 ## Transports
 

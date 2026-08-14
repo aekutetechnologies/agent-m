@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drives the interactive TUI in tmux (mirrors pi's pi-test.sh pattern):
+# Drives the interactive REPL in tmux (mirrors pi's pi-test.sh pattern):
 # launch, capture the rendered UI, submit a prompt, interrupt, exit cleanly.
 #
 # A live end-to-end reply requires DEEPSEEK_API_KEY; without one the run still
@@ -12,7 +12,7 @@ SESSION="agent-m-smoke"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 echo "== launching agent-m in tmux =="
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "./agent-m.sh --ui-mode fullscreen"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "./agent-m.sh"
 sleep 4
 echo "== initial render =="
 tmux capture-pane -t "$SESSION" -p | head -25
@@ -22,13 +22,10 @@ tmux send-keys -t "$SESSION" "Say exactly: smoke test ok" Enter
 sleep 3
 tmux capture-pane -t "$SESSION" -p | tail -12
 
-echo "== interrupting =="
-tmux send-keys -t "$SESSION" Escape
+echo "== interrupting (Ctrl-C exits the REPL) =="
+tmux send-keys -t "$SESSION" C-c
 sleep 1
 
-echo "== exiting with ctrl+d =="
-tmux send-keys -t "$SESSION" C-d
-sleep 1
 tmux capture-pane -t "$SESSION" -p | tail -5
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true

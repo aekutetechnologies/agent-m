@@ -20,6 +20,7 @@ fn provider(base_url: &str) -> OpenAiCompatibleProvider {
             agent_m_ai::ModelSpec::new("deepseek-chat"),
             agent_m_ai::ModelSpec::new("deepseek-reasoner"),
         ],
+        None,
     )
 }
 
@@ -257,6 +258,7 @@ async fn missing_key_is_reported() {
         "http://localhost:1",
         None,
         vec![agent_m_ai::ModelSpec::new("deepseek-chat")],
+        None,
     );
     let result = provider
         .stream_chat(request(vec![LlmMessage::User {
@@ -284,6 +286,7 @@ async fn vision_gate_rejects_images_on_text_only_models() {
         "https://api.deepseek.com".to_string(),
         Some("test-key".to_string()),
         vec![ModelSpec::new("deepseek-chat")],
+        None,
     );
     let request = agent_m_ai::ChatRequest {
         model: "deepseek-chat".to_string(),

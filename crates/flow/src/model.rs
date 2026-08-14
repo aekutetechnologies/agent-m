@@ -10,6 +10,12 @@ pub struct Flow {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Cap on the TOTAL number of fix rounds across all `verify` steps in one
+    /// run. When exhausted, the verify step stops-and-reports instead of
+    /// burning more model calls. `None` = unlimited (per-step
+    /// `max_fix_rounds` still applies).
+    #[serde(default)]
+    pub error_budget: Option<usize>,
     #[serde(default)]
     pub steps: Vec<FlowStep>,
 }
@@ -74,6 +80,26 @@ pub enum FlowStep {
         #[serde(default = "default_fix_rounds")]
         max_fix_rounds: usize,
     },
+    /// Run a fresh structured sub-agent (the delegate protocol): the
+    /// `prompt` runs in a brand-new context window that MUST reply with a
+    /// single JSON object (conforming to `schema` when given). The parsed
+    /// JSON is stored at `${steps.<name>.output.json}` and the
+    /// pretty-printed text at `${steps.<name>.output.content}`, so
+    /// downstream steps can reference real fields
+    /// (`${steps.<name>.output.json.risk}`). Invalid JSON fails the step
+    /// unless `on_invalid: continue`.
+    Delegate {
+        name: String,
+        prompt: String,
+        #[serde(default)]
+        schema: Option<Value>,
+        #[serde(default)]
+        tools: Option<Vec<String>>,
+        #[serde(default = "default_delegate_turns")]
+        max_turns: usize,
+        #[serde(default = "default_stop")]
+        on_invalid: String,
+    },
 }
 
 fn default_stop() -> String {
@@ -81,6 +107,9 @@ fn default_stop() -> String {
 }
 fn default_fix_rounds() -> usize {
     3
+}
+fn default_delegate_turns() -> usize {
+    4
 }
 
 /// Shared, serializable flow state. Step outputs are stored under
@@ -167,6 +196,65 @@ steps:
         match &flow.steps[2] {
             FlowStep::Condition { then, .. } => assert!(matches!(then[0], FlowStep::Ask { .. })),
             _ => panic!("expected condition"),
+        }
+    }
+
+    #[test]
+    fn parses_delegate_step() {
+        let yaml = r#"
+name: structured
+steps:
+  - type: delegate
+    name: analysis
+    prompt: "Map entrypoints and rate the risk"
+    schema:
+      type: object
+      properties:
+        risk: { type: string }
+    tools: [read, search]
+    max_turns: 6
+    on_invalid: continue
+"#;
+        let flow: Flow = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(flow.steps.len(), 1);
+        match &flow.steps[0] {
+            FlowStep::Delegate {
+                name,
+                prompt,
+                schema,
+                tools,
+                max_turns,
+                on_invalid,
+            } => {
+                assert_eq!(name, "analysis");
+                assert_eq!(prompt, "Map entrypoints and rate the risk");
+                assert_eq!(
+                    schema.as_ref().and_then(|s| s.get("type")),
+                    Some(&Value::String("object".to_string()))
+                );
+                assert_eq!(
+                    tools.as_ref().unwrap(),
+                    &vec!["read".to_string(), "search".to_string()]
+                );
+                assert_eq!(*max_turns, 6);
+                assert_eq!(on_invalid, "continue");
+            }
+            _ => panic!("expected delegate step"),
+        }
+        // Defaults: no schema/tools, max_turns 4, on_invalid stop.
+        let minimal: Flow =
+            serde_yml::from_str("name: x\nsteps:\n  - type: delegate\n    name: d\n    prompt: p\n")
+                .expect("parse");
+        match &minimal.steps[0] {
+            FlowStep::Delegate {
+                schema, tools, max_turns, on_invalid, ..
+            } => {
+                assert!(schema.is_none());
+                assert!(tools.is_none());
+                assert_eq!(*max_turns, 4);
+                assert_eq!(on_invalid, "stop");
+            }
+            _ => panic!("expected delegate step"),
         }
     }
 

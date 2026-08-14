@@ -35,6 +35,12 @@ Thinking: enabled via `thinking: {type: "enabled", budget_tokens: N}` in the req
 
 **Thinking budget tiers** (map to variant selector for Anthropic models with `thinking_toggle`):
 
+> ⚠️ *Planned, not yet wired* — `anthropic.rs` currently sends a fixed
+> `max_tokens: 8192` and ignores `variant`. The `variant` selector maps to
+> `reasoning_effort` only on OpenAI-compatible providers (`openai.rs`).
+> These tiers describe the intended mapping when thinking-budget selection
+> lands.
+
 | Variant label | `budget_tokens` |
 |---|---|
 | `low` | 1 024 |

@@ -79,6 +79,9 @@ pub struct StepRecord {
 pub struct FlowRun {
     pub flow_name: String,
     pub steps: Vec<StepRecord>,
+    /// Total fix rounds spent across all `verify` steps (for the error
+    /// budget report).
+    pub fix_rounds: usize,
     pub context: FlowContext,
 }
 
@@ -86,10 +89,12 @@ pub struct FlowRun {
 /// it is an `ask` step with `on_reject: continue`).
 pub async fn run_flow(flow: &Flow, context: &mut FlowContext, deps: &FlowDeps) -> Result<FlowRun> {
     let mut records = Vec::new();
-    run_steps(flow, &flow.steps, 0, context, deps, &mut records).await?;
+    let mut fix_rounds = 0;
+    run_steps(flow, &flow.steps, 0, context, deps, &mut records, &mut fix_rounds).await?;
     Ok(FlowRun {
         flow_name: flow.name.clone(),
         steps: records,
+        fix_rounds,
         context: context.clone(),
     })
 }
@@ -101,6 +106,7 @@ fn run_steps<'a>(
     context: &'a mut FlowContext,
     deps: &'a FlowDeps,
     records: &'a mut Vec<StepRecord>,
+    total_fix_rounds: &'a mut usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         for (index, step) in steps.iter().enumerate() {
@@ -115,7 +121,7 @@ fn run_steps<'a>(
                     status: StepStatus::Running,
                 });
             }
-            let record = run_step(flow, step, depth, context, deps).await?;
+            let record = run_step(flow, step, depth, context, deps, total_fix_rounds).await?;
             if depth == 0
                 && let Some(on_progress) = &deps.on_progress
             {
@@ -127,7 +133,11 @@ fn run_steps<'a>(
             }
             let failed = record.status == StepStatus::Failed;
             let continued =
-                matches!(step, FlowStep::Ask { on_reject, .. } if on_reject == "continue");
+                matches!(step, FlowStep::Ask { on_reject, .. } if on_reject == "continue")
+                    || matches!(
+                        step,
+                        FlowStep::Delegate { on_invalid, .. } if on_invalid == "continue"
+                    );
             // Flatten condition branches into the top-level record list so the
             // UI/CLI shows the steps that actually ran.
             let branches: Vec<StepRecord> = if matches!(step, FlowStep::Condition { .. }) {
@@ -216,8 +226,11 @@ fn run_step<'a>(
     depth: usize,
     context: &'a mut FlowContext,
     deps: &'a FlowDeps,
+    total_fix_rounds: &'a mut usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StepRecord>> + Send + 'a>> {
-    Box::pin(async move { run_step_inner(flow, step, depth, context, deps).await })
+    Box::pin(async move {
+        run_step_inner(flow, step, depth, context, deps, total_fix_rounds).await
+    })
 }
 
 async fn run_step_inner(
@@ -226,6 +239,7 @@ async fn run_step_inner(
     depth: usize,
     context: &mut FlowContext,
     deps: &FlowDeps,
+    total_fix_rounds: &mut usize,
 ) -> Result<StepRecord> {
     tracing::info!("flow `{}`: running step `{}`", flow.name, step.name());
     match step {
@@ -423,7 +437,16 @@ async fn run_step_inner(
                 else_.as_deref().unwrap_or(&[])
             };
             let mut branch_records = Vec::new();
-            run_steps(flow, branch, depth + 1, context, deps, &mut branch_records).await?;
+            run_steps(
+                flow,
+                branch,
+                depth + 1,
+                context,
+                deps,
+                &mut branch_records,
+                total_fix_rounds,
+            )
+            .await?;
             let skipped = branch.is_empty();
             Ok(StepRecord {
                 name: name.clone(),
@@ -457,6 +480,7 @@ async fn run_step_inner(
                     depth,
                     context,
                     deps,
+                    total_fix_rounds,
                 )
                 .await?;
                 nested.push(record);
@@ -470,7 +494,16 @@ async fn run_step_inner(
                     });
                 }
             }
-            run_steps(flow, steps, depth + 1, context, deps, &mut nested).await?;
+            run_steps(
+                flow,
+                steps,
+                depth + 1,
+                context,
+                deps,
+                &mut nested,
+                total_fix_rounds,
+            )
+            .await?;
             Ok(StepRecord {
                 name: name.clone(),
                 step_type: "phase".to_string(),
@@ -483,21 +516,90 @@ async fn run_step_inner(
             name,
             command,
             max_fix_rounds,
-        } => run_verify(name, command.as_deref(), *max_fix_rounds, context, deps).await,
+        } => run_verify(
+            flow,
+            name,
+            command.as_deref(),
+            *max_fix_rounds,
+            context,
+            deps,
+            total_fix_rounds,
+        )
+        .await,
+        FlowStep::Delegate {
+            name,
+            prompt,
+            schema,
+            tools,
+            max_turns,
+            on_invalid: _,
+        } => {
+            // A delegate step is a typed sub-agent call: fresh context
+            // window, fresh turn budget, MUST reply with a single JSON
+            // object (optionally conforming to `schema`). The parsed JSON is
+            // stored at `${steps.<name>.output.json}` so downstream steps
+            // can reference real fields, e.g.
+            // `${steps.analysis.output.json.risk}`.
+            let prompt = context.expand(prompt);
+            let schema = schema.as_ref().map(|value| expand_json(value, context));
+            let outcome = agent_m_agent::run_delegate_sub(
+                deps.provider.clone(),
+                deps.permission_gate.clone(),
+                &deps.agent_options,
+                agent_m_agent::DelegateRequest {
+                    prompt,
+                    cwd: None,
+                    tools: tools.clone(),
+                    max_turns: *max_turns,
+                    json: true,
+                    schema,
+                },
+            )
+            .await;
+            let output = json!({
+                "content": outcome.content,
+                "json": outcome.parsed,
+                "isError": outcome.is_error,
+            });
+            set_step_output(context, name, output.clone());
+            let status = if outcome.is_error {
+                StepStatus::Failed
+            } else {
+                StepStatus::Succeeded
+            };
+            let error = outcome.is_error.then_some(outcome.content.clone());
+            Ok(StepRecord {
+                name: name.clone(),
+                step_type: "delegate".to_string(),
+                status,
+                output: Some(output),
+                error,
+            })
+        }
     }
 }
 
 /// GSD-style verify: run the check command; on failure, loop a bounded number
 /// of fix rounds (each: a build-mode agent prompt seeded with the failure,
-/// then re-run the command) until it passes.
+/// then re-run the command) until it passes. The loop is bounded by BOTH the
+/// per-step `max_fix_rounds` and the flow-level `error_budget` (total fix
+/// rounds across all verify steps). When the budget is exhausted the step
+/// fails with a stop-and-report message that includes the last failure
+/// output.
 async fn run_verify(
+    flow: &Flow,
     name: &str,
     command: Option<&str>,
     max_fix_rounds: usize,
     context: &mut FlowContext,
     deps: &FlowDeps,
+    total_fix_rounds: &mut usize,
 ) -> Result<StepRecord> {
     let command = command.unwrap_or("cargo test");
+    let budget_left = flow.error_budget.map_or(usize::MAX, |budget| {
+        budget.saturating_sub(*total_fix_rounds)
+    });
+    let rounds_allowed = budget_left.min(max_fix_rounds);
     let bash = deps.tools.iter().find(|t| t.name() == "bash");
     let mut tool_context = ToolContext::simple(deps.agent_options.cwd.clone());
     tool_context.ask_gate = deps.ask_gate.clone();
@@ -529,8 +631,17 @@ async fn run_verify(
 
     let mut output = run_once(context.expand(command)).await?;
     let mut rounds = 0;
-    while output.is_error && rounds < max_fix_rounds {
+    while output.is_error && rounds < rounds_allowed {
         rounds += 1;
+        *total_fix_rounds += 1;
+        let fix_rounds_remaining = flow.error_budget.map_or_else(
+            || (max_fix_rounds.saturating_sub(rounds)).to_string(),
+            |budget| {
+                budget
+                    .saturating_sub(*total_fix_rounds)
+                    .to_string()
+            },
+        );
         tracing::info!("verify `{name}`: fix round {rounds}");
         let mut options = deps.agent_options.clone();
         options.mode = Mode::Build;
@@ -547,7 +658,7 @@ async fn run_verify(
             }
         });
         let fix_prompt = format!(
-            "The verification command failed. Fix the root cause.\n\nCommand: {command}\n\nOutput:\n{}\n\nReply with the fix summary when done.",
+            "The verification command failed. Fix the root cause.\n\nCommand: {command}\n\nOutput:\n{}\n\nFix rounds remaining: {fix_rounds_remaining}\nReply with the fix summary when done.",
             output.content
         );
         if let Err(error) = agent.prompt(fix_prompt).await {
@@ -567,15 +678,38 @@ async fn run_verify(
     } else {
         StepStatus::Succeeded
     };
-    let result =
-        json!({ "output": output.content, "isError": output.is_error, "fix_rounds": rounds });
+    let budget_exhausted = output.is_error
+        && flow.error_budget.is_some_and(|budget| *total_fix_rounds >= budget);
+    let result = json!({
+        "output": output.content,
+        "isError": output.is_error,
+        "fix_rounds": rounds,
+        "max_fix_rounds": max_fix_rounds,
+        "budget_exhausted": budget_exhausted,
+    });
     set_step_output(context, name, result.clone());
+    let error = if output.is_error {
+        // Stop-and-report: say exactly why we stopped and show the last
+        // failure so the report is actionable without re-running.
+        let reason = if budget_exhausted {
+            format!(
+                "fix budget exhausted (used {} of {} fix rounds)",
+                total_fix_rounds,
+                flow.error_budget.unwrap_or(0)
+            )
+        } else {
+            format!("fix rounds exhausted ({rounds}/{max_fix_rounds})")
+        };
+        Some(format!("{reason}; last failure:\n{}", output.content))
+    } else {
+        None
+    };
     Ok(StepRecord {
         name: name.to_string(),
         step_type: "verify".to_string(),
         status,
         output: Some(result),
-        error: output.is_error.then_some(output.content),
+        error,
     })
 }
 
@@ -644,7 +778,8 @@ impl FlowStep {
             | FlowStep::Tool { name, .. }
             | FlowStep::Condition { name, .. }
             | FlowStep::Phase { name, .. }
-            | FlowStep::Verify { name, .. } => name,
+            | FlowStep::Verify { name, .. }
+            | FlowStep::Delegate { name, .. } => name,
         }
     }
 }

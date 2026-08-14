@@ -29,16 +29,29 @@
         "getting-started/what-is-agent-m",
         "getting-started/install",
         "getting-started/concepts",
-        "getting-started/quickstart"
+        "getting-started/quickstart",
+        "getting-started/faq"
       ]
     },
     {
       "group": "Usage",
       "pages": [
         "cli/reference",
-        "ui/keybindings",
-        "ui/sidebar",
+        "usage/pickup",
+        "usage/tutorial",
         "usage/sessions-worktrees"
+      ]
+    },
+    {
+      "group": "Checks",
+      "pages": [
+        "checks/verification"
+      ]
+    },
+    {
+      "group": "Templates",
+      "pages": [
+        "templates/index"
       ]
     },
     {
@@ -59,7 +72,8 @@
         "extending/mcp",
         "extending/anthropic",
         "extending/headless",
-        "extending/providers"
+        "extending/providers",
+        "extending/slack"
       ]
     },
     {

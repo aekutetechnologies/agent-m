@@ -18,5 +18,7 @@ pub mod registry;
 pub mod tools;
 
 pub use client::McpClient;
-pub use registry::{McpServerConfig, McpServers, ensure_default_mcp, load_servers};
+pub use registry::{
+    McpServerConfig, McpServers, ensure_default_mcp, load_servers, matches_patterns,
+};
 pub use tools::{McpTool, connect_tools, mcp_tool_spec};

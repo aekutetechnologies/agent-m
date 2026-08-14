@@ -14,17 +14,23 @@ opinion.
 | Low | auto | `read`, `grep`, `find`, `ls`, `search`; read-only bash (`ls -la`, `cat x`, `git status`) |
 | Medium | auto | `write`/`edit` inside the workspace; ordinary bash (`cargo test`, `npm install`) |
 | High | asks | writes outside the cwd or into `.git`; `git reset --hard`, `git clean -f`, `git checkout --force`, `git push --force`; `chmod -R`; `find -exec`/`-delete`; `eval`; `curl | sh` |
-| Critical | always asks | `rm -rf` variants; `sudo`/`doas`; device writes (`mkfs`, `fdisk`, `dd`); opaque plugin tools the host cannot inspect |
+| Critical | asks | `rm -rf` variants; `sudo`/`doas`; device writes (`mkfs`, `fdisk`, `dd`); opaque plugin tools the host cannot inspect |
 
-"Always asks" means High and Critical go to the human **even under `--yes`** —
-the harness has no auto-approve path for them. In print mode and flow execution
-there is no human to ask, so High/Critical calls are **denied outright**.
+The classification is harness-side heuristics, and the enforcement is now
+tiered: `LevelGate` (the runtime gate for both the REPL and the daemon)
+auto-approves Low/Medium and prompts the human for High/Critical at the
+default autonomy level (3). Level 2 makes **everything** ask; level 4 auto-
+approves everything except Critical. `--yes` auto-approves Low/Medium only —
+it cannot silence a High/Critical prompt. In print mode and flow execution
+there is no human to ask: High/Critical calls are **denied outright**
+(`DangerousCommandGate`), and without `--yes` all tool calls are denied.
 
 ## What the approval prompt shows
 
-Instead of a bare "Approve tool call?", the TUI shows:
+Instead of a bare "Approve tool call?", the REPL approval prompt shows:
 
-- a tier badge — ⚠️ HIGH or 🔴 CRITICAL — with the reason;
+- the tool name and arguments;
+- the risk reason (the "Risk Level:" line shows the classification reason);
 - consequence framing: "This can destroy data or change the host." / "This
   could discard or rewrite work."
 

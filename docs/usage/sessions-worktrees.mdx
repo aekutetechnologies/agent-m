@@ -15,29 +15,76 @@ Every conversation is a **session**: a file on disk under
 replies, the tool calls, and the approvals.
 
 **Auto-resume**: start agent-m in the same folder and it continues your
-latest session automatically — the sidebar shows its state and `/journal`
-shows its timeline.
+latest session automatically — `/sessions` shows it and `/journal` shows its
+timeline.
 
-**`/sessions` — the session manager**: type `/sessions` (or `/` and pick it
-from the command palette) to see every past session, newest first:
+**`/sessions` — the session list**: type `/sessions` to list past sessions
+for the current folder, newest first:
 
 ```
-┌────────────── sessions — 2 ──────────────┐
-│ › /tmp/proj/a · 2 msgs · deepseek-chat — explain proj a │
-│   /tmp/proj/b · 1 msgs — old proj b      │
-│   enter resume · esc close               │
-└──────────────────────────────────────────┘
+# Session 2026-08-12T10:42:11Z — 3 msgs
+  /tmp/proj/a · deepseek-chat — explain proj a
+  /tmp/proj/b · 1 msgs — old proj b
 ```
 
-- **↑/↓** move, **Enter** resumes the selected session: the transcript
-  reloads and new messages keep appending to *that* session's file (its
-  todos, undo history, and checkpoints come along).
-- **Esc** closes. The picker reads only the first/last line of each file, so
-  it stays instant even with hundreds of sessions.
+The list is **read-only**: there is no picker, and resume-from-list is not
+wired. Starting agent-m in the folder re-attaches to the latest session; to
+switch sessions you currently restart.
 
-Why it matters: leave a task half-done in one folder, work somewhere else,
-then `/sessions` → Enter and the context (and the undo/checkpoint safety net)
-is back — no copy-pasting between chats.
+## Daemon sessions — keep a long-horizon agent alive
+
+A **daemon session** is a background agent that survives your terminal: start
+it once, attach from anywhere, and it keeps its context window across many
+`prompt` calls. The session stays live for the whole process lifetime and
+persists every exchange to disk.
+
+**Start** (any directory, from any terminal):
+
+```bash
+agent-m --daemon build1 --slack-channel C05ABC123   # approvals over Slack
+agent-m --daemon build1                              # approvals on attach TTY
+```
+
+The daemon binds a unix socket under `~/.agent-m/agent/sockets/<id>.sock`
+and streams every agent event to connected clients.
+
+**Attach**:
+
+```bash
+agent-m --attach build1
+```
+
+Inside the attach session:
+
+- any line that does **not** start with `/` is sent as a prompt — the daemon
+  runs it, streams `EVENT <json>` lines (same shape as `--stream-json`), then
+  replies `RESULT ok` (or `RESULT error <msg>`);
+- `/status` — `RESULT ok messages=N tokens=T/W` (current context usage);
+- `/resume` — reload the session transcript from disk into the context
+  window (`RESULT ok restored N messages`);
+- `/detach` or `/exit` — leave the session running.
+
+```text
+Connected to daemon `build1`. Lines that start with / are attach commands…
+> /status
+RESULT ok messages=3 tokens=1200/1000000
+> fix the flaky test in tests/runner.rs
+EVENT {"event":"turn_start",…}
+EVENT {"event":"tool_execution_start","data":{"name":"bash",…}}
+RESULT ok
+> /detach
+```
+
+**List** running daemons:
+
+```bash
+agent-m --list-daemons
+```
+
+> **Status**: the daemon is a plain persistent session — it has no cron, no
+> wake words, and no multi-agent fan-out. It keeps state, answers prompts,
+> and can be driven from a script or an attach client. Cross-session pickup
+> and scheduled execution are later phases.
 
 ## Worktrees — run parallel sessions safely
 
@@ -54,20 +101,19 @@ agent-m --worktree                 # auto-named from the repo slug
 ```
 
 agent-m runs `git worktree add -b agent-m/<name>-<timestamp>` and starts the
-session inside the fresh checkout under `~/.agent-m/worktrees/`. A notice
+session inside the fresh checkout under `~/.agent-m/agent/worktrees/`. A notice
 prints the path.
 
-**Inside the TUI**:
+**In the REPL**:
 
 - `/worktree` — shows the current worktree and the full list (`git worktree
   list`).
 - `/worktree detach` — removes the session's worktree (refuses the main
   checkout, so your primary branch is always safe).
 
-Worktrees pair naturally with the safety net: `/checkpoint` snapshots git
-state before mutating tools run, and `/restore <n|sha>` rolls back — so even
-in a parallel session, nothing is irreversible (see
-[Trust principles](/trust/principles)).
+> **Status**: `/checkpoint`, `/restore`, and the undo safety net are **not
+> wired** (see [Trust principles](/trust/principles)) — "nothing is
+> irreversible" is the target, not the current state.
 
 ### Notes
 

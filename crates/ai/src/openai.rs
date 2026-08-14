@@ -51,6 +51,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: Option<String>,
     models: Vec<ModelSpec>,
+    extra_body: Option<serde_json::Value>,
     http: reqwest::Client,
 }
 
@@ -61,6 +62,7 @@ impl OpenAiCompatibleProvider {
         base_url: impl Into<String>,
         api_key: Option<String>,
         models: Vec<ModelSpec>,
+        extra_body: Option<serde_json::Value>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -68,6 +70,7 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.into(),
             api_key,
             models,
+            extra_body,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
@@ -117,6 +120,7 @@ impl OpenAiCompatibleProvider {
                     .context_window(1_000_000)
                     .pricing(0.42, 0.004, 0.84),
             ],
+            None,
         )
     }
 }
@@ -185,6 +189,16 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .any(|spec| spec.id == request.model && spec.supports_effort);
         apply_effort(&mut body, supports_effort, request.variant.as_deref());
+
+        if let Some(extra) = &self.extra_body {
+            if let Some(obj) = extra.as_object() {
+                if let Some(body_obj) = body.as_object_mut() {
+                    for (k, v) in obj {
+                        body_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
 
         let response = self
             .http

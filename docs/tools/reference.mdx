@@ -17,18 +17,60 @@ filter the active set; `--no-tools` disables everything.
 | `grep` | `pattern`, `path?`, `glob?` | `rg` with `--color never` + `--` terminator (regex walk fallback if `rg` is missing). |
 | `find` | `pattern?`, `path?` | `fd` (or a walk fallback); result count clamped to 10 000. |
 | `ls` | `path?` | Directory listing. |
-| `search` | `query`, `path?` | **Symbol search** over a per-project index: JSON cache of file paths + symbol names with line numbers, rebuilt when any file under the root changes (tree-sitter grammars; skips vendored dirs like `node_modules`/`.git`/`__pycache__`). `/info` shows `search index: N files · N symbols`. |
+| `search` | `query`, `path?` | **Symbol search** over a per-project index: JSON cache of file paths + symbol names with line numbers, rebuilt when any file under the root changes (tree-sitter grammars; skips vendored dirs like `node_modules`/`.git`/`__pycache__`). |
 | `web_fetch` | `url` | URL → readable text. 10 MB cap, 10 s timeout, `http(s)` only, with an SSRF guard (loopback/RFC1918/link-local targets blocked) re-applied on every redirect hop. |
 | `web_search` | `query`, `max_results?` | SearXNG-style endpoint from `AGENT_M_SEARCH_URL` (clear error when unset); result count clamped. |
-| `ask` | `question`, `options?`, `multi_select?` | Asks the human in the TUI (numbered options, `j/k` or ↑/↓ navigate, multi-select via space). Fails with a clear message when no ask gate is installed (headless/print mode). |
+| `ask` | `question`, `options?`, `multi_select?` | Asks the human in the REPL (numbered options; multi-select via space-separated numbers). Fails with a clear message when no ask gate is installed (headless/print mode). |
 
 ## Mutating tools
 
 | Tool | Arguments | Notes |
 |---|---|---|
 | `bash` | `command`, `timeout?` | Runs via the user's shell in its own **process group**; on timeout the whole group is `SIGKILL`ed. With `AGENT_M_SANDBOX=1` the invocation runs under an OS sandbox (Seatbelt on macOS, Landlock/bwrap on Linux) that denies filesystem writes outside cwd/tmp. Output is capped: under 10 KB inline, larger output is offloaded to a file with a `read path="…"` pointer (50 KB inline ceiling). |
-| `write` | `path`, `content` | Creates/overwrites a file (containment: resolved under cwd + `--allow-path` roots). Before-content is snapshotted for `/undo`. |
-| `edit` | `path`, edits… | Exact-text multi-edit with a `similar`-based diff preview; snapshotted for `/undo` like `write`. |
+| `write` | `path`, `content` | Creates/overwrites a file (containment: resolved under cwd + `--allow-path` roots). |
+| `edit` | `path`, edits… | Exact-text multi-edit with a `similar`-based diff preview. |
+
+## Sub-agents (`delegate`)
+
+`delegate` spawns a fresh-context sub-agent (build mode only) and returns its
+final answer as the tool outcome — check.md-inspired parallel/isolated work
+with its own context window, so the parent's history never grows:
+
+| Argument | Description |
+|----------|-------------|
+| `prompt` | **Required.** Self-contained task for the sub-agent. |
+| `cwd` | Working directory for the sub-agent's tools (default: the parent's cwd). |
+| `tools` | Restrict the sub-agent to these tools (default: the parent's set minus `delegate`). |
+| `max_turns` | Sub-agent turn budget (default `4`, clamped `1..=16`). |
+| `format` | Output format: `text` (default) returns the sub-agent's final reply verbatim; `json` requires the reply to be a single JSON object. |
+| `schema` | Optional JSON Schema describing the expected answer shape (used with `format=json`); embedded verbatim in the sub-agent's system prompt. |
+
+**Structured output:** with `format=json` the sub-agent's system prompt
+instructs it to return only a single JSON object (no markdown fences, no
+prose). The final reply is parsed — the whole reply first, then the first
+`{`…`}` slice as a fallback for models that wrap JSON in fences — and
+returned pretty-printed, so the parent can treat the outcome as data (e.g.
+`findings: [...]`) rather than prose. If the reply cannot be parsed, the
+outcome is an error quoting the first 200 characters, which the parent can
+retry or re-delegate. The `<trust>` block (strict mode) is stripped before
+parsing, so the JSON arrives clean.
+
+Scoping rules:
+
+- The sub-agent inherits the parent's provider and permission gate; its
+  tools run relative to `cwd` and are limited to the `tools` subset.
+- Sub-agents **never see `delegate` itself** — a nested delegate call is an
+  error inside the sub-agent, so delegation cannot recurse.
+- The parent's turn that issued the call is trust-enforced (P2/P4/P9) as
+  usual; sub-agents rely on cwd + tool scoping rather than a second trust
+  pass, so strict (`--trust block`) modes keep working.
+- `delegate` is not available in plan mode.
+
+**Parallelism:** several tool calls in one turn run concurrently, so a single
+turn with multiple `delegate` calls explores several directories at once.
+Results are recorded in call order. Keep mutating calls (e.g. `bash`/`write`)
+to one per turn — only independent reads/searches/delegates are meant to
+share a turn.
 
 ## Output truncation & offload
 

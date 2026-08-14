@@ -42,3 +42,8 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
   echo "Add this to your shell profile:"
   echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
+
+if command -v cargo >/dev/null 2>&1; then
+  echo "Installing Rust MCP servers (rust-mcp-filesystem, jira-mcp-rs, mcp-postgres)..."
+  cargo install rust-mcp-filesystem jira-mcp-rs mcp-postgres 2>/dev/null || true
+fi

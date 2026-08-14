@@ -1,0 +1,131 @@
+---
+title: FAQ & troubleshooting
+---
+
+# FAQ & troubleshooting
+
+Quick answers to the things that usually trip people up. If it's not here,
+try [Checks & verification](/checks/verification) or the
+[end-to-end tutorial](/usage/tutorial).
+
+## Where do things live?
+
+agent-m keeps everything under one **agent dir** — `~/.agent-m/agent/`
+(override with `AGENT_M_DIR`):
+
+| Path | Purpose |
+|------|---------|
+| `auth.json` | API keys (`0600`, owner-only). **Never** in env vars |
+| `settings.json` | providers, task→model routing, `allowedPaths`, `level` |
+| `mcp.json` | MCP servers (preferred over `settings.json`'s `mcpServers`) |
+| `repos.json` | Jira project key → repo map for pickup |
+| `sessions/` | one JSONL file per working directory |
+| `tasks/` | per-ticket task records |
+| `commands/*.md` | your saved commands |
+| `plugins/` | installed plugins |
+| `worktrees/` | git worktrees created by pickup |
+| `tickets/<KEY>.jsonl` | per-ticket logs + status |
+| `flows/<name>/STATE.md` | flow state for the UI sidebar |
+| `preferences.json` | remembered preferences (e.g. `dont_ask`) |
+| `harness.json` | harness/eval config |
+
+## Which environment variables does agent-m read?
+
+The **integration** variables (these matter):
+
+| Variable | Used for |
+|----------|----------|
+| `JIRA_URL`, `JIRA_TOKEN` | jira plugin |
+| `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` | Slack remote channel (Socket Mode) |
+| `BITBUCKET_BASE`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` | bitbucket plugin |
+| `GITHUB_TOKEN`, `GITHUB_API` (default `https://api.github.com`) | github plugin |
+| `AGENT_M_DIR` | agent dir override (default `~/.agent-m`) |
+| `AGENT_M_SANDBOX` | `"1"`/`"true"` = extra sandbox protections |
+| `AGENT_M_ALLOW_PATH` | `:`-separated extra allowed path roots |
+| `AGENT_M_SEARCH_URL` | SearXNG-style search endpoint for `web_search` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry export target |
+| `CARGO_HOME`, `SHELL` (default `/bin/sh`) | build/test environment |
+| `NO_COLOR` | disable ANSI color |
+| `AGENT_M_INSTALL_DIR` | where `install.sh` puts the binary |
+
+**The one that deliberately does nothing:** provider-key variables.
+`DEEPSEEK_API_KEY=…` (or any `<PROVIDER>_API_KEY`) is **not** read — keys
+come only from `auth.json` (then `settings.json`). An error message *naming*
+the env var is display-only; the fix is always the file.
+
+## Why does it say "no LLM providers are configured"?
+
+`settings.json` is missing or empty. Run any command once and the starter
+template (with the five providers: deepseek, openai, anthropic, nvidia,
+openrouter) is recreated automatically. Then add a key to `auth.json` and
+you're set.
+
+## Why "Missing API key for 'deepseek'"? I set the env var!
+
+Because env vars are ignored by design (see above). Write the key to
+`~/.agent-m/agent/auth.json`:
+
+```bash
+printf '{"deepseek": "sk-…"}\n' > ~/.agent-m/agent/auth.json
+```
+
+## Why does a tool action get denied even with `--yes`?
+
+`--yes` auto-approves **Low/Medium** risks. **High/Critical** always ask —
+that's the [trust boundary](/trust/risk-tiers) doing its job. Deny is the
+safe default; approve in the prompt, over Slack, or via
+`/allow <tool>` (persisted in `preferences.json`). In a non-interactive
+terminal (`--no-tty`), an ask **denies** — agent-m never guesses yes.
+
+## What does "stop-and-report" mean in a flow?
+
+A `verify` step that hit its fix-round limit, or any failed step with no
+recovery, halts the flow **without** running later steps and prints the
+failure evidence (see [Flows](/flows/overview) for `error_budget` and
+`max_fix_rounds`).
+
+## `docs-check FAILED` — what now?
+
+Each check prints its own `FAIL: …` line. The common ones:
+
+- `not valid JSON` → syntax error in `docs/mint.json`.
+- `nav path does not resolve` → a page in `mint.json` `navigation` doesn't
+  exist under `docs/` (typo, or the file was renamed).
+- `internal link does not resolve` → a backticked `](some/path)` link points
+  at a non-existent page.
+- `fences unbalanced` → a triple-backtick code fence is missing its closer.
+
+Fix, re-run `./scripts/docs-check.sh`, and wait for `docs-check PASSED`.
+
+## The plan step is asking me a question mid-run — what do I answer?
+
+That's the trust design: **plan and High/Critical actions are human-gated**
+even in autonomous runs. `y` approves this step. With `--yes` plans are
+still shown but not waited on; in headless mode (`--no-tty`) plans approve
+only if `plan_approval` policy allows, otherwise they abort safely. To ask
+*no* questions at all, use `--trust off` — but then the model has full
+permission and it's your call that made it so. See
+[Autonomy](/trust/autonomy).
+
+## What's the difference between `pickup`, `ticket-run`, and `--flow`?
+
+| Command | What it does |
+|---------|--------------|
+| `agent-m pickup` | full loop: Jira query → transition → worktree → run `flows/agentic-dev.yml` → PR → close-out |
+| `agent-m pickup --poll 300 --workers 2` | same, as a daemon draining the backlog, one child process per ticket |
+| `agent-m ticket-run PROJ-42` | one specific ticket through the loop |
+| `agent-m ticket-log PROJ-42 [--follow]` | per-ticket report (state + step verdicts) |
+| `agent-m --flow my.yml` | run an arbitrary flow with `--flow-context` variables; no Jira required |
+
+## Why is there a `graphify-out/` folder?
+
+A knowledge-graph export (nodes + edges JSON, `GRAPH_REPORT.md`, `graph.html`)
+generated by the [graphify](https://github.com/aekutetechnologies/agent-m)
+tooling to explore the codebase. Safe to ignore for day-to-day use; the
+docs site does not depend on it.
+
+## The UI shows a sidebar — what is that?
+
+The REPL has a sidebar showing conversation state (session, cost, flow
+state from `flows/<name>/STATE.md`). Toggle it with `/sidebar` or see the
+keybindings in the CLI reference ([CLI reference](/cli/reference)).

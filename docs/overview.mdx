@@ -4,42 +4,52 @@ title: agent-m
 
 # agent-m
 
-A pi-style coding agent in Rust: an interactive terminal UI (ratatui) with a
+A pi-style coding agent in Rust: an interactive terminal REPL with a
 DeepSeek-backed streaming agent, tool calling, byte-stable prefix caching, and
 JSONL session persistence.
 
-The UI is modeled on [pi](https://pi.dev)'s interactive mode (transcript +
-fixed editor/footer dock, same default keybindings), implemented with the same
-stack warp's terminal agent CLI uses (ratatui + crossterm).
+The REPL (rustyline + crossterm-styled section panels) is modeled on
+[pi](https://pi.dev)'s interactive flow: a streaming transcript with tool
+execution blocks and slash commands. For embedding and scripting there is
+print mode (`-p`), `--stream-json`, and a stdio JSON-RPC server (`--serve`).
 
 ## Features
 
-- **Interactive TUI** — streaming markdown replies, tool-execution blocks with
-  expand/collapse, a status line with a working spinner, and footer keybinding
-  hints. `ui-mode regular|fullscreen` switches between terminal scrollback and
-  the alternate screen.
+- **Interactive REPL** — streaming markdown replies, color-coded
+  tool-execution blocks, a per-turn "thinking…" indicator, and a
+  `── decision ──` panel rendering the model's `<trust>` block (confidence,
+  reason, evidence). `ui-mode`-style fullscreen and scrollback switching is
+  not offered; the REPL runs in the terminal's normal scrollback.
 - **Tool calling with approval** — per-call `y`/`n` prompts or `--yes`
   auto-approve. Tools: `bash`, `read`, `write`, `edit` (exact-text multi-edit
-  + unified diff), `grep`, `find`, `ls`. The default active set is `read`,
-  `bash`, `ls`, `grep`, `find`, `edit`, `write`; plan mode keeps the read-only
-  subset (`ls`, `read`, `grep`, `find`, `ask`).
+  + unified diff), `grep`, `find`, `ls`, `search`, `web_fetch`,
+  `web_search`, `ask`, and `delegate` (fresh-context sub-agents). The default
+  active set is `read`, `bash`, `ls`, `grep`, `find`, `edit`, `write`;
+  plan mode keeps the read-only subset (`ls`, `read`, `grep`, `find`, `ask`).
 - **Model-agnostic provider layer** — OpenAI-compatible chat completions, with
   DeepSeek configured out of the box (`deepseek-chat`, `deepseek-reasoner`).
 - **Byte-stable prefix caching** — request bodies are serialized
   deterministically (sorted keys, no volatile fields); the system prompt and
   tool schemas are assembled once per session and only the new message is
   appended per turn, so the provider's context cache is served instead of
-  recomputed. Cache hit/miss tokens are parsed into usage and shown in the
-  status line (`/cache` or `ctrl+t` to toggle).
+  recomputed. Cache hit/miss tokens are parsed into usage and shown via
+  `/usage`.
 - **JSONL sessions** — stored under
   `~/.agent-m/agent/sessions/--<cwd>--/` and auto-resumed.
-- **Trust harness** — the twelve check.md trust principles are implemented:
-  confidence scores, evidence citations, risk tiers, consequence-framed
-  approvals, an audit journal, `/undo` rollback, preference learning, and
-  progressive autonomy levels. See [Trust](/trust/principles).
+- **Trust harness** — the twelve check.md trust principles are addressed in
+  code: confidence scores and evidence citations parsed from the model's
+  `<trust>` block, risk tiers classified by the harness, consequence-framed
+  approvals, a narrated `/journal` audit trail. Honest status against the
+  current tree: **7 of 12 are fully implemented** (explain decisions,
+  confidence, risk-based permissions, meaningful interruptions, evidence,
+  autonomy — plus a partial 11 with evidence backing), the rest partial
+  (transparency, plan-before-execution, audit trail, reversibility,
+  uncertainty, preference learning); zero absent. See
+  [Trust](/trust/principles) and `TRUST_AUDIT.md`.
 
 ## Next steps
 
-- [Quickstart](/getting-started/quickstart) — install and run
+- [Install & first chat](/getting-started/install) — the 5-minute noob path
+- [Tutorial](/usage/tutorial) — install → Jira → PR end to end
 - [CLI reference](/cli/reference) — every flag
 - [Trust principles](/trust/principles) — how agent-m earns trust

@@ -1,12 +1,13 @@
 # agent-m
 
-A pi-style coding agent in Rust: an interactive terminal UI (ratatui) with a
+A pi-style coding agent in Rust: an interactive terminal REPL with a
 DeepSeek-backed streaming agent, tool calling, byte-stable prefix caching, and
 JSONL session persistence.
 
-The UI is modeled on [pi](https://pi.dev)'s interactive mode (transcript +
-fixed editor/footer dock, same default keybindings), implemented with the same
-stack warp's terminal agent CLI uses (ratatui + crossterm).
+The REPL (rustyline + crossterm-styled section panels) is modeled on
+[pi](https://pi.dev)'s interactive flow: a streaming transcript with tool
+execution blocks and slash commands. For embedding and scripting there is
+print mode (`-p`), `--stream-json`, and a stdio JSON-RPC server (`--serve`).
 
 📚 **Docs**: a Mintlify documentation site lives in [`docs/`](docs/overview.mdx)
 — quickstart, CLI reference, trust principles, flows, plugins, and
@@ -22,7 +23,7 @@ expects from a coding agent:
 | MCP client | `mcpServers` in `~/.agent-m/agent/mcp.json` (stdio + Streamable HTTP); tools appear as `server__tool`, gated Critical-by-default |
 | Web tools | `web_fetch` (read-only, 10 MB / 10 s caps) + `web_search` (SearXNG-style endpoint via `AGENT_M_SEARCH_URL`) |
 | Subagents | `delegate` tool — fresh-context sub-agent with its own tool/turn budget |
-| Git checkpoints | auto-snapshot before mutating tools + `/checkpoint` + `/restore <index|sha>` (stash-create snapshots, no branch pollution) |
+| Git checkpoints | `/checkpoint` + `/restore` + auto-snapshot infra exist (`checkpoint.rs`) but are **not wired** — stubs today |
 | Image input | `@image.png` → base64 image parts; provider `supports_images` gate with a clear error on text-only models |
 | Headless | `--stream-json` event lines + `--serve` stdio JSON-RPC (prompt/exit + `event` notifications) |
 | Cross-tool rules | `AGENTS.md` + `CLAUDE.md` + `.cursorrules` + `GEMINI.md` loaded with fixed precedence |
@@ -45,16 +46,18 @@ LM Studio, Together, …). The built-in `deepseek` is the zero-config default.
 ]}
 ```
 
-Fields: `id` (`[a-z0-9-_]`, used by `--provider` and the env var `<ID>_API_KEY`),
-`name?`, `baseUrl` (no trailing `/chat/completions`), `model`, `reasoning?`,
-`supportsImages?`, `contextWindow?` (default 128000), `pricing?`
-(`inMiss`/`inHit`/`out`, USD per 1M tokens), `apiKeyEnv?` (default `<ID>_API_KEY`).
-Keys are never stored in the config — they resolve through
-env → `auth.json` → `settings.json` via the named env var.
+Fields: `id` (`[a-z0-9-_]`, used by `--provider` and the error-hint env var
+`<ID>_API_KEY`), `name?`, `baseUrl` (no trailing `/chat/completions`),
+`model`, `reasoning?`, `supportsImages?`, `contextWindow?` (default 128000),
+`pricing?` (`inMiss`/`inHit`/`out`, USD per 1M tokens), `apiKeyEnv?` (default
+`<ID>_API_KEY`). Keys are never stored in the chat logs — they resolve from
+`~/.agent-m/agent/auth.json` → `~/.agent-m/agent/settings.json` (provider-key
+env vars are not read).
 
-**TUI wizard** — `/provider` opens an interactive setup: 1 add · 2 edit ·
-3 remove · 4 switch. Each add/switch writes the config and live-switches the
-running agent. `/provider <id>` switches directly.
+**Providers** — configure via `~/.agent-m/agent/settings.json` or `--provider
+<id>`; `/provider` reports the active provider's models, `/model <id>` and
+`/variant <id>` switch live, and `/tasks` routes roles (build/plan/compact/
+subagent/refine) to different providers.
 
 **CLI** — `--provider <id>` selects a configured provider (or `deepseek`),
 `--list-models` shows every configured
@@ -64,9 +67,11 @@ visible in `ps`).
 
 ## Features
 
-- Interactive TUI: streaming markdown replies, tool-execution blocks with
-  expand/collapse, status line with a working spinner, footer keybinding hints.
-- `ui-mode regular|fullscreen` (terminal scrollback vs alternate screen).
+- Interactive REPL: streaming markdown replies, color-coded tool-execution
+  blocks, a per-turn "thinking…" indicator, and a `── decision ──` panel
+  rendering the model's `<trust>` block (confidence, reason, evidence).
+- Print mode (`-p` / piped stdin), `--stream-json` event lines, and `--serve`
+  stdio JSON-RPC for embedding and other agents.
 - Tool calling with per-call approval (`y`/`n`) or `--yes` auto-approve:
   `bash`, `read`, `write`, `edit` (exact-text multi-edit + unified diff),
   `grep`, `find`, `ls` (default active set: read, bash, ls, grep, find,
@@ -78,8 +83,7 @@ visible in `ps`).
   (sorted keys, no volatile fields), the system prompt and tool schemas are
   assembled once per session, and only the new message is appended per turn —
   so the provider's context cache is served instead of recomputed. Cache
-  hit/miss tokens are parsed into usage and shown in the status line
-  (`/cache` or `ctrl+t` to toggle).
+  hit/miss tokens are parsed into usage and shown in the `/usage` output.
 - JSONL sessions under `~/.agent-m/agent/sessions/--<cwd>--/`, auto-resumed.
 
 ## Install & run
@@ -117,7 +121,7 @@ Key resolution order: `DEEPSEEK_API_KEY` env var → `~/.agent-m/agent/auth.json
 ### Usage
 
 ```bash
-agent-m                                # interactive TUI (default on a TTY)
+agent-m                                # interactive REPL (default on a TTY)
 agent-m --model deepseek-reasoner      # reasoning model
 agent-m -p "explain this repo"         # print mode: stream reply to stdout
 echo "summarize README" | agent-m      # non-TTY stdin → print mode
@@ -136,10 +140,12 @@ there is no interactive approval in print mode, so tools require explicit opt-in
 agent-m runs with the full privileges of the invoking user. It has no OS-level sandbox. The security model consists of three layers, in order of strength:
 
 ### 1. No tool registered (strongest)
-The most secure boundary: if a tool is not registered (`--no-tools`, `--exclude-tools bash`), the model cannot invoke it. Plan mode (`/plan` or `--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`, `search`) plus `ask`, so destructive operations cannot reach the filesystem.
+The most secure boundary: if a tool is not registered (`--no-tools`, `--exclude-tools bash`), the model cannot invoke it. Plan mode (`/mode plan` or `--mode-plan`) registers only read-only tools (`read`, `grep`, `find`, `ls`, `search`) plus `ask`, so destructive operations cannot reach the filesystem.
 
-### 2. Human approval (interactive TUI only)
-A human is present in the interactive TUI, so the gate is risk-based whether or not you pass `--yes`: read-only tools (`read`, `grep`, `find`, `ls`, `search`, `ask`) never prompt, and neither does a benign shell command — `ls`, `cat somefile`, `git status` — even when the model runs it via `bash` rather than a dedicated tool. Only calls that look destructive wait for your approval. **Risk hints** — cheap heuristics over command strings and write targets — flag calls that look destructive (recursive deletes, git force operations, writes outside the workspace, writes to `.git/hooks`) with a **⚠️ RISKY** prompt; these always ask, even under `--yes` (ECC GateGuard). These hints catch accidents from a cooperative model, not adversarial prompts. A bash command can hide anything via `eval "$(base64 -d …)"`, so risk detection is advisory, never a containment boundary.
+### 2. Human approval (interactive mode only)
+A human is present in the interactive REPL, so the gate is risk-based: read-only tools (`read`, `grep`, `find`, `ls`, `search`, `ask`) never prompt, and neither does a benign shell command — `ls`, `cat somefile`, `git status` — even when the model runs it via `bash` rather than a dedicated tool. Only calls that look destructive wait for your approval. **Risk hints** — cheap heuristics over command strings and write targets — flag calls that look destructive (recursive deletes, git force operations, writes outside the workspace, writes to `.git/hooks`) with a ⚠️ prompt that shows the risk reason and a consequence framing ("This can destroy data…"). These catch accidents from a cooperative model, not adversarial prompts. A bash command can hide anything via `eval "$(base64 -d …)"`, so risk detection is advisory, never a containment boundary.
+
+**Caveat**: `--yes` auto-approves Low/Medium calls, but **High/Critical calls still prompt in the REPL** — the gate is tiered, not bypassed. There is no way to silence the Critical prompt (see `TRUST_AUDIT.md`).
 
 In print mode with `--yes`, and in flow execution with `--yes`, risk-hinted calls are **denied outright** — there is no human to ask. Without `--yes`, print mode and flows deny all tool calls.
 
@@ -157,47 +163,29 @@ The denylist arms race cannot be won. The real boundaries are: no tool registere
 
 ## Modes, planning, and the ask tool
 
-- **`/plan`** (or `--mode-plan`) switches to **plan mode**: only read-only tools
+- **Plan mode** (`/mode plan` or `--mode-plan`): only read-only tools
   (`read`, `grep`, `find`, `ls`) plus `ask` are available, and the model is
-  prompted to emit a numbered `Plan:` list. `/build` returns to normal mode.
-- The plan is parsed into a task list (rendered as a `📋` block with a `n/m`
-  counter in the status line) and **persisted to
+  prompted to emit a numbered `Plan:` list. `/mode build` returns to normal
+  mode.
+- The plan is parsed into a task list (rendered as a `plan (n/m)` panel with
+  ✓/○ markers) and **persisted to
   `~/.agent-m/agent/tasks/<session>.json`** — it survives restarts and
   compaction.
-- After the plan is ready: `[e]xecute` (flips to build and sends the plan as
-  the follow-up prompt), `[s]tay in plan mode`, `[r]efine` (rewrites the plan).
+- After the plan is ready, the model executes it (plan mode is read-only);
+  `/mode build` flips to normal mode with the plan as the follow-up prompt.
   During execution the model marks steps with `[DONE:n]`; `/todos` shows the
   current list.
 - **`ask` tool**: the model can stop and ask you a clarifying question
-  mid-task. The TUI shows the question in the status area — type your answer
-  in the editor and press Enter (Escape cancels). In print mode `ask` fails
-  with a clear message.
-
-## Right-side status sidebar (accordion)
-
-The right side of the TUI is an accordion of collapsible sections — click a
-section header (or run `/sidebar <section>`) to collapse/expand it; the
-collapsed state persists in `settings.json` (`collapsedSidebarSections`):
-
-- **Context** — model, tokens in/out, cache read %, cost, context % of the
-  model's window.
-- **Timing** — the most recent turn's elapsed time and the average over the
-  last 10 turns.
-- **Flow** — while a flow runs: the name with a `done/total` counter, a
-  progress bar, and one row per step — `✓` done (green), `▶` running
-  (highlighted), `○` pending, `✗` failed.
-- **Plan** — the task list from `/plan` or a flow's plan step (`[x]`/`[ ]`
-  with an `n/m` counter).
-
-`/sidebar` (no argument) toggles the whole panel; it auto-hides below 110
-terminal columns.
+  mid-task. The REPL prints the question (numbered options when provided) and
+  reads your answer from stdin — type the option number or your answer and
+  press Enter (blank cancels). In print mode `ask` fails with a clear message.
 
 ## Flows (Devin-style pipelines)
 
 `agent-m --flow flows/agentic-dev.yml --yes` runs a YAML pipeline of steps
 (tool / prompt / ask / condition / phase / verify) with a shared
-`FlowContext` and `${step.output}` references. In the TUI, `/flow <path>` runs
-one interactively and `/flows` lists the flows in `~/.agent-m/flows/`. The
+`FlowContext` and `${step.output}` references. `/flow <path>` runs one
+interactively and `/flows` lists the flows in `~/.agent-m/flows/`. The
 shipped `flows/agentic-dev.yml` is the canonical GSD loop (Discuss → Plan →
 Execute → Verify → Ship). Flow `tool` and `verify` steps go through the
 permission gate and the destructive-command rules, and each run writes
@@ -223,77 +211,74 @@ plugin tools.
   directory up to your home, plus `~/.agent-m/agent/AGENTS.md`, and wraps them
   into the system prompt (`<project_instructions path="…">…`). File arguments
   (`agent-m -p @src/main.ts "fix it"` or a bare path) inline the file as
-  `<file>` context. `/info` shows the loaded context files, mode, usage, and
-  cost.
+  `<file>` context.
 - **Memory**: the conversation persists as JSONL sessions (auto-resumed), and
   `/compact` summarizes older messages into a `[session summary]` entry that
   stays in context — pi's cross-session memory model. The plan file is a
   second durable memory.
-- **Context size**: the status line shows `NN% of 64k` (yellow >70%, red
-  >90%); `/context` reports tokens, window, percent, and the 16k reserve.
+- **Context size**: `/usage` reports tokens in/out, context window usage
+  percent, and cache hit/miss stats.
 - **`search` tool (local index)**: agent-m builds a per-project symbol/keyword
   index (file paths, language-aware symbols with line numbers, identifier
   tokens — pure Rust, no embedding API) cached at `~/.agent-m/index/`. The
   `search { query }` tool scores hits (exact symbol > prefix > substring >
   token overlap), returns the top 20 with `file:line (kind name) — snippet`,
   and re-indexes automatically when files change. It is read-only, so plan
-  mode gets it too. `/info` shows index stats.
+  mode gets it too.
 
-## Keybindings (pi defaults)
+## REPL editing keys (rustyline defaults)
 
 | Key | Action |
 |-----|--------|
 | `Enter` | submit |
-| `Shift+Enter` / `ctrl+j` | newline |
 | `Tab` | autocomplete (slash commands, file paths) |
-| `ctrl+c` | clear editor (exit when empty) |
-| `ctrl+d` | exit |
-| `Escape` | interrupt the running reply |
-| `ctrl+l` | cycle model |
-| `ctrl+o` | expand/collapse the most recent tool output |
-| `ctrl+r` | expand/collapse the most recent thinking trace |
-| `ctrl+p` / `ctrl+shift+p` | cycle model forward/backward |
-| `ctrl+a`/`ctrl+e` | line start/end |
-| `ctrl+b`/`ctrl+f` | word left/right |
-| `ctrl+w`/`ctrl+u`/`ctrl+k` | kill word/backward/forward |
-| `ctrl+y` / `ctrl+-` | yank / undo |
-| `PageUp`/`PageDown` / mouse wheel | scroll transcript |
+| `ctrl+c` | exit |
+| `ctrl+d` | exit (EOF) |
+| `↑` / `↓` (`ctrl+p` / `ctrl+n`) | history |
+| `ctrl+a` / `ctrl+e` | line start / end |
+| `ctrl+w` / `ctrl+u` / `ctrl+k` | kill word / backward / forward |
+| `ctrl+y` | yank |
 
-Tool output and thinking from a finished turn collapse to a one-line receipt/summary once you
-move on to the next prompt (or `!command`) — `ctrl+o`/`ctrl+r` re-expand the most recent one.
+While the model streams, a `thinking…` indicator shows with an elapsed timer,
+tool executions are printed as one-line summaries (`reading "src/main.rs"`,
+`running "cargo test"`), and `/tool-output last|<n>` reprints the full output
+of any of the last 20 tool calls.
 
-Slash commands: `/help`, `/hotkeys`, `/clear`, `/exit`, `/quit`, `/model`,
-`/new`, `/settings`, `/cache`. `!command` runs bash directly.
+Slash commands: `/exit`, `/quit`, `/sessions`, `/undo`, `/model`, `/variant`,
+`/mode`, `/usage`, `/level`, `/harness`, `/refine`, `/todos`, `/worktree`,
+`/journal`, `/checkpoint`, `/restore`, `/flows`, `/compact`, `/tool-output`,
+`/tools`, `/color`, `/provider`, `/tasks`, `/help`.
 
 ## Trust (check.md principles)
 
-The harness — never the LLM — decides what is safe. All twelve principles from
-`check.md` are addressed; the model only *reports* (reason, confidence, evidence)
-and the harness *enforces* (risk tiers, autonomy levels).
+The harness — never the LLM — decides what is safe. The model *reports*
+(reason, confidence, evidence) and the harness *enforces* (risk tiers,
+approvals). Status is against the current code, not the ideal: **three** of
+the twelve principles are fully implemented (risk-based permissions,
+meaningful interruptions, autonomy levels), nine are partially implemented
+(parsed and displayed, or half-wired), and none are entirely absent. See
+`TRUST_AUDIT.md` for the evidence-based audit.
 
-| # | Principle | Status |
-|---|-----------|--------|
-| 1 | Transparency | ✅ Tool narration in the status line (`Reading …`, `Running \`…\``) |
-| 2 | Explain decisions | ✅ `<trust>` block parsed into a "── decision ──" block under every reply |
-| 3 | Plan before execution | ✅ Plan mode + `<plan>` items + time estimate in the decision block |
-| 4 | Confidence | ✅ 0-100 gauge, color-coded by tier, in the decision block and `/info` |
-| 5 | Risk-based permissions | ✅ 4 tiers (Low/Medium/High/Critical) by `RiskPolicy`; `TierGate`/`LevelGate` |
-| 6 | Meaningful interruptions | ✅ Consequence framing + tier badge (⚠️ HIGH / 🔴 CRITICAL); High/Critical always ask, even `--yes` |
-| 7 | Audit trail | ✅ Timestamped JSONL entries + `/journal` narrated timeline |
-| 8 | Reversible actions | ✅ `/undo` restores write/edit snapshots; ledger persists per session |
-| 9 | Evidence | ✅ `file:line — note` citations rendered from `<evidence>` |
-| 10 | Uncertainty | ✅ `<uncertainty>` note shown in the decision block |
-| 11 | Preference learning | ✅ Learns `!command` families + `/undo` → `preferences.json` → static prompt block |
-| 12 | Autonomy levels | ✅ `--level 0-4` / `/level`: observe · suggest · assisted · trusted · autonomous |
+| # | Principle | Status | Evidence |
+|---|-----------|--------|----------|
+| 1 | Transparency | **Partial** | One-line tool narration (`reading "src/main.rs"`, `running "cargo test"`) via `toolout.rs` — no "why" or "what's next" |
+| 2 | Explain decisions | **Partial** | `<trust>` block parsed (`trust.rs`) into a `── decision ──` panel (`section.rs`); model may omit it |
+| 3 | Plan before execution | **Partial** | Plan mode (`--mode-plan`/`/mode plan`), `plan (n/m)` panel, `[DONE:n]` markers — opt-in |
+| 4 | Confidence | **Partial** | 0-100 parsed, tiered, displayed — has no effect on gating or retries |
+| 5 | Risk-based permissions | **Yes** | 4 tiers classified by `RiskPolicy::assess`; `LevelGate` gates both interactive modes (repl + daemon): Low/Medium auto, High/Critical ask |
+| 6 | Meaningful interruptions | **Yes** | Consequence-framed prompt (`gate.rs::ask_human`); only High/Critical interrupt; `--yes` cannot silence them |
+| 7 | Audit trail | **Partial** | Timestamped JSONL + `/journal` narrated rows (`sessions.rs`) — message log, not a narrated rationale |
+| 8 | Reversible actions | **Partial** | `/undo` is live: `write`/`edit` targets snapshotted before execution and restored by `/undo`. `/checkpoint` + `/restore` still return fake success strings |
+| 9 | Evidence | **Partial** | `file:line — note` citations parsed + rendered — model may omit them |
+| 10 | Uncertainty | **Partial** | `<uncertainty>` parsed + rendered — model may omit it |
+| 11 | Preference learning | **Partial** | Prompt block built from real usage (`prefs.rs`); `/undo` recorded. No `!command` signal — no `!` command exists |
+| 12 | Autonomy levels | **Yes** | `--level <0-4>` feeds `LevelGate` at startup; `/level N` changes it live via the atomic handle; `/level` reports the current tier by name |
 
-**Self-improvement (`/refine`)**: on top of the preference learner, a
-Continual-Harness layer (`~/.agent-m/harness.json`) holds memories, prompt
-notes, and skills that the model proposes via `/refine` (or automatically after
-three consecutive tool failures / three `/undo`s). The base system prompt is
-immutable — only the harness block between it and the trust suffix changes
-(one prefix-cache miss at apply, then byte-stable). Every proposal is reviewed
-before applying; every op is audited and reversible via
-`/harness rollback <op-id>`. `/harness` lists the current state.
+**Self-improvement (`/refine`)**: a Continual-Harness layer
+(`~/.agent-m/harness.json`) holds memories, prompt notes, and skills that the
+model proposes via `/refine`. Proposals print as a text list — there is **no
+apply step, no rollback, and no background auto-trigger yet** (see
+`TRUST_AUDIT.md`); `/harness` lists the current state.
 
 **Risk tiers** (harness-assigned): reads/searches → Low; workspace writes and
 ordinary commands → Medium; outside-cwd / `.git` / force-git / `find -exec` →
@@ -301,20 +286,25 @@ High; recursive deletes / sudo / device writes / opaque plugin tools → Critica
 
 **Autonomy levels**: 0 observe (no tools), 1 suggest, 2 everything asks,
 3 trusted (default: auto Low/Medium, ask High/Critical), 4 autonomous (auto
-everything except Critical). Persisted in `settings.json`.
+everything except Critical — High/Critical still ask). Wired end-to-end:
+`--level <0-4>` or `settings.json` `"level"` at startup, `/level N` live in
+the session, `/level` with no arg reports the current tier.
 
-**Slash commands added**: `/journal` (audit timeline), `/undo` (restore the last
-file snapshot), `/level <0-4>` (autonomy). `!command` still runs bash directly
-and is what the preference learner watches.
+**Slash commands added for trust**: `/journal` (audit timeline), `/undo`
+(restores the last `write`/`edit` — targets are snapshotted before they run),
+`/level [0-4]` (show or set the live autonomy level), `/checkpoint` +
+`/restore` (git snapshots — infra present, not yet wired).
 
 ## Architecture
 
 ```
 crates/ai      model-agnostic provider layer, byte-stable serializer, cache stats
-crates/agent   agent loop (pi event ordering), session messages, tool trait, permission gate
-crates/tools   built-in tools (bash, read, write, edit, grep, find, ls)
-crates/tui     pi-style terminal UI (transcript, editor, markdown, themes, sessions)
-crates/cli     the agent-m binary (args, config, print mode, interactive mode)
+crates/agent   agent loop (pi event ordering), session messages, tool trait, permission gates
+crates/tools   built-in tools (bash, read, write, edit, grep, find, ls, search, web)
+crates/flow    YAML flow engine (prompt/ask/tool/condition/phase/verify steps, ${ref}s)
+crates/mcp     MCP client (stdio + Streamable HTTP)
+crates/plugin-sdk / plugin-loader   C-ABI contract + host for out-of-tree plugin tools
+crates/cli     the agent-m binary (args, config, print mode, interactive REPL)
 ```
 
 ## Roadmap

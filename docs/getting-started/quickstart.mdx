@@ -30,18 +30,24 @@ agent-m        # chat mode starts, scoped to ~/some/project
 
 ## Setup
 
+Put your key in `~/.agent-m/agent/auth.json` (created automatically on first
+run with a placeholder):
+
 ```bash
-export DEEPSEEK_API_KEY="sk-..."
+mkdir -p ~/.agent-m/agent
+printf '{"deepseek": "sk-..."}\n' > ~/.agent-m/agent/auth.json
 ```
 
-Key resolution order: `DEEPSEEK_API_KEY` env var → `~/.agent-m/agent/auth.json`
-(`{"providers": {"deepseek": {"apiKey": "..."}}}` or `{"deepseek": "..."}`) →
-`~/.agent-m/agent/settings.json` (same shapes).
+Key resolution order: `~/.agent-m/agent/auth.json` (nested
+`{"providers": {"deepseek": {"apiKey": "..."}}}` or flat
+`{"deepseek": "..."}`) → `~/.agent-m/agent/settings.json` (same shapes — but
+that file is world-readable, so prefer `auth.json`). Environment variables
+such as `DEEPSEEK_API_KEY` are **not** consulted.
 
 ## Usage
 
 ```bash
-agent-m                                # interactive TUI (default on a TTY)
+agent-m                                # interactive REPL (default on a TTY)
 agent-m --model deepseek-reasoner      # reasoning model
 agent-m -p "explain this repo"         # print mode: stream reply to stdout
 echo "summarize README" | agent-m      # non-TTY stdin → print mode
@@ -61,9 +67,8 @@ Start `agent-m` in any folder. Type a prompt and press `Enter`. The agent
 streams its reply, and when it wants to run a tool you'll see an approval
 prompt (`y`/`n`) unless the call is read-only or you passed `--yes`.
 
-- `!command` runs bash directly without the model — e.g. `!git status`.
-- `/plan` switches to read-only plan mode; `/build` returns.
-- `ctrl+d` exits. `Escape` interrupts a running reply.
+- `/mode plan` switches to read-only plan mode; `/mode build` returns.
+- `ctrl+d` exits (EOF). `ctrl+c` also exits the REPL.
 
 ## Where data lives
 
@@ -75,6 +80,6 @@ environment variable):
 | `sessions/--<cwd>--/` | JSONL conversation sessions, auto-resumed |
 | `tasks/<session>.json` | the persisted plan/task list |
 | `plugins/` | installed out-of-tree plugins |
-| `preferences.json` | learned `!command` families and `/undo` signals |
-| `settings.json` | model, autonomy level, API keys |
+| `preferences.json` | learned preferences — the "Known preferences" prompt block, fed by `/undo` usage |
+| `settings.json` | model, providers, API keys |
 | `index/` | the local symbol/keyword search index |

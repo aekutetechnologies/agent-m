@@ -4,9 +4,12 @@ title: Autonomy levels
 
 # Autonomy levels
 
-Trust is earned gradually. `--level <0-4>` (or `/level <0-4>` in the TUI)
-selects how much the agent may do on its own. Each level maps the four risk
-tiers onto approvals:
+**Status: shipped.** `AutonomyLevel` 0–4 + `LevelGate` (`crates/agent/src/tool.rs`)
+are wired into the CLI: `--level <0-4>` (or `settings.json` `"level"`) selects
+the startup level, and `/level N` changes it live during a session via the
+gate's atomic handle. Both interactive modes (REPL and daemon) use `LevelGate`.
+
+The design maps the four risk tiers onto approvals:
 
 | Level | Name | Behavior |
 |-------|------|----------|
@@ -16,20 +19,14 @@ tiers onto approvals:
 | 3 | trusted (default) | Auto Low + Medium, asks High + Critical |
 | 4 | autonomous | Auto everything except Critical (Critical still asks) |
 
-The default is level 3 (trusted). The setting persists in
-`~/.agent-m/agent/settings.json` under the `"level"` key, so `/level 4` in one
-session carries into the next.
-
-```bash
-agent-m --level 4            # autonomous for this session
-agent-m --level 1 "what would you change?"   # suggest-only, no execution
-```
-
-In the TUI, `/level 3` prints the behavior of the chosen level; `/level` with no
-argument prints usage.
+See `TRUST_AUDIT.md` for the evidence-based audit.
 
 ## Relationship to --yes
 
-`--yes` auto-approves whatever the current level would auto-approve. It is not
-an escape hatch: High and Critical calls still ask (levels 2-4) or are denied
-(print mode and flows, where no human is present).
+In the interactive REPL, `--yes` auto-approves Low/Medium calls only.
+**High/Critical calls always prompt** — `LevelGate` routes them to the human
+regardless of `--yes`. There is no flag that silences the Critical prompt.
+
+In print mode and flows there is no human to ask: risky calls are **denied
+outright** even under `--yes` (`DangerousCommandGate`), and without `--yes`
+all tool calls are denied.

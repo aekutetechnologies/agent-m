@@ -177,6 +177,7 @@ pub async fn run_repl(
     gate: Arc<dyn PermissionGate>,
     agent_dir: PathBuf,
     cwd: PathBuf,
+    level_handle: Option<Arc<std::sync::atomic::AtomicU8>>,
 ) -> Result<()> {
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
@@ -216,6 +217,8 @@ pub async fn run_repl(
     // re-parsing the raw turn text if the event is missed).
     let turn_trust = Arc::new(Mutex::new(None::<TrustData>));
     let turn_trust_listener = turn_trust.clone();
+    // Undo snapshots need agent_dir after the move into the event closure.
+    let undo_dir = agent_dir.clone();
 
     agent.subscribe(move |event| match event {
         agent_m_agent::AgentEvent::MessageUpdate {
@@ -237,6 +240,17 @@ pub async fn run_repl(
         agent_m_agent::AgentEvent::ToolExecutionStart {
             name, arguments, ..
         } => {
+            // check.md principle 8: snapshot write/edit targets before the
+            // tool runs, so /undo can restore them.
+            if matches!(name.as_str(), "write" | "edit") {
+                if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
+                    let _ = crate::sessions::record_undo_snapshot(
+                        &undo_dir,
+                        session_stem,
+                        std::path::Path::new(path),
+                    );
+                }
+            }
             if let Ok(mut cur) = current_tool_listener.lock() {
                 *cur = Some((name.clone(), arguments.clone()));
             }
@@ -335,6 +349,7 @@ pub async fn run_repl(
                         cwd: &cwd,
                         session_stem,
                         tools: tool_store.clone(),
+                        level_handle: level_handle.clone(),
                     };
                     match handle_slash_command(trimmed, &mut ctx).await {
                         CommandResult::Exit => break,
@@ -409,6 +424,18 @@ pub async fn run_repl(
                 };
                 if let Some(trust) = trust {
                     println!("{}", crate::section::print_decision(&trust));
+                    // P9: report evidence citations that point at missing
+                    // files or out-of-range lines (advisory at the REPL).
+                    let problems =
+                        agent_m_agent::check_evidence(&trust, &cwd);
+                    if !problems.is_empty() {
+                        for problem in problems {
+                            println!(
+                                "{} {problem}",
+                                ansi::yellow("[evidence]")
+                            );
+                        }
+                    }
                 }
 
                 // Plan extraction: if the reply contains a Plan: block, render

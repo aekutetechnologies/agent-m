@@ -19,6 +19,8 @@ pub struct CommandContext<'a> {
     pub cwd: &'a Path,
     pub session_stem: &'a str,
     pub tools: Arc<Mutex<ToolStore>>,
+    /// Autonomy level handle from the live LevelGate, if this mode has one.
+    pub level_handle: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> CommandResult {
@@ -52,6 +54,7 @@ pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> C
                     Ok(action) => {
                         let _ =
                             crate::sessions::save_undo(ctx.agent_dir, ctx.session_stem, &entries);
+                        crate::prefs::record_undo(ctx.agent_dir);
                         CommandResult::Handled(format!("Undo: {} {}", action, entry.path))
                     }
                     Err(err) => CommandResult::Handled(format!("Undo error: {}", err)),
@@ -229,20 +232,55 @@ pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> C
                 0
             };
             CommandResult::Handled(format!(
-                "Context Window: {} / {} tokens ({}%)\nCache Stats: {} hits, {} misses, {} requests",
+                "Context Window: {} / {} tokens ({}%)\nCache Stats: {} hits, {} misses, {} requests ({} cached)",
                 last_input,
-                context_window.map(|w| w.to_string()).unwrap_or_else(|| "unspecified".to_string()),
+                context_window
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "unspecified".to_string()),
                 pct,
                 cache_stats.hit_tokens,
                 cache_stats.miss_tokens,
-                cache_stats.requests
+                cache_stats.requests,
+                cache_stats
+                    .hit_ratio()
+                    .map(|r| format!("{:.0}%", r * 100.0))
+                    .unwrap_or_else(|| "n/a".to_string())
             ))
         }
         "/level" => {
-            if args.is_empty() {
-                CommandResult::Handled(format!("Autonomy level: {:?}", ctx.agent.mode()))
+            let Some(handle) = &ctx.level_handle else {
+                return CommandResult::Handled(
+                    "Autonomy level is not available in this mode.".to_string(),
+                );
+            };
+            if let Some(arg) = args.first() {
+                match arg
+                    .parse::<u8>()
+                    .ok()
+                    .and_then(agent_m_agent::AutonomyLevel::from_number)
+                {
+                    Some(level) => {
+                        handle.store(level.number(), std::sync::atomic::Ordering::Relaxed);
+                        CommandResult::Handled(format!(
+                            "Autonomy level set to {} — {}",
+                            level.number(),
+                            level.label()
+                        ))
+                    }
+                    None => CommandResult::Handled(format!(
+                        "Invalid level `{arg}`. Use 0-4: observe, suggest, assisted, trusted, autonomous"
+                    )),
+                }
             } else {
-                CommandResult::Handled("Set autonomy level via --level flag".to_string())
+                let current = agent_m_agent::AutonomyLevel::from_number(
+                    handle.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .unwrap_or_default();
+                CommandResult::Handled(format!(
+                    "Autonomy level: {} — {}",
+                    current.number(),
+                    current.label()
+                ))
             }
         }
         "/harness" => {
@@ -386,21 +424,21 @@ pub async fn handle_slash_command(line: &str, ctx: &mut CommandContext<'_>) -> C
 - `/variant [id]` — query or switch model variant
 - `/mode [plan|build]` — toggle plan (read-only) vs build mode
 - `/usage` — token and cache-hit telemetry
-- `/undo` — revert the last turn's file edits
+- `/undo` — revert the last file edit (write/edit targets are snapshotted automatically)
 - `/todos` — show the persisted plan for this session
-- `/sessions` — list sessions for the current directory
+- `/sessions` — list sessions for the current directory (list-only; resume is not wired)
 - `/harness` — show active harness notes
-- `/refine [focus]` — propose harness refinements
+- `/refine [focus]` — propose harness refinements (propose-only; no apply yet)
 - `/journal` — action audit timeline
 - `/tool-output [last|n]` — reprint a stored tool output
 - `/tools` — list stored tool outputs
-- `/compact` — compact conversation history
-- `/checkpoint` — record a git checkpoint
-- `/restore` — restore from last checkpoint
-- `/flows` — list available flow files
+- `/compact` — compact conversation history (stub: reports scheduled, no-op)
+- `/checkpoint` — record a git checkpoint (stub: no snapshot is taken)
+- `/restore` — restore from last checkpoint (stub: no-op)
+- `/flows` — list available flow files (stub: reports path, no listing)
 - `/color [on|off]` — toggle ANSI color
 - `/provider` — show active provider details
-- `/level` — show autonomy level
+- `/level [0-4]` — show or set the live autonomy level (observe, suggest, assisted, trusted, autonomous)
 - `/exit` — quit";
             CommandResult::Handled(crate::ansi::render_markdown(md))
         }

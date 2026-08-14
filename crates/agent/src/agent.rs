@@ -13,6 +13,7 @@ use tracing::Instrument;
 
 use crate::message::SessionMessage;
 use crate::tool::{Permission, PermissionGate, Tool, ToolCallInfo, ToolContext, ToolOutcome};
+use crate::trust_policy::TrustDecision;
 
 /// The agent's working mode. Plan mode is read-only: mutating tools are
 /// hidden and the model is asked to produce a numbered plan.
@@ -57,7 +58,10 @@ const TRUST_BLOCK: &str = "\n\nEnd each reply with a <trust> block the harness m
 
 /// The `delegate` tool: spawn a fresh-context sub-agent (check.md-inspired
 /// subagents — parallel/isolated work with its own context window).
-const DELEGATE_SPEC: &str = r#"{"type":"object","properties":{"prompt":{"type":"string","description":"Self-contained task for the sub-agent"},"tools":{"type":"array","items":{"type":"string"},"description":"Restrict the sub-agent to these tools (default: the parent's set minus delegate)"},"max_turns":{"type":"integer","description":"Sub-agent turn budget (default 4)"}},"required":["prompt"]}"#;
+/// Scoped by `cwd` + `tools`; sub-agents never see `delegate` themselves, so
+/// delegation cannot recurse. `format=json` (+ optional `schema`) makes the
+/// sub-agent return machine-readable structured findings instead of prose.
+const DELEGATE_SPEC: &str = r#"{"type":"object","properties":{"prompt":{"type":"string","description":"Self-contained task for the sub-agent"},"cwd":{"type":"string","description":"Working directory for the sub-agent's tools (default: the parent's cwd)"},"tools":{"type":"array","items":{"type":"string"},"description":"Restrict the sub-agent to these tools (default: the parent's set minus delegate)"},"max_turns":{"type":"integer","description":"Sub-agent turn budget (default 4)"},"format":{"type":"string","enum":["text","json"],"description":"Output format: 'text' (default) returns the sub-agent's final reply; 'json' requires a single JSON object and returns it parsed and pretty-printed, or a clear error the parent can retry"},"schema":{"type":"object","description":"Optional JSON Schema for the expected answer shape (used with format=json); embedded in the sub-agent's system prompt"}},"required":["prompt"]}"#;
 
 /// Instructions for the compaction summarizer (memory across sessions).
 const SUMMARY_PROMPT: &str = "Summarize the conversation above for continuation by a coding agent. Keep it concise but complete: the goal, key decisions, files touched, important tool results, user preferences, and open questions. 300 words or fewer.";
@@ -128,6 +132,17 @@ pub struct AgentOptions {
     /// When set, bash/grep results over 10KB are written here and replaced with
     /// a 2KB preview + path hint. None → plain truncation (existing behavior).
     pub output_dir: Option<std::path::PathBuf>,
+    /// Trust protocol enforcement (check.md P2/P4/P9): how strictly turns
+    /// that use tools must carry a `<trust>` block. Default `Off` (library);
+    /// the CLI opts in with `--trust warn|ask|block`.
+    pub trust: crate::trust_policy::TrustPolicy,
+    /// Risk policy for classifying the turn's tool calls during P4
+    /// escalation. None → unknown tools count as risky.
+    pub risk_policy: Option<crate::risk::RiskPolicy>,
+    /// Delegation depth: 0 = top-level agent (may spawn sub-agents). Each
+    /// sub-agent gets +1 and never sees the `delegate` tool, so delegation
+    /// cannot recurse indefinitely.
+    pub delegate_depth: usize,
 }
 
 /// Events emitted by the agent loop, in pi's ordering:
@@ -275,13 +290,19 @@ impl Agent {
             .iter()
             .map(|tool| crate::tool::tool_spec(tool.as_ref()))
             .collect();
-        if options.mode == Mode::Build {
+        if options.mode == Mode::Build && options.delegate_depth == 0 {
             specs.push(ToolSpec {
                 name: "delegate".to_string(),
                 description: "Delegate a self-contained task to a fresh sub-agent with its own context window and tool budget. Returns the sub-agent's final answer. Use for isolated research, review, or implementation subtasks you should not block on.".to_string(),
                 parameters: serde_json::from_str(DELEGATE_SPEC).unwrap_or_default(),
             });
         }
+        // Cache stability: provider prefix caching is byte-exact on the
+        // `tools` array. Sorting by name keeps the prefix identical when an
+        // MCP server flakes, reconnects, or is added (order previously
+        // followed connection order in main.rs, so a failed handshake on one
+        // server shifted every tool that followed and busted the cache).
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }
 
@@ -475,9 +496,15 @@ impl Agent {
         });
         let request = ChatRequest {
             model: self.options.model.clone(),
-            system: "You produce conversation summaries for a coding agent.".to_string(),
+            // Cache reuse: identical system + tools as the live loop, so the
+            // whole conversation prefix is a cache HIT. The summarization
+            // instruction rides in the trailing user message (suffix, not
+            // prefix), which is why the old code — a different system string
+            // and empty tools — ran compaction in a cold cache namespace at
+            // exactly the moment history is largest.
+            system: self.current_system_prompt(),
             messages: summary_messages,
-            tools: vec![],
+            tools: self.tool_specs.clone(),
             temperature: None,
             variant: self.options.variant.clone(),
         };
@@ -754,7 +781,7 @@ impl Agent {
                 usage: usage.clone(),
                 stop_reason,
                 model: self.options.model.clone(),
-                trust,
+                trust: trust.clone(),
             };
             if let Some(usage) = &usage {
                 self.cache_stats.record(usage);
@@ -795,21 +822,71 @@ impl Agent {
 
             let has_tool_calls = !tool_calls.is_empty();
             if has_tool_calls {
+                // Enforced trust protocol (P2/P4/P9): a tool-using turn must
+                // carry a <trust> block, a confidence score above the
+                // threshold when it touches risky tools, and evidence that
+                // points at real files. Denied turns never run their tools —
+                // each call becomes an error result so the model sees the
+                // denial and can repair the block.
+                let call_infos: Vec<ToolCallInfo> =
+                    tool_calls.iter().map(|(_, call)| call.clone()).collect();
+                let (trust_decision, trust_notices) = crate::trust_policy::enforce(
+                    &self.options.trust,
+                    &trust,
+                    &call_infos,
+                    self.options.risk_policy.as_ref(),
+                    self.options.ask_gate.as_deref(),
+                    &self.options.cwd,
+                )
+                .await;
+                for notice in trust_notices {
+                    self.emit(&AgentEvent::Notice { message: notice });
+                }
+                if let TrustDecision::Denied(reason) = &trust_decision {
+                    let mut tool_results = 0;
+                    for (_, call) in &tool_calls {
+                        let outcome = ToolOutcome::error(format!(
+                            "trust policy denied tool `{}`: {reason}",
+                            call.name
+                        ));
+                        self.messages.push(SessionMessage::ToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            name: call.name.clone(),
+                            content: outcome.content,
+                            is_error: outcome.is_error,
+                        });
+                        tool_results += 1;
+                    }
+                    self.emit(&AgentEvent::TurnEnd {
+                        message: assistant_message,
+                        tool_results,
+                    });
+                    continue;
+                }
+
                 let mut tool_results = 0;
-                for (_, call) in tool_calls {
+                // One turn may carry several independent tool calls (parallel
+                // `delegate` sub-agents for repo exploration). Run them
+                // concurrently, then record results in call order so the
+                // byte-stable message prefix never shifts.
+                for (_, call) in &tool_calls {
                     self.emit(&AgentEvent::ToolExecutionStart {
                         tool_call_id: call.tool_call_id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
                     });
-                    let outcome = self
-                        .run_tool(&call)
-                        .instrument(tracing::info_span!(
+                }
+                let outcomes = futures_util::future::join_all(tool_calls.iter().map(
+                    |(_, call)| {
+                        self.run_tool(call).instrument(tracing::info_span!(
                             "agent.tool",
                             tool.name = %call.name,
                             tool.call_id = %call.tool_call_id,
                         ))
-                        .await;
+                    },
+                ))
+                .await;
+                for ((_, call), outcome) in tool_calls.iter().zip(outcomes) {
                     tool_results += 1;
                     self.emit(&AgentEvent::ToolExecutionEnd {
                         tool_call_id: call.tool_call_id.clone(),
@@ -844,7 +921,222 @@ impl Agent {
         });
         Ok(())
     }
+}
 
+/// The text parts of the sub-agent's last assistant message — the final
+/// answer. Earlier assistant messages are tool-call plumbing.
+fn last_assistant_text(agent: &Agent) -> String {
+    agent.messages().iter().rev().find_map(|message| {
+        let SessionMessage::Assistant { content, .. } = message else {
+            return None;
+        };
+        let text: String = content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }).unwrap_or_default()
+}
+
+/// Parse a JSON answer: the whole reply first, then the first `{`…last `}`
+/// slice (models wrap JSON in markdown fences or prose).
+fn parse_json_answer(answer: &str) -> Option<Value> {
+    let trimmed = answer.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+}
+
+/// Byte-safe truncation for error messages (never panic mid-UTF-8 char).
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    let mut end = max_chars.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        format!("{}…", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
+/// A request to run a fresh, scoped sub-agent (the delegate protocol).
+/// Shared by the synthetic `delegate` tool (build mode) and the flow
+/// `delegate` step, so both get identical scoping + JSON handling.
+pub struct DelegateRequest {
+    /// Self-contained task for the sub-agent.
+    pub prompt: String,
+    /// Working directory override (None = the caller's cwd).
+    pub cwd: Option<PathBuf>,
+    /// Restrict the sub-agent to these tools by name (None = the caller's
+    /// set minus `delegate`).
+    pub tools: Option<Vec<String>>,
+    /// Sub-agent turn budget (clamped 1..=16).
+    pub max_turns: usize,
+    /// `true`: require a single JSON object reply (system prompt injection,
+    /// parsed + pretty-printed result). `false`: plain text answer.
+    pub json: bool,
+    /// Optional JSON Schema embedded in the sub-agent's system prompt.
+    pub schema: Option<serde_json::Value>,
+}
+
+/// The result of one delegate run.
+pub struct DelegateOutcome {
+    /// The sub-agent's final answer: pretty-printed JSON in json mode, or
+    /// the plain text. On error, a clear message the caller can retry with.
+    pub content: String,
+    pub is_error: bool,
+    /// json mode success: the parsed value (also in `content`).
+    pub parsed: Option<serde_json::Value>,
+}
+
+/// Run a fresh sub-agent with a fresh context window: the delegate protocol.
+/// Scoping: cwd override + tool subset (never `delegate` itself — the
+/// sub-agent is one level deeper, so it cannot recurse); trust stays Off
+/// because the caller's turn/flow is already trust-enforced; the sub-agent
+/// runs in build mode on its own future root (no stack nesting).
+pub async fn run_delegate_sub(
+    provider: Arc<dyn Provider>,
+    gate: Arc<dyn PermissionGate>,
+    options: &AgentOptions,
+    request: DelegateRequest,
+) -> DelegateOutcome {
+    let max_turns = request.max_turns.clamp(1, 16);
+    // Tool subset: `tools` restricts; otherwise the caller's set minus
+    // delegate (no recursion).
+    let tools: Vec<Arc<dyn Tool>> = match &request.tools {
+        Some(names) => options
+            .tools
+            .iter()
+            .filter(|tool| {
+                tool.name() != "delegate" && names.iter().any(|name| name.as_str() == tool.name())
+            })
+            .cloned()
+            .collect(),
+        None => options
+            .tools
+            .iter()
+            .filter(|tool| tool.name() != "delegate")
+            .cloned()
+            .collect(),
+    };
+    let mut sub_options = AgentOptions {
+        tools,
+        max_turns,
+        delegate_depth: options.delegate_depth + 1,
+        // The caller (a delegate tool call or a flow step) already went
+        // through trust enforcement (P2/P4/P9). Re-enforcing inside the
+        // sub-agent would make delegation unusable in strict (Block) trust
+        // modes; sub-agents are scoped by cwd + tool subset instead.
+        trust: crate::trust_policy::TrustPolicy::default(),
+        // Structured sub-agents always work in build mode.
+        mode: Mode::Build,
+        ..options.clone()
+    };
+    if let Some(cwd) = &request.cwd {
+        sub_options.cwd = cwd.clone();
+    }
+    // Structured output: a `json` sub-agent is told to reply with a single
+    // JSON object (plus the optional schema) so the caller receives
+    // machine-readable findings instead of prose. The <trust> block is
+    // still stripped by the loop before the text reaches us, so the JSON
+    // is clean.
+    if request.json {
+        sub_options.system_prompt.push_str(
+            "\n\nReturn ONLY a single JSON object as your final reply — no markdown fences, \
+             no prose, no commentary. It must parse as JSON.",
+        );
+        if let Some(schema) = &request.schema {
+            sub_options
+                .system_prompt
+                .push_str(&format!("\nThe answer must conform to this JSON Schema: {schema}"));
+        }
+    }
+    // Run the sub-agent on its own task: a fresh future root, so the async
+    // recursion (prompt → run_tool → delegate → prompt) never nests in the
+    // caller's stack.
+    let sub_prompt = request.prompt.clone();
+    let sub = tokio::task::spawn(async move {
+        let mut sub = Agent::new(provider, sub_options, gate);
+        let _ = sub.prompt(sub_prompt).await;
+        sub
+    })
+    .await;
+    let sub = match sub {
+        Ok(sub) => sub,
+        Err(_) => {
+            return DelegateOutcome {
+                content: "delegate: sub-agent task failed".to_string(),
+                is_error: true,
+                parsed: None,
+            }
+        }
+    };
+
+    // The sub-agent's final answer = its last assistant text.
+    let mut answer = String::new();
+    for message in sub.messages() {
+        if let SessionMessage::Assistant { content, .. } = message {
+            for part in content {
+                if let ContentPart::Text { text } = part {
+                    answer.push_str(text);
+                    answer.push('\n');
+                }
+            }
+        }
+    }
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        return DelegateOutcome {
+            content: "delegate: sub-agent produced no answer".to_string(),
+            is_error: true,
+            parsed: None,
+        };
+    }
+    if request.json {
+        // Only the final assistant message carries the JSON answer; earlier
+        // turns are tool-call plumbing.
+        let last = last_assistant_text(&sub);
+        let target = if last.is_empty() { &answer } else { &last };
+        return match parse_json_answer(target) {
+            Some(value) => DelegateOutcome {
+                content: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                is_error: false,
+                parsed: Some(value),
+            },
+            None => DelegateOutcome {
+                content: format!(
+                    "delegate: sub-agent did not produce valid JSON; got (first 200 chars): {}",
+                    truncate_for_display(target, 200)
+                ),
+                is_error: true,
+                parsed: None,
+            },
+        };
+    }
+    DelegateOutcome {
+        content: answer,
+        is_error: false,
+        parsed: None,
+    }
+}
+
+impl Agent {
     /// Spawn a fresh sub-agent for a delegated task: same provider and gate,
     /// a fresh context window, an optional tool subset, and a turn budget.
     /// Returns the sub-agent's final answer as the tool outcome.
@@ -852,73 +1144,38 @@ impl Agent {
         let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
             return ToolOutcome::error("delegate: missing `prompt` argument");
         };
-        let max_turns = arguments
-            .get("max_turns")
-            .and_then(Value::as_u64)
-            .unwrap_or(4)
-            .clamp(1, 16) as usize;
-        // Tool subset: `tools` restricts; otherwise the parent's set minus
-        // delegate (no recursion).
-        let tools: Vec<Arc<dyn Tool>> = match arguments.get("tools").and_then(Value::as_array) {
-            Some(names) => self
-                .options
-                .tools
-                .iter()
-                .filter(|tool| {
-                    tool.name() != "delegate"
-                        && names.iter().any(|name| name.as_str() == Some(tool.name()))
-                })
-                .cloned()
-                .collect(),
-            None => self
-                .options
-                .tools
-                .iter()
-                .filter(|tool| tool.name() != "delegate")
-                .cloned()
-                .collect(),
+        let format = arguments
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("text");
+        let request = DelegateRequest {
+            prompt: prompt.to_string(),
+            cwd: arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+                .map(PathBuf::from),
+            tools: arguments.get("tools").and_then(Value::as_array).map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            }),
+            max_turns: arguments
+                .get("max_turns")
+                .and_then(Value::as_u64)
+                .unwrap_or(4)
+                .clamp(1, 16) as usize,
+            json: format == "json",
+            schema: arguments.get("schema").cloned(),
         };
-        let sub_options = AgentOptions {
-            tools,
-            max_turns,
-            ..self.options.clone()
-        };
-        // Run the sub-agent on its own task: a fresh future root, so the
-        // async recursion (prompt → run_tool → delegate → prompt) never
-        // nests in the parent's stack.
-        let provider = self.provider.clone();
-        let gate = self.gate.clone();
-        let sub_prompt = prompt.to_string();
-        let sub = tokio::task::spawn(async move {
-            let mut sub = Agent::new(provider, sub_options, gate);
-            let _ = sub.prompt(sub_prompt).await;
-            sub
-        })
-        .await;
-        let sub = match sub {
-            Ok(sub) => sub,
-            Err(_) => return ToolOutcome::error("delegate: sub-agent task failed"),
-        };
-
-        // The sub-agent's final answer = its last assistant text.
-        let mut answer = String::new();
-        for message in sub.messages() {
-            if let SessionMessage::Assistant { content, .. } = message {
-                for part in content {
-                    if let ContentPart::Text { text } = part {
-                        answer.push_str(text);
-                        answer.push('\n');
-                    }
-                }
-            }
-        }
-        let answer = answer.trim().to_string();
-        if answer.is_empty() {
-            return ToolOutcome::error("delegate: sub-agent produced no answer");
-        }
+        let outcome =
+            run_delegate_sub(self.provider.clone(), self.gate.clone(), &self.options, request)
+                .await;
         ToolOutcome {
-            content: answer,
-            is_error: false,
+            content: outcome.content,
+            is_error: outcome.is_error,
         }
     }
 
@@ -928,7 +1185,11 @@ impl Agent {
                 "Permission denied for tool `{}`: {reason}",
                 call.name
             )),
-            Permission::Allowed if call.name == "delegate" => {
+            Permission::Allowed
+                if call.name == "delegate"
+                    && self.options.mode == Mode::Build
+                    && self.options.delegate_depth == 0 =>
+            {
                 self.run_delegate(&call.arguments).await
             }
             Permission::Allowed => {
@@ -1002,5 +1263,69 @@ mod clamp_tests {
             SessionMessage::ToolResult { content, .. } => assert_eq!(content, "short"),
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct MockTool(&'static str);
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn parameters(&self) -> Value {
+            Value::Object(Default::default())
+        }
+        async fn execute(
+            &self,
+            _arguments: Value,
+            _context: &ToolContext,
+        ) -> Result<ToolOutcome, crate::tool::ToolError> {
+            Ok(ToolOutcome::success(""))
+        }
+    }
+
+    fn options_with(tools: Vec<Arc<dyn Tool>>) -> AgentOptions {
+        AgentOptions {
+            model: "test-model".to_string(),
+            system_prompt: "test".to_string(),
+            harness_block: None,
+            tools,
+            max_turns: 4,
+            cwd: PathBuf::from("."),
+            mode: Mode::Build,
+            ask_gate: None,
+            context_window: None,
+            variant: None,
+            output_dir: None,
+            trust: crate::trust_policy::TrustPolicy::default(),
+            risk_policy: None,
+            delegate_depth: 0,
+        }
+    }
+
+    /// Tools must be name-sorted: the wire `tools` array sits in the cached
+    /// prefix, and a connection-order shift (MCP flake) must not move it.
+    #[test]
+    fn tool_specs_are_name_sorted_for_cache_stability() {
+        let options = options_with(vec![
+            Arc::new(MockTool("zebra")),
+            Arc::new(MockTool("alpha")),
+        ]);
+        let specs = Agent::tool_specs_for(&options);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "tool order must be deterministic");
+        // Build mode always appends `delegate`; it sorts in alphabetically.
+        assert!(names.contains(&"delegate"));
     }
 }

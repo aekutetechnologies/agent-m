@@ -37,7 +37,7 @@ pub async fn run_attach(session_id: &str, agent_dir: &Path) -> Result<()> {
         return Err(anyhow!("Authentication failed: {}", response.trim()));
     }
 
-    println!("Connected to daemon `{session_id}`.");
+    println!("Connected to daemon `{session_id}`. Lines that start with `/` are attach commands; everything else is sent as `prompt <line>`. Events stream in as they happen.");
 
     let mut rl = rustyline::DefaultEditor::new()?;
     loop {
@@ -53,10 +53,29 @@ pub async fn run_attach(session_id: &str, agent_dir: &Path) -> Result<()> {
                     println!("Detached from daemon `{session_id}`.");
                     break;
                 }
-                writer.write_all(format!("{}\n", trimmed).as_bytes()).await?;
-                let mut ack = String::new();
-                buf_reader.read_line(&mut ack).await?;
-                println!("{}", ack.trim());
+                if trimmed == "/status" || trimmed == "/resume" {
+                    writer
+                        .write_all(format!("{}\n", trimmed.trim_start_matches('/')).as_bytes())
+                        .await?;
+                } else {
+                    // Everything else is a prompt for the running agent.
+                    writer.write_all(format!("prompt {trimmed}\n").as_bytes()).await?;
+                }
+                // Drain lines until the RESULT for this command. EVENT lines
+                // from live runs are printed as they arrive.
+                let mut out = String::new();
+                buf_reader.read_line(&mut out).await?;
+                loop {
+                    if out.starts_with("RESULT ") {
+                        println!("{}", out.trim());
+                        break;
+                    }
+                    print!("{}", out);
+                    out.clear();
+                    if buf_reader.read_line(&mut out).await? == 0 {
+                        break;
+                    }
+                }
             }
             Err(_) => {
                 let _ = writer.write_all(b"QUIT\n").await;

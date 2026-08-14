@@ -14,9 +14,13 @@ mod context;
 mod message;
 mod risk;
 mod tool;
+mod trust_policy;
 mod worktree;
 
-pub use agent::{Agent, AgentEvent, AgentOptions, InterruptHandle, Mode};
+pub use agent::{
+    Agent, AgentEvent, AgentOptions, DelegateOutcome, DelegateRequest, InterruptHandle, Mode,
+    run_delegate_sub,
+};
 pub use checkpoint::{create_checkpoint, is_git_repo, restore_checkpoint};
 pub use context::{InstructionFile, discover_instructions, render_instructions};
 pub use message::{SessionMessage, SessionMessageKind};
@@ -27,4 +31,5 @@ pub use tool::{
     ReadOnlyAutoApproveGate, SelectiveAskGate, TierGate, Tool, ToolCallInfo, ToolContext,
     ToolError, ToolOutcome, ToolRegistry, UnavailableAskGate, tool_spec,
 };
+pub use trust_policy::{TrustDecision, TrustIssues, TrustMode, TrustPolicy, assess, check_evidence, enforce};
 pub use worktree::{create_worktree, list_worktrees, remove_worktree};

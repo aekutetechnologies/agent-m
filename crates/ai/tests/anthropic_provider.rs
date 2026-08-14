@@ -15,6 +15,7 @@ fn provider(base_url: &str) -> AnthropicProvider {
         base_url,
         Some("test-key".to_string()),
         vec![agent_m_ai::ModelSpec::new("claude-3-5-sonnet-20241022")],
+        None,
     )
 }
 
