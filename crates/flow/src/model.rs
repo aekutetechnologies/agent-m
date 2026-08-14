@@ -1,4 +1,4 @@
-//! Flow model: a YAML-defined pipeline of steps (Devin-style), plus the
+//! Flow model: a YAML-defined pipeline of steps, plus the
 //! shared context with `${step.output}` reference substitution.
 
 use serde::{Deserialize, Serialize};

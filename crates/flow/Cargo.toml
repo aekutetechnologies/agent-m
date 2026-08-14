@@ -3,7 +3,7 @@ name = "agent-m-flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Devin-style flow engine: YAML-defined step pipelines for agent-m"
+description = "Flow engine: YAML-defined step pipelines for agent-m"
 
 [dependencies]
 agent-m-agent = { path = "../agent" }

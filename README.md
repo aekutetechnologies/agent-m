@@ -180,7 +180,7 @@ The denylist arms race cannot be won. The real boundaries are: no tool registere
   reads your answer from stdin — type the option number or your answer and
   press Enter (blank cancels). In print mode `ask` fails with a clear message.
 
-## Flows (Devin-style pipelines)
+## Flows
 
 `agent-m --flow flows/agentic-dev.yml --yes` runs a YAML pipeline of steps
 (tool / prompt / ask / condition / phase / verify) with a shared

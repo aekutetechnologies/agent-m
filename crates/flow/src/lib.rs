@@ -1,4 +1,4 @@
-//! agent-m-flow: Devin-style YAML flow engine for agent-m.
+//! agent-m-flow: YAML flow engine for agent-m.
 //!
 //! A flow is an ordered list of steps (prompt / ask / tool / condition /
 //! phase / verify) that share a serializable `FlowContext`. The design
